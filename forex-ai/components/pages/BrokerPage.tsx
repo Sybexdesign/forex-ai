@@ -35,15 +35,17 @@ const ENV_GUIDES: Record<string, { vars: Array<{ key: string; description: strin
   },
   capital: {
     vars: [
-      { key: 'TRADING_BROKER',     description: 'Select Capital.com',    example: 'capital' },
-      { key: 'CAPITAL_API_KEY',    description: 'API key from Capital.com dashboard', example: 'abc123...' },
-      { key: 'CAPITAL_PASSWORD',   description: 'Your Capital.com account password', example: 'YourPassword' },
-      { key: 'CAPITAL_BASE_URL',   description: 'Demo or live API URL',  example: 'https://demo-api-capital.backend.currency.com/api' },
+      { key: 'TRADING_BROKER',        description: 'Select Capital.com',                   example: 'capital' },
+      { key: 'CAPITAL_API_KEY',       description: 'API key from Capital.com dashboard',   example: 'abc123...' },
+      { key: 'CAPITAL_IDENTIFIER',    description: 'Your Capital.com account email address', example: 'you@example.com' },
+      { key: 'CAPITAL_PASSWORD',      description: 'Your Capital.com account password',    example: 'YourPassword' },
+      { key: 'CAPITAL_BASE_URL',      description: 'Demo or live API URL',                 example: 'https://demo-api-capital.backend.currency.com/api' },
     ],
     steps: [
       'Sign up at capital.com — free demo with £10,000 virtual funds',
       'Log in → Settings → API → Create new API key',
-      'Copy the API key — you will use your account password as CAPITAL_PASSWORD',
+      'Set CAPITAL_API_KEY to the generated key',
+      'Set CAPITAL_IDENTIFIER to your account email address (used for login)',
       'Keep the demo URL until confident in the system',
     ],
   },
@@ -84,15 +86,22 @@ const STATUS_COLOR = {
 export default function BrokerPage() {
   const [brokerData, setBrokerData] = useState<any>(null)
   const [loading, setLoading] = useState(true)
+  const [fetchError, setFetchError] = useState<string | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [copied, setCopied] = useState<string | null>(null)
 
   useEffect(() => {
-    fetch('/api/broker').then(r => r.json()).then(d => {
-      setBrokerData(d)
-      setSelected(d.active)
-      setLoading(false)
-    })
+    fetch('/api/broker')
+      .then(r => r.json())
+      .then(d => {
+        setBrokerData(d)
+        setSelected(d.active)
+        setLoading(false)
+      })
+      .catch(err => {
+        setFetchError(err?.message || 'Failed to load broker data')
+        setLoading(false)
+      })
   }, [])
 
   function copyEnvBlock(key: string) {
@@ -108,6 +117,14 @@ export default function BrokerPage() {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', padding: 60 }}>
         <LoadingDots />
+      </div>
+    )
+  }
+
+  if (fetchError) {
+    return (
+      <div style={{ padding: 40, color: '#ff6060', fontFamily: 'JetBrains Mono', fontSize: 13 }}>
+        <strong style={{ color: '#ff3056' }}>Connection error:</strong> {fetchError}
       </div>
     )
   }

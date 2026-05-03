@@ -42,7 +42,7 @@ export const BROKER_INFO: Record<BrokerKey, {
     description: 'Spread-only trading. Forex, stocks, crypto and indices. Free demo.',
     website: 'https://capital.com',
     demo: true,
-    envVars: ['CAPITAL_API_KEY', 'CAPITAL_PASSWORD', 'CAPITAL_BASE_URL'],
+    envVars: ['CAPITAL_API_KEY', 'CAPITAL_IDENTIFIER', 'CAPITAL_PASSWORD', 'CAPITAL_BASE_URL'],
     pairs: ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'XAU/USD', 'XAG/USD', 'BTC/USD', 'ETH/USD'],
   },
   ibkr: {

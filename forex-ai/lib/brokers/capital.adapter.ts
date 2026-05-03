@@ -5,6 +5,7 @@
 //
 // Env vars needed:
 //   CAPITAL_API_KEY=your_api_key
+//   CAPITAL_IDENTIFIER=your_account_email
 //   CAPITAL_PASSWORD=your_account_password
 //   CAPITAL_BASE_URL=https://demo-api-capital.backend.currency.com/api  (demo)
 //                  =https://api-capital.backend.currency.com/api         (live)
@@ -12,9 +13,10 @@
 import type { IBroker, Price, Candle, AccountSummary, OpenTrade, OrderRequest, OrderResult, CloseResult } from './interface'
 import { calcStandardPositionSize, getPipValue } from './interface'
 
-const BASE_URL = process.env.CAPITAL_BASE_URL || 'https://demo-api-capital.backend.currency.com/api'
-const API_KEY  = process.env.CAPITAL_API_KEY  || ''
-const PASSWORD = process.env.CAPITAL_PASSWORD || ''
+const BASE_URL    = process.env.CAPITAL_BASE_URL    || 'https://demo-api-capital.backend.currency.com/api'
+const API_KEY     = process.env.CAPITAL_API_KEY     || ''
+const IDENTIFIER  = process.env.CAPITAL_IDENTIFIER  || ''
+const PASSWORD    = process.env.CAPITAL_PASSWORD    || ''
 
 // Capital.com uses epic codes for instruments
 const PAIR_TO_EPIC: Record<string, string> = {
@@ -47,7 +49,7 @@ async function getSession() {
   const res = await fetch(`${BASE_URL}/v1/session`, {
     method: 'POST',
     headers: { 'X-CAP-API-KEY': API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ identifier: API_KEY, password: PASSWORD }),
+    body: JSON.stringify({ identifier: IDENTIFIER, password: PASSWORD, encryptedPassword: false }),
   })
   if (!res.ok) throw new Error(`Capital.com auth failed: ${await res.text()}`)
   _sessionToken = res.headers.get('X-SECURITY-TOKEN') || ''
