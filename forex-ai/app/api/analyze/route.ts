@@ -147,3 +147,26 @@ function generateDemoRecommendation(
     checklist,
   }
 }
+
+// Helper to add advanced analysis to AI prompt (imported at call time to avoid circular deps)
+export async function getAdvancedContext(pair: string, timeframe: string): Promise<string> {
+  try {
+    const base = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000'
+    const res = await fetch(`${base}/api/advanced?pair=${encodeURIComponent(pair)}&timeframe=${timeframe}`)
+    if (!res.ok) return ''
+    const { analysis } = await res.json()
+    if (!analysis) return ''
+    return `
+ADVANCED ANALYSIS CONTEXT:
+- Fibonacci trend: ${analysis.fibonacci?.trend}, price in zone: ${analysis.fibonacci?.currentPriceZone}
+- ATR volatility: ${analysis.atr?.volatility}, suggested SL: ${analysis.atr?.suggestedSL} pips, TP: ${analysis.atr?.suggestedTP2} pips (1:2R)
+- Candlestick patterns: ${analysis.patterns?.summary}
+- ${analysis.patterns?.patterns?.map((p: any) => `${p.name} (${p.signal})`).join(', ') || 'None'}
+- Nearest resistance: ${analysis.supportResistance?.nearestResistance?.price || 'none'} (${analysis.supportResistance?.nearestResistance?.distancePips || 0}p)
+- Nearest support: ${analysis.supportResistance?.nearestSupport?.price || 'none'} (${analysis.supportResistance?.nearestSupport?.distancePips || 0}p)
+- Overall confluence score: ${analysis.confluenceScore}/100 (${analysis.overallBias})
+`.trim()
+  } catch {
+    return ''
+  }
+}
