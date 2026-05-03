@@ -1,0 +1,16 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "env": {
+    "OANDA_API_KEY": "@oanda_api_key",
+    "OANDA_ACCOUNT_ID": "@oanda_account_id",
+    "OANDA_BASE_URL": "https://api-fxpractice.oanda.com",
+    "ANTHROPIC_API_KEY": "@anthropic_api_key",
+    "NEXT_PUBLIC_SUPABASE_URL": "@supabase_url",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY": "@supabase_anon_key",
+    "SUPABASE_SERVICE_ROLE_KEY": "@supabase_service_role_key"
+  },
+  "regions": ["lhr1"]
+}
