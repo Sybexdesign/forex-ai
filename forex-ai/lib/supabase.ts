@@ -53,7 +53,7 @@ export const DEFAULT_STRATEGY: StrategySettings = {
   minStrength: 65,
   tpPips: 50,
   slPips: 25,
-  watchlist: ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'XAU/USD'],
+  watchlist: ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'XAU/USD', 'XAG/USD'],
   sessionStart: 7,
   sessionEnd: 20,
   hardDailyStop: true,

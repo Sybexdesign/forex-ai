@@ -9,11 +9,12 @@ import StrategyPage from './pages/StrategyPage'
 import JournalPage from './pages/JournalPage'
 import SignalsPage from './pages/SignalsPage'
 import BrokerPage from './pages/BrokerPage'
+import MetalsPage from './pages/MetalsPage'
 import { usePriceFeed, useAccount, useNews, useStrategy, useTrades, useSignals } from '@/hooks/useForex'
 import type { StrategySettings } from '@/lib/supabase'
 import { DEFAULT_STRATEGY } from '@/lib/supabase'
 
-const PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'XAU/USD']
+const PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'XAU/USD', 'XAG/USD']
 
 const NAV = [
   { id: 'dashboard', label: 'Dashboard',    icon: '◈', shortcut: 'D' },
@@ -21,6 +22,7 @@ const NAV = [
   { id: 'strategy',  label: 'Strategy',     icon: '⚙', shortcut: 'S' },
   { id: 'journal',   label: 'Journal',      icon: '📋', shortcut: 'J' },
   { id: 'signals',   label: 'Signals',      icon: '📡', shortcut: 'G' },
+  { id: 'metals',    label: 'Gold & Silver', icon: '🥇', shortcut: 'M' },
   { id: 'broker',    label: 'Brokers',      icon: '🔌', shortcut: 'B' },
 ]
 
@@ -83,6 +85,7 @@ export default function AppShell() {
     strategy: 'STRATEGY SETTINGS',
     journal: 'TRADE JOURNAL',
     signals: 'SIGNAL HISTORY',
+    metals: 'GOLD & SILVER TRADING',
     broker: 'BROKER CONNECTIONS',
   }
 
@@ -230,6 +233,7 @@ export default function AppShell() {
           )}
           {page === 'journal' && <JournalPage trades={trades} />}
           {page === 'signals' && <SignalsPage signals={signals} />}
+          {page === 'metals' && <MetalsPage prices={prices} strategy={strategy} news={news} account={account} onToast={addToast} />}
           {page === 'broker' && <BrokerPage />}
         </div>
       </main>

@@ -9,7 +9,7 @@ const BASE_PRICES: Record<string, number> = {
   'EUR/USD': 1.0842, 'GBP/USD': 1.2714, 'USD/JPY': 149.82,
   'AUD/USD': 0.6523, 'XAU/USD': 2318.40, 'USD/CAD': 1.3641,
   'USD/CHF': 0.9012, 'NZD/USD': 0.5981, 'GBP/JPY': 190.14,
-  'EUR/JPY': 162.39, 'XAG/USD': 27.42,
+  'EUR/JPY': 162.39, 'XAG/USD': 27.42, 'XAG_USD': 27.42,
   'BTC/USD': 62450.00, 'ETH/USD': 3218.50,
 }
 
