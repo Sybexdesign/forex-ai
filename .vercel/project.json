@@ -1,0 +1,16 @@
+{
+  "projectId": "prj_hyWublYciU9j1LItrHxC0N8cQKMS",
+  "orgId": "team_UbOWp9fojt2njSD851oGIzm8",
+  "projectName": "forex-ai",
+  "settings": {
+    "createdAt": 1777807381667,
+    "framework": "nextjs",
+    "devCommand": "npm run dev",
+    "installCommand": "npm install",
+    "buildCommand": "npm run build",
+    "outputDirectory": null,
+    "rootDirectory": null,
+    "directoryListing": false,
+    "nodeVersion": "24.x"
+  }
+}

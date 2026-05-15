@@ -1,0 +1,98 @@
+// app/api/news/route.ts
+// Checks for upcoming high-impact forex news events
+// Uses ForexFactory calendar (public JSON) or falls back to simulation
+
+import { NextResponse } from 'next/server'
+
+export interface NewsEvent {
+  title: string
+  currency: string
+  impact: 'high' | 'medium' | 'low'
+  time: string
+  minutesAway: number
+  isInWindow: boolean
+}
+
+export async function GET() {
+  try {
+    // Try ForexFactory (they sometimes block server fetches, so we catch gracefully)
+    const now = new Date()
+    const dateStr = now.toISOString().split('T')[0].replace(/-/g, '')
+
+    let events: NewsEvent[] = []
+
+    let simulated = false
+    try {
+      const res = await fetch(
+        `https://nfs.faireconomy.media/ff_calendar_thisweek.json`,
+        { next: { revalidate: 300 } } // cache 5 mins
+      )
+      if (res.ok) {
+        const data = await res.json()
+        events = parseForexFactoryEvents(data, now)
+      } else {
+        events = generateSimulatedEvents(now)
+        simulated = true
+      }
+    } catch {
+      events = generateSimulatedEvents(now)
+      simulated = true
+    }
+
+    const inWindow = events.some(e => e.impact === 'high' && e.isInWindow)
+
+    return NextResponse.json({
+      events: events.slice(0, 10),
+      hasHighImpactInWindow: inWindow,
+      windowMinutes: 30,
+      checkedAt: now.toISOString(),
+      simulated,
+    })
+  } catch (error: any) {
+    return NextResponse.json({
+      events: [],
+      hasHighImpactInWindow: false,
+      error: error.message,
+    })
+  }
+}
+
+function parseForexFactoryEvents(data: any[], now: Date): NewsEvent[] {
+  return data
+    .filter(e => e.impact === 'High')
+    .map(e => {
+      const eventTime = new Date(e.date)
+      const minutesAway = Math.round((eventTime.getTime() - now.getTime()) / 60000)
+      return {
+        title: e.title,
+        currency: e.country,
+        impact: 'high' as const,
+        time: eventTime.toISOString(),
+        minutesAway,
+        isInWindow: minutesAway >= -5 && minutesAway <= 30,
+      }
+    })
+    .filter(e => e.minutesAway > -60 && e.minutesAway < 240)
+    .sort((a, b) => a.minutesAway - b.minutesAway)
+}
+
+function generateSimulatedEvents(now: Date): NewsEvent[] {
+  // Simulated upcoming events for demo
+  const events = [
+    { title: 'USD Non-Farm Payrolls', currency: 'USD', minutesOffset: 28 },
+    { title: 'EUR ECB Interest Rate Decision', currency: 'EUR', minutesOffset: 95 },
+    { title: 'GBP CPI y/y', currency: 'GBP', minutesOffset: -30 }, // past
+    { title: 'USD Federal Reserve FOMC Meeting', currency: 'USD', minutesOffset: 180 },
+  ]
+  return events.map(e => {
+    const eventTime = new Date(now.getTime() + e.minutesOffset * 60000)
+    return {
+      title: e.title,
+      currency: e.currency,
+      impact: 'high' as const,
+      time: eventTime.toISOString(),
+      minutesAway: e.minutesOffset,
+      isInWindow: e.minutesOffset >= -5 && e.minutesOffset <= 30,
+    }
+  })
+}

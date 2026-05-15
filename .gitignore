@@ -1,0 +1,9 @@
+node_modules/
+.next/
+.env.local
+.env.test
+*.log
+.vercel/.env.*
+.vercel/output/
+.vercel/README.txt
+.env*.local

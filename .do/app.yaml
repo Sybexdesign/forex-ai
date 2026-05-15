@@ -1,0 +1,60 @@
+name: forex-ai
+region: lon
+
+services:
+  - name: web
+    github:
+      repo: sybexdesign/forex-ai
+      branch: main
+      deploy_on_push: true
+    build_command: npm install && npm run build
+    run_command: npm run start
+    environment_slug: node-js
+    instance_size_slug: apps-s-1vcpu-1gb
+    instance_count: 1
+    http_port: 8080
+    health_check:
+      http_path: /
+    envs:
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_TELEMETRY_DISABLED
+        value: "1"
+      - key: PORT
+        value: "8080"
+      - key: NEXTAUTH_URL
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: ANTHROPIC_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: OANDA_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: OANDA_ACCOUNT_ID
+        scope: RUN_TIME
+        type: SECRET
+      - key: CAPITAL_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: CAPITAL_IDENTIFIER
+        scope: RUN_TIME
+        type: SECRET
+      - key: CAPITAL_PASSWORD
+        scope: RUN_TIME
+        type: SECRET
+      - key: TELEGRAM_BOT_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+      - key: TELEGRAM_CHAT_ID
+        scope: RUN_TIME
+        type: SECRET
