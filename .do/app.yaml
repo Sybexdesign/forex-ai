@@ -58,3 +58,29 @@ services:
       - key: TELEGRAM_CHAT_ID
         scope: RUN_TIME
         type: SECRET
+
+workers:
+  - name: scalper-worker
+    github:
+      repo: sybexdesign/forex-ai
+      branch: main
+      deploy_on_push: true
+    build_command: npm install
+    run_command: node workers/scalper.mjs
+    environment_slug: node-js
+    instance_size_slug: apps-s-1vcpu-1gb
+    instance_count: 1
+    envs:
+      - key: NODE_ENV
+        value: production
+      - key: APP_URL
+        value: https://forex.sybexdesigns.co.uk
+      - key: ANTHROPIC_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: TELEGRAM_BOT_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+      - key: TELEGRAM_CHAT_ID
+        scope: RUN_TIME
+        type: SECRET
