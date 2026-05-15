@@ -100,6 +100,26 @@ const stats = {
   startTime: Date.now(),
 }
 
+// ── Worker Log (Supabase) ─────────────────────────────────────────────────────
+// Writes key events to the worker_logs table so the web app can display them.
+
+async function wlog(level, message, { pair, session, metadata } = {}) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/worker_logs`, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey':        SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer':        'return=minimal',
+      },
+      body:   JSON.stringify({ level, message, pair, session, metadata }),
+      signal: AbortSignal.timeout(5_000),
+    })
+  } catch { /* non-critical — never let logging crash the worker */ }
+}
+
 // ── Pip / Price Helpers ───────────────────────────────────────────────────────
 
 function pipSize(pair) {
@@ -255,6 +275,7 @@ async function processSignal(pair, tick, strategy, session) {
   } catch (e) {
     stats.errors++
     console.error(`[signal] ${pair}:`, e.message)
+    wlog('error', `Signal fetch failed: ${e.message}`, { pair, session })
     return
   }
 
@@ -264,6 +285,12 @@ async function processSignal(pair, tick, strategy, session) {
   console.log(
     `[${pair}] ${strategy}/${session} → ${dir} ${conf}%` +
     (tick.simulated ? ' (sim)' : ` (${tick.broker})`)
+  )
+
+  // Log every signal check to Supabase (ML data + UI visibility)
+  wlog('signal',
+    `${dir} ${conf}% — ${strategy}`,
+    { pair, session, metadata: { direction: dir, confidence: conf, strategy, session, simulated: tick.simulated, entry: signal.entry, sl: signal.sl, tp: signal.tp, reasons: signal.reasons } }
   )
 
   if (dir === 'HOLD' || conf < CONFIDENCE_MIN) return
@@ -278,6 +305,7 @@ async function processSignal(pair, tick, strategy, session) {
   }
   alertCooldowns.set(coolKey, Date.now())
   stats.alerts++
+  wlog('alert', `${dir} ${pair} — confidence ${conf}%`, { pair, session, metadata: { direction: dir, confidence: conf, strategy, session } })
 
   // Risk guards + order placement (live mode only)
   let placed = false
@@ -304,8 +332,10 @@ async function processSignal(pair, tick, strategy, session) {
               placed = true
               stats.trades++
               console.log(`[order] ✓ ${pair} ${dir} → trade ${result.tradeId} @ ${result.filledPrice}`)
+              wlog('order', `${dir} order placed`, { pair, session, metadata: { direction: dir, success: true, tradeId: result.tradeId, filledPrice: result.filledPrice, lots: result.lots } })
             } else {
               console.log(`[order] blocked: ${(result.reasons || []).join(', ')}`)
+              wlog('order', `${dir} order blocked: ${(result.reasons || []).join(', ')}`, { pair, session, metadata: { direction: dir, success: false, reasons: result.reasons } })
             }
           } catch (e) {
             console.error('[order]', e.message)
@@ -400,6 +430,19 @@ async function sendHeartbeat() {
 
   console.log('[heartbeat] sending')
   await tgSend(lines)
+  wlog('heartbeat', `Uptime ${uptimeH}h · Sweeps ${stats.sweeps} · Alerts ${stats.alerts}`, {
+    metadata: {
+      uptimeH: +uptimeH,
+      sweeps:  stats.sweeps,
+      sigChecks: stats.sigChecks,
+      alerts:  stats.alerts,
+      trades:  stats.trades,
+      errors:  stats.errors,
+      market:  isMarketOpen() ? '✅ OPEN' : '🔴 CLOSED',
+      session: getSession(),
+      mode:    WORKER_MODE.toUpperCase(),
+    },
+  })
 }
 
 // ── Midnight Restart ──────────────────────────────────────────────────────────
@@ -447,7 +490,7 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   scheduleMidnightRestart()
   setInterval(sendHeartbeat, HEARTBEAT_MS)
 
-  await tgSend([
+  const startMsg = [
     `🚀 <b>SybexForexAI Worker Started</b>`,
     `Mode     : ${WORKER_MODE.toUpperCase()}`,
     `Interval : 10 seconds`,
@@ -455,7 +498,9 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
     `Strategy : session-aware rotation`,
     `Threshold: confidence ≥ ${CONFIDENCE_MIN}%`,
     `⏱ ${new Date().toUTCString()}`,
-  ].join('\n'))
+  ].join('\n')
+  await tgSend(startMsg)
+  wlog('info', `Worker started — mode: ${WORKER_MODE.toUpperCase()}`, { metadata: { mode: WORKER_MODE, pairs: PAIRS, threshold: CONFIDENCE_MIN } })
 
   // Main polling loop — honours 10-second interval accounting for sweep duration
   while (running) {
@@ -465,6 +510,7 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
     } catch (e) {
       stats.errors++
       console.error('[sweep error]', e.message)
+      wlog('error', `Sweep error: ${e.message}`)
     }
     const elapsed = Date.now() - t0
     const wait    = Math.max(0, POLL_MS - elapsed)
