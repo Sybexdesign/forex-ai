@@ -75,6 +75,8 @@ workers:
         value: production
       - key: APP_URL
         value: https://forex.sybexdesigns.co.uk
+      - key: WORKER_MODE
+        value: paper   # change to 'live' when ready for real orders
       - key: ANTHROPIC_API_KEY
         scope: RUN_TIME
         type: SECRET
@@ -84,3 +86,12 @@ workers:
       - key: TELEGRAM_CHAT_ID
         scope: RUN_TIME
         type: SECRET
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: WORKER_USER_ID
+        scope: RUN_TIME
+        type: SECRET   # set to your Supabase user ID for signal logging
