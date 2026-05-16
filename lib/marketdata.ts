@@ -2,17 +2,18 @@
 // Smart market-data layer with a broker-aware priority chain.
 //
 // Priority order:
-//   1. User's connected broker (if it has a real pull API)
-//   2. OANDA (server-level env-var credentials — real 24/5 price feed)
+//   1. User's connected broker (native API or EA-pushed data)
+//   2. OANDA  (server-level env-var credentials — real 24/5 price feed)
 //   3. Capital.com (server-level env-var credentials)
-//   4. Simulation (absolute last resort — no real broker connected)
+//   4. Simulation (absolute last resort)
 //
-// MT5 Direct, Exness, and Simulation are webhook-only / have no native candle API,
-// so they are skipped in step 1 and fall straight to OANDA.
+// MT5 Direct and Exness store EA-pushed prices/candles in their adapter;
+// OANDA/Capital fallbacks are built into those adapters themselves.
+// Only Simulation is skipped at this layer.
 
 import type { Price, Candle } from './brokers/interface'
 
-const WEBHOOK_ONLY = new Set(['MT5 Direct', 'Exness (MT5)', 'Simulation'])
+const WEBHOOK_ONLY = new Set(['Simulation'])
 
 async function tryOandaCandles(pair: string, timeframe: string, count: number): Promise<Candle[] | null> {
   try {

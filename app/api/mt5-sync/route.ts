@@ -58,7 +58,7 @@ export async function POST(req: NextRequest) {
     if (!token) return NextResponse.json({ error: 'Missing token' }, { status: 400 })
 
     const body = await req.json()
-    const { balance, equity, currency, login, server, completedOrders, openPositions } = body
+    const { balance, equity, currency, login, server, completedOrders, openPositions, prices, candles } = body
 
     if (typeof balance !== 'number') {
       return NextResponse.json({ error: 'balance must be a number' }, { status: 400 })
@@ -120,6 +120,30 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // ── Merge EA-pushed price data ────────────────────────────────────────
+    // prices: { EURUSD: { bid, ask }, GBPUSD: { bid, ask }, ... }
+    const now = new Date().toISOString()
+    let latestPrices: Record<string, any> = row.config?.latestPrices || {}
+    if (prices && typeof prices === 'object') {
+      for (const [sym, p] of Object.entries(prices as Record<string, any>)) {
+        if (typeof p?.bid === 'number' && typeof p?.ask === 'number') {
+          latestPrices[sym] = { bid: p.bid, ask: p.ask, updatedAt: now }
+        }
+      }
+    }
+
+    // ── Merge EA-pushed candle data ───────────────────────────────────────
+    // candles: { timeframe: "M5", data: { EURUSD: [{t,o,h,l,c,v},...], GBPUSD: [...] } }
+    let candleCache: Record<string, any> = row.config?.candleCache || {}
+    if (candles?.timeframe && candles?.data && typeof candles.data === 'object') {
+      const tf = String(candles.timeframe)
+      for (const [sym, bars] of Object.entries(candles.data as Record<string, any>)) {
+        if (Array.isArray(bars) && bars.length >= 10) {
+          candleCache[`${sym}_${tf}`] = { candles: bars, updatedAt: now }
+        }
+      }
+    }
+
     // ── Update broker config with latest balance ──────────────────────────
     const updatedConfig = {
       ...row.config,
@@ -128,8 +152,10 @@ export async function POST(req: NextRequest) {
       currency: currency || row.config.currency || 'USD',
       login: login || row.config.login || '',
       server: server || row.config.server || '',
-      updatedAt: new Date().toISOString(),
+      updatedAt: now,
       pendingOrders,
+      latestPrices,
+      candleCache,
     }
 
     await sb.from('broker_configs')
