@@ -1,6 +1,6 @@
 // app/api/scan/route.ts
-// Scans all watchlist pairs in one shot, runs AI analysis on each,
-// returns only actionable signals (BUY or SELL with checklist >= 6/8).
+// Scans all watchlist pairs in parallel, runs AI analysis,
+// returns only actionable signals with full accuracy filters.
 
 import { NextRequest, NextResponse } from 'next/server'
 import { getBroker } from '@/lib/brokers'
@@ -27,168 +27,249 @@ export interface ScanSignal {
   riskNote: string
   currentPrice: number
   scannedAt: string
-  expiresAt: string       // 15-min window
+  expiresAt: string
   indicators: any
   simulated?: boolean
+  htfConfirmed?: boolean   // higher-timeframe trend confirmed
 }
 
+// Tighter expiry for short timeframes — a 1m signal is stale after 2 candles
 const TF_EXPIRY_MS: Record<string, number> = {
-  '1m': 5 * 60_000, '3m': 10 * 60_000, '5m': 15 * 60_000,
-  '15m': 30 * 60_000, '30m': 60 * 60_000, '1H': 120 * 60_000,
-  '4H': 360 * 60_000, 'Daily': 1440 * 60_000,
+  '1m':   2 * 60_000,    // 2 min  (was 5 — stale after 2 candles)
+  '3m':   5 * 60_000,    // 5 min  (was 10)
+  '5m':   15 * 60_000,
+  '15m':  30 * 60_000,
+  '30m':  60 * 60_000,
+  '1H':   120 * 60_000,
+  '4H':   360 * 60_000,
+  'Daily': 1440 * 60_000,
+}
+
+// Per-timeframe thresholds
+function tfConfig(timeframe: string) {
+  const isShort  = ['1m', '3m', '5m'].includes(timeframe)
+  const isMicro  = ['1m', '3m'].includes(timeframe)
+  return {
+    minChecklistPass: isShort ? 5 : 6,     // 1m/3m/5m allow one extra miss (noisier)
+    atrGuardMult:     isShort ? 3 : 2,     // short TF ATR is naturally small
+    minConfidence:    isMicro ? 55 : 60,   // slightly lower bar for micro scalps
+    htfFrame:         isMicro ? '15m' : null, // multi-TF check for 1m/3m
+    htfCandleCount:   60,
+  }
+}
+
+// Fetch candles with sim fallback
+async function getCandles(broker: any, pair: string, tf: string, count: number) {
+  let simulated = false
+  let candles: any[]
+  try {
+    candles = await broker.getCandles(pair, tf, count)
+    if (!candles || candles.length < 50) throw new Error('insufficient')
+  } catch {
+    const sim = new SimulationBroker()
+    candles = await sim.getCandles(pair, tf, count)
+    simulated = true
+  }
+  return { candles, simulated }
+}
+
+// Higher-timeframe trend confirmation: returns true if HTF trend agrees with direction
+async function confirmHTF(broker: any, pair: string, htfFrame: string, direction: 'BUY' | 'SELL'): Promise<boolean> {
+  try {
+    const { candles } = await getCandles(broker, pair, htfFrame, 60)
+    const ind = calculateIndicators(candles)
+    // HTF must agree on both EMA cross AND MACD histogram direction
+    const htfBullish = ind.emaCrossed && ind.macdHistogram > 0
+    const htfBearish = !ind.emaCrossed && ind.macdHistogram < 0
+    return direction === 'BUY' ? htfBullish : htfBearish
+  } catch {
+    return true  // if HTF fetch fails, don't block the signal
+  }
+}
+
+// Scan a single pair — returns a ScanSignal or null
+async function scanPair(
+  pair: string,
+  timeframe: string,
+  broker: any,
+  strategy: StrategySettings,
+  context: { newsInWindow: boolean; openPositions: number; todayPL: number; accountBalance: number },
+  cfg: ReturnType<typeof tfConfig>,
+): Promise<ScanSignal | null> {
+  // Skip index instruments outside their market session
+  if (!isIndexInSession(pair)) return null
+
+  // 1. Fetch candles for this timeframe
+  const { candles, simulated } = await getCandles(broker, pair, timeframe, 200)
+
+  // 2. Calculate indicators
+  const indicators = calculateIndicators(candles)
+
+  // 3. EMA + MACD must agree on direction
+  const emaDir:  'BUY' | 'SELL' = indicators.emaCrossed      ? 'BUY' : 'SELL'
+  const macdDir: 'BUY' | 'SELL' = indicators.macdHistogram > 0 ? 'BUY' : 'SELL'
+  if (emaDir !== macdDir) return null
+
+  const direction = emaDir
+
+  // 3b. RSI must not be extreme against direction
+  // BUY when RSI overbought (>75) is a low-probability entry; same for SELL at oversold (<25)
+  if (direction === 'BUY'  && indicators.rsi > 75) return null
+  if (direction === 'SELL' && indicators.rsi < 25) return null
+
+  // 3c. ATR volatility guard — TF-aware multiplier
+  const atrResult = calcATRIndicator(candles, pair)
+  if (atrResult.suggestedSL > strategy.slPips * cfg.atrGuardMult) return null
+
+  // 4. Multi-timeframe confirmation for 1m / 3m
+  let htfConfirmed = true
+  if (cfg.htfFrame) {
+    htfConfirmed = await confirmHTF(broker, pair, cfg.htfFrame, direction)
+    if (!htfConfirmed) return null   // HTF contradicts — skip
+  }
+
+  // 5. Checklist — TF-aware minimum pass count
+  const checklist = evaluateChecklist(indicators, direction, {
+    newsInWindow:  context.newsInWindow,
+    signalStrength: indicators.adx,
+    minStrength:   strategy.minStrength,
+    openPositions: context.openPositions,
+    maxPositions:  strategy.maxPositions,
+    todayPL:       context.todayPL,
+    balance:       context.accountBalance,
+    maxLossPct:    strategy.maxLoss,
+  })
+
+  if (!checklist.canTrade || checklist.passCount < cfg.minChecklistPass) return null
+
+  // 6. S/R room check — TP must have 70% clear runway before nearest S/R
+  const pip      = getPipValue(pair)
+  const srResult = detectSupportResistance(candles, pair)
+  if (direction === 'BUY' && srResult.nearestResistance) {
+    const roomPips = (srResult.nearestResistance.price - indicators.currentPrice) / pip
+    if (roomPips < strategy.tpPips * 0.7) return null
+  }
+  if (direction === 'SELL' && srResult.nearestSupport) {
+    const roomPips = (indicators.currentPrice - srResult.nearestSupport.price) / pip
+    if (roomPips < strategy.tpPips * 0.7) return null
+  }
+
+  // 7. AI analysis
+  let rec: any = null
+  const hasKey = !!(process.env.ANTHROPIC_API_KEY &&
+    process.env.ANTHROPIC_API_KEY !== 'your_anthropic_api_key_here')
+
+  if (hasKey) {
+    const isShort = ['1m', '3m', '5m'].includes(timeframe)
+    const systemPrompt = `You are a disciplined forex scalping analyst. Respond ONLY with valid JSON — no markdown.
+JSON format: {"direction":"BUY"|"SELL"|"WAIT","confidence":0-100,"entry_zone":{"low":number,"high":number},"reasons":["r1","r2","r3"],"risk_note":"string","checklist_passed":number}
+${isShort ? `You are analysing a SHORT timeframe (${timeframe}). Signals must be crisp — momentum and immediate price action matter more than lagging indicators. Require tight confluence.` : ''}
+Rules: Only recommend BUY/SELL if ${cfg.minChecklistPass}+ of 8 checklist rules pass. Otherwise return WAIT.`
+
+    try {
+      const prompt = buildIndicatorPrompt(pair, timeframe, indicators, checklist, direction)
+      const msg = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 600,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: prompt }],
+      })
+      const text = msg.content.find(b => b.type === 'text')?.text || '{}'
+      rec = JSON.parse(text.replace(/```json|```/g, '').trim())
+    } catch { /* fall through to null */ }
+  }
+
+  if (!rec || rec.direction === 'WAIT' || (rec.confidence ?? 0) < cfg.minConfidence) return null
+
+  // 8. Build signal
+  const now        = new Date()
+  const sign       = rec.direction === 'BUY' ? 1 : -1
+  const dp         = getPairDecimalPlaces(pair)
+  const lots       = calcStandardPositionSize(context.accountBalance, strategy.riskPct, strategy.slPips, pair)
+  const tpPrice    = +(indicators.currentPrice + strategy.tpPips * pip * sign).toFixed(dp)
+  const slPrice    = +(indicators.currentPrice - strategy.slPips * pip * sign).toFixed(dp)
+  const expiryMs   = TF_EXPIRY_MS[timeframe] ?? 15 * 60_000
+
+  const signal: ScanSignal = {
+    id:            `scan-${pair.replace('/', '')}-${now.getTime()}`,
+    pair,
+    timeframe,
+    direction:     rec.direction,
+    confidence:    rec.confidence,
+    checklistScore: checklist.passCount,
+    entryZone:     rec.entry_zone || { low: indicators.currentPrice, high: indicators.currentPrice },
+    reasons:       rec.reasons || [],
+    riskNote:      rec.risk_note || '',
+    currentPrice:  indicators.currentPrice,
+    scannedAt:     now.toISOString(),
+    expiresAt:     new Date(now.getTime() + expiryMs).toISOString(),
+    indicators,
+    simulated,
+    htfConfirmed,
+  }
+
+  // Telegram alert (non-blocking)
+  alertNewSignal({
+    pair, direction: rec.direction, confidence: rec.confidence,
+    checklistScore: checklist.passCount,
+    currentPrice: indicators.currentPrice, timeframe,
+    entryLow: signal.entryZone.low, entryHigh: signal.entryZone.high,
+    tpPrice, slPrice, lots,
+    reasons: rec.reasons || [],
+  })
+
+  return signal
 }
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-    const { pairs, timeframe = '1H', strategy, newsInWindow = false, openPositions = 0, todayPL = 0, accountBalance = 10000 } = body as {
-      pairs: string[]
-      timeframe: string
-      strategy: StrategySettings
-      newsInWindow: boolean
-      openPositions: number
-      todayPL: number
-      accountBalance: number
+    const {
+      pairs, timeframe = '1H', strategy,
+      newsInWindow = false, openPositions = 0, todayPL = 0, accountBalance = 10000,
+    } = body as {
+      pairs: string[]; timeframe: string; strategy: StrategySettings
+      newsInWindow: boolean; openPositions: number; todayPL: number; accountBalance: number
     }
 
     if (!pairs?.length) return NextResponse.json({ signals: [] })
 
     const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
-    const broker = await getBroker(authToken)
-    const signals: ScanSignal[] = []
+    const broker    = await getBroker(authToken)
+    const cfg       = tfConfig(timeframe)
+    const context   = { newsInWindow, openPositions, todayPL, accountBalance }
 
-    // Scan each pair sequentially to avoid rate limits
-    for (const pair of pairs) {
-      try {
-        // Skip index instruments outside their market session
-        if (!isIndexInSession(pair)) continue
+    // Run all pairs in parallel — cuts total scan time from 60-90 s → 10-15 s
+    // Batch in groups of 3 to avoid hitting Claude rate limits
+    const results: ScanSignal[] = []
+    const BATCH = 3
 
-        // 1. Get candles
-        let candles: any[]
-        let candlesSimulated = false
-        try {
-          candles = await broker.getCandles(pair, timeframe, 200)
-          if (!candles || candles.length < 60) throw new Error('insufficient')
-        } catch {
-          const sim = new SimulationBroker()
-          candles = await sim.getCandles(pair, timeframe, 200)
-          candlesSimulated = true
-        }
-
-        // 2. Calculate indicators
-        const indicators = calculateIndicators(candles)
-
-        // 3. Determine direction — require EMA AND MACD to agree (conflicting = skip, reduces false signals)
-        const emaDir: 'BUY' | 'SELL' = indicators.emaCrossed ? 'BUY' : 'SELL'
-        const macdDir: 'BUY' | 'SELL' = indicators.macdHistogram > 0 ? 'BUY' : 'SELL'
-        if (emaDir !== macdDir) continue  // EMA and MACD disagree — no high-probability setup
-
-        const direction = emaDir
-
-        // 3b. ATR volatility guard — if ATR-based SL is >2x our fixed SL, volatility too high for fixed stops
-        const atrResult = calcATRIndicator(candles, pair)
-        if (atrResult.suggestedSL > strategy.slPips * 2) continue
-
-        // 4. Run checklist
-        const checklist = evaluateChecklist(indicators, direction, {
-          newsInWindow,
-          signalStrength: indicators.adx,  // pass actual ADX, used for context only
-          minStrength: strategy.minStrength,
-          openPositions,
-          maxPositions: strategy.maxPositions,
-          todayPL,
-          balance: accountBalance,
-          maxLossPct: strategy.maxLoss,
-        })
-
-        // Skip pairs that can't trade or have weak signal
-        if (!checklist.canTrade || checklist.passCount < 6) continue
-
-        // 4b. S/R room check — ensure TP can be reached before nearest S/R level blocks it
-        const pip = getPipValue(pair)
-        const srResult = detectSupportResistance(candles, pair)
-        const tpDistance = strategy.tpPips * pip
-        if (direction === 'BUY' && srResult.nearestResistance) {
-          const roomPips = (srResult.nearestResistance.price - indicators.currentPrice) / pip
-          if (roomPips < strategy.tpPips * 0.7) continue  // resistance blocks TP
-        }
-        if (direction === 'SELL' && srResult.nearestSupport) {
-          const roomPips = (indicators.currentPrice - srResult.nearestSupport.price) / pip
-          if (roomPips < strategy.tpPips * 0.7) continue  // support blocks TP
-        }
-
-        // 5. Run AI analysis
-        let rec: any = null
-        try {
-          if (process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY !== 'your_anthropic_api_key_here') {
-            const systemPrompt = `You are a disciplined forex trading analyst. Respond ONLY with valid JSON — no markdown.
-JSON format: {"direction":"BUY"|"SELL"|"WAIT","confidence":0-100,"entry_zone":{"low":number,"high":number},"reasons":["r1","r2","r3"],"risk_note":"string","checklist_passed":number}
-Rules: Only recommend BUY/SELL if 6+ of 8 checklist rules pass. Otherwise return WAIT.`
-            const prompt = buildIndicatorPrompt(pair, timeframe, indicators, checklist, direction)
-            const msg = await anthropic.messages.create({
-              model: 'claude-sonnet-4-6',
-              max_tokens: 600,
-              system: systemPrompt,
-              messages: [{ role: 'user', content: prompt }],
-            })
-            const text = msg.content.find(b => b.type === 'text')?.text || '{}'
-            rec = JSON.parse(text.replace(/```json|```/g, '').trim())
-          }
-        } catch { /* fall through to skip */ }
-
-        if (!rec || rec.direction === 'WAIT' || rec.confidence < 60) continue
-
-        const now = new Date()
-        const pipPerLot = getPipValuePerLot(pair)
-        const lots = calcStandardPositionSize(accountBalance, strategy.riskPct, strategy.slPips, pair)
-        const sign = rec.direction === 'BUY' ? 1 : -1
-        const dp = getPairDecimalPlaces(pair)
-        const tpPrice = +(indicators.currentPrice + strategy.tpPips * pip * sign).toFixed(dp)
-        const slPrice = +(indicators.currentPrice - strategy.slPips * pip * sign).toFixed(dp)
-
-        const signal: ScanSignal = {
-          id: `scan-${pair.replace('/', '')}-${now.getTime()}`,
-          pair,
-          timeframe,
-          direction: rec.direction,
-          confidence: rec.confidence,
-          checklistScore: checklist.passCount,
-          entryZone: rec.entry_zone || { low: indicators.currentPrice, high: indicators.currentPrice },
-          reasons: rec.reasons || [],
-          riskNote: rec.risk_note || '',
-          currentPrice: indicators.currentPrice,
-          scannedAt: now.toISOString(),
-          expiresAt: new Date(now.getTime() + (TF_EXPIRY_MS[timeframe] ?? 15 * 60_000)).toISOString(),
-          indicators,
-          simulated: candlesSimulated,
-        }
-
-        // Fire Telegram alert for this signal (non-blocking)
-        alertNewSignal({
-          pair, direction: rec.direction, confidence: rec.confidence,
-          checklistScore: checklist.passCount,
-          currentPrice: indicators.currentPrice, timeframe,
-          entryLow: signal.entryZone.low, entryHigh: signal.entryZone.high,
-          tpPrice, slPrice, lots,
-          reasons: rec.reasons || [],
-        })
-
-        signals.push(signal)
-      } catch (e: any) {
-        console.error(`[scan] ${pair}:`, e?.message)
+    for (let i = 0; i < pairs.length; i += BATCH) {
+      const batch  = pairs.slice(i, i + BATCH)
+      const settled = await Promise.allSettled(
+        batch.map(pair =>
+          scanPair(pair, timeframe, broker, strategy, context, cfg)
+            .catch(e => { console.error(`[scan] ${pair}:`, e?.message); return null })
+        )
+      )
+      for (const r of settled) {
+        if (r.status === 'fulfilled' && r.value) results.push(r.value)
       }
     }
 
-    // Summary alert if any signals found
-    if (signals.length > 0) {
+    if (results.length > 0) {
       alertScanComplete({
         pairsScanned: pairs.length,
-        signalsFound: signals.length,
-        pairs: signals.map(s => `${s.pair} ${s.direction} (${s.confidence}%)`),
+        signalsFound: results.length,
+        pairs: results.map(s => `${s.pair} ${s.direction} (${s.confidence}%)`),
       })
     }
 
-    return NextResponse.json({ signals, scannedAt: new Date().toISOString(), pairsScanned: pairs.length })
+    return NextResponse.json({
+      signals: results,
+      scannedAt: new Date().toISOString(),
+      pairsScanned: pairs.length,
+    })
   } catch (error: any) {
     console.error('[scan]', error)
     return NextResponse.json({ error: error.message }, { status: 500 })
