@@ -2,10 +2,15 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 
 function getUrl() {
-  return process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://xyzplaceholder.supabase.co'
+  // SUPABASE_URL is a server-side runtime var that bypasses Next.js build-time substitution
+  return process.env.SUPABASE_URL
+    || process.env.NEXT_PUBLIC_SUPABASE_URL
+    || 'https://xyzplaceholder.supabase.co'
 }
 function getAnonKey() {
-  return process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder'
+  return process.env.SUPABASE_ANON_KEY
+    || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder'
 }
 function getServiceKey() {
   return process.env.SUPABASE_SERVICE_ROLE_KEY || getAnonKey()
