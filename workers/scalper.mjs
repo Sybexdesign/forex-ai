@@ -17,7 +17,7 @@
 const BASE_URL       = process.env.APP_URL || 'https://forex.sybexdesigns.co.uk'
 const BOT_TOKEN      = process.env.TELEGRAM_BOT_TOKEN
 const CHAT_ID        = process.env.TELEGRAM_CHAT_ID
-const SUPABASE_URL   = process.env.NEXT_PUBLIC_SUPABASE_URL
+const SUPABASE_URL   = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
 const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY
 const WORKER_MODE    = (process.env.WORKER_MODE || 'paper').toLowerCase() // 'paper' | 'live'
 const WORKER_USER_ID = process.env.WORKER_USER_ID  // optional: Supabase user ID for logging
@@ -26,7 +26,7 @@ const POLL_MS          = 10_000       // 10 s per sweep
 const SIG_COOLDOWN_MS  = 60_000       // 1 min between Claude calls per pair
 const ALERT_COOL_MS    = 15 * 60_000  // 15 min per pair+direction alert
 const RISK_CACHE_MS    = 2  * 60_000  // 2 min account state cache
-const HEARTBEAT_MS     = 4  * 3_600_000
+const HEARTBEAT_MS     = 30 * 60_000
 const FETCH_TIMEOUT_MS = 45_000       // Claude API can take 10-15 s
 const MAX_SIG_BATCH    = 3            // max concurrent Claude calls per sweep
 const CONFIDENCE_MIN   = 70           // minimum confidence to alert/trade
@@ -380,6 +380,14 @@ async function runSweep() {
   const session = getSession()
   const now     = new Date().toISOString().slice(11, 19)
   console.log(`── sweep #${stats.sweeps}  ${now} UTC  [${session}] ──`)
+
+  // Write a sweep summary to Supabase every 30 sweeps (~5 min) so logs page shows activity
+  if (stats.sweeps % 30 === 0) {
+    wlog('info', `Sweep #${stats.sweeps} · session ${session} · checked ${stats.sigChecks} signals · ${stats.alerts} alerts`, {
+      session,
+      metadata: { sweeps: stats.sweeps, sigChecks: stats.sigChecks, alerts: stats.alerts, errors: stats.errors },
+    })
+  }
 
   // Phase 1: fetch all ticks concurrently
   const tickResults = await Promise.allSettled(

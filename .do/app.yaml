@@ -104,6 +104,9 @@ workers:
       - key: TELEGRAM_CHAT_ID
         scope: RUN_TIME
         type: SECRET
+      - key: SUPABASE_URL
+        value: https://lfurosnmkwvqtlifggaa.supabase.co
+        scope: RUN_TIME
       - key: NEXT_PUBLIC_SUPABASE_URL
         scope: RUN_TIME
         type: SECRET
