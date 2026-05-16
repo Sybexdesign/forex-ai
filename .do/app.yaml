@@ -38,11 +38,11 @@ services:
         scope: RUN_AND_BUILD_TIME
         type: SECRET
       - key: NEXT_PUBLIC_SUPABASE_URL
+        value: https://lfurosnmkwvqtlifggaa.supabase.co
         scope: RUN_AND_BUILD_TIME
-        type: SECRET
       - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxmdXJvc25ta3d2cXRsaWZnZ2FhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjQ4MzEsImV4cCI6MjA5MzMwMDgzMX0.ZWxFA-D57GqObQM_jSQ2PvNbqfxPOY4YBd__XZiFeWA
         scope: RUN_AND_BUILD_TIME
-        type: SECRET
       - key: SUPABASE_URL
         value: https://lfurosnmkwvqtlifggaa.supabase.co
         scope: RUN_TIME
