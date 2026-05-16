@@ -387,18 +387,15 @@ async function runSweep() {
   const now     = new Date().toISOString().slice(11, 19)
   console.log(`── sweep #${stats.sweeps}  ${now} UTC  [${session}] ──`)
 
-  // Sweep ping every 6 sweeps (~1 min) so the logs page shows the worker is alive
-  if (stats.sweeps === 1 || stats.sweeps % 6 === 0) {
-    wlog('info', `▶ Sweep #${stats.sweeps} · ${session} · ${stats.sigChecks} checks · ${stats.alerts} alerts`, {
-      session,
-      metadata: { sweeps: stats.sweeps, sigChecks: stats.sigChecks, alerts: stats.alerts, errors: stats.errors },
-    })
-  }
+  // DIAGNOSTIC: await wlog to confirm sweep entry point is reached
+  await wlog('info', `▶ Sweep #${stats.sweeps} enter · ${session}`)
 
   // Phase 1: fetch all ticks concurrently
   const tickResults = await Promise.allSettled(
     PAIRS.map(async pair => ({ pair, tick: await fetchTick(pair) }))
   )
+
+  await wlog('info', `▶ Sweep #${stats.sweeps} ticks done · ${tickResults.filter(r => r.status === 'fulfilled').length}/${PAIRS.length} ok`)
 
   // Phase 2: pre-filter — build signal candidate queue
   const queue = []
