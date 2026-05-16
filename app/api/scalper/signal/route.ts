@@ -185,7 +185,8 @@ Return JSON only:
         const text  = message.content.find(b => b.type === 'text')?.text || '{}'
         const clean = text.replace(/```json|```/g, '').trim()
         result      = JSON.parse(clean)
-      } catch {
+      } catch (e: any) {
+        console.error('[scalper/signal] Claude error:', e?.status, e?.message)
         result   = fallbackSignal(t, strategy, pair)
         fallback = true
       }
