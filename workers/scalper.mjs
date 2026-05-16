@@ -375,6 +375,7 @@ async function processSignal(pair, tick, strategy, session) {
 // ── Sweep ─────────────────────────────────────────────────────────────────────
 
 async function runSweep() {
+  await wlog('info', `runSweep ENTERED sweeps=${stats.sweeps + 1}`)  // first line diagnostic
   stats.sweeps++
 
   if (!isMarketOpen()) {
