@@ -85,7 +85,10 @@ function checkRisk(sig: Signal | null, balance: number, dailyPnL: number, openCo
   const checks: { label: string; ok: boolean }[] = []
   let passed = true
 
-  checks.push({ label: `Risk ≤ ${RISK_CFG.maxRiskPct}% ($${(balance * RISK_CFG.maxRiskPct / 100).toFixed(0)})`, ok: true })
+  const riskAmt = balance * RISK_CFG.maxRiskPct / 100
+  const riskOk  = balance > 0  // balance 0 = can't size a trade
+  if (!riskOk) passed = false
+  checks.push({ label: `Risk ≤ ${RISK_CFG.maxRiskPct}% ($${riskAmt.toFixed(0)})`, ok: riskOk })
 
   const limit = balance * RISK_CFG.maxDailyLossPct / 100
   if (dailyPnL < -limit) { checks.push({ label: 'Daily loss limit hit', ok: false }); passed = false }
@@ -295,7 +298,7 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
               onRefreshAccount?.()
               onRefreshTrades?.()
             } else {
-              addLog(`[LIVE] Order blocked: ${order.reason || 'unknown'}`, 'risk')
+              addLog(`[LIVE] Order blocked: ${order.reasons?.[0] || order.reason || 'unknown'}`, 'risk')
             }
           } catch (e: any) {
             addLog(`[LIVE] Order failed: ${e.message}`, 'risk')
@@ -585,11 +588,15 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
         <Panel title="LAYER 3 — AI PREDICTION" badge={<LayerBadge label="DUAL ENGINE" color={C.purple} />}>
           <div style={{ padding: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <div style={{ padding: 10, borderRadius: 4, border: '1px solid var(--border)' }}>
-              <div style={{ fontSize: 10, color: C.amber, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>ML MODEL</div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>XGBoost — Stage 2</div>
+              <div style={{ fontSize: 10, color: C.amber, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>SIGNAL ENGINE</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                {aiConn === 'live' ? 'Claude Sonnet 4.6' : aiConn === 'fallback' ? 'Rule-based fallback' : 'Awaiting tick'}
+              </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
-                <span style={{ width: 5, height: 5, borderRadius: '50%', background: C.cyan, display: 'inline-block', flexShrink: 0 }} />
-                <span className="mono" style={{ fontSize: 9, color: C.cyan, letterSpacing: 0.5 }}>Collecting training data</span>
+                <span style={{ width: 5, height: 5, borderRadius: '50%', background: aiConn === 'live' ? C.green : aiConn === 'error' ? C.red : C.amber, display: 'inline-block', flexShrink: 0 }} />
+                <span className="mono" style={{ fontSize: 9, color: aiConn === 'live' ? C.green : C.amber, letterSpacing: 0.5 }}>
+                  {aiConn === 'live' ? 'AI ACTIVE' : aiConn === 'fallback' ? 'RULE-BASED' : connLabel[aiConn]}
+                </span>
               </div>
               <div className="mono" style={{ fontSize: 22, fontWeight: 700, marginTop: 8, color: dirColor(signal?.direction) }}>
                 {signal?.confidence ?? '—'}<span style={{ fontSize: 11 }}>%</span>
