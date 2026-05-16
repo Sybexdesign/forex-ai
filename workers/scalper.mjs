@@ -375,7 +375,6 @@ async function processSignal(pair, tick, strategy, session) {
 // ── Sweep ─────────────────────────────────────────────────────────────────────
 
 async function runSweep() {
-  await wlog('info', `runSweep ENTERED sweeps=${stats.sweeps + 1}`)  // first line diagnostic
   stats.sweeps++
 
   if (!isMarketOpen()) {
@@ -388,15 +387,18 @@ async function runSweep() {
   const now     = new Date().toISOString().slice(11, 19)
   console.log(`── sweep #${stats.sweeps}  ${now} UTC  [${session}] ──`)
 
-  // DIAGNOSTIC: await wlog to confirm sweep entry point is reached
-  await wlog('info', `▶ Sweep #${stats.sweeps} enter · ${session}`)
+  // Sweep ping every 6 sweeps (~1 min) so the logs page shows the worker is alive
+  if (stats.sweeps % 6 === 0) {
+    wlog('info', `▶ Sweep #${stats.sweeps} · ${session} · ${stats.sigChecks} checks · ${stats.alerts} alerts`, {
+      session,
+      metadata: { sweeps: stats.sweeps, sigChecks: stats.sigChecks, alerts: stats.alerts, errors: stats.errors },
+    })
+  }
 
   // Phase 1: fetch all ticks concurrently
   const tickResults = await Promise.allSettled(
     PAIRS.map(async pair => ({ pair, tick: await fetchTick(pair) }))
   )
-
-  await wlog('info', `▶ Sweep #${stats.sweeps} ticks done · ${tickResults.filter(r => r.status === 'fulfilled').length}/${PAIRS.length} ok`)
 
   // Phase 2: pre-filter — build signal candidate queue
   const queue = []
@@ -515,17 +517,14 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   wlog('info', `Worker started — mode: ${WORKER_MODE.toUpperCase()}`, { metadata: { mode: WORKER_MODE, pairs: PAIRS, threshold: CONFIDENCE_MIN } })
 
   // Main polling loop — honours 10-second interval accounting for sweep duration
-  let loopCount = 0
   while (running) {
-    loopCount++
-    if (loopCount === 1) await wlog('info', `Loop started — iteration ${loopCount}`)  // diagnostic
     const t0 = Date.now()
     try {
       await runSweep()
     } catch (e) {
       stats.errors++
       console.error('[sweep error]', e.message)
-      await wlog('error', `Sweep error: ${e.message}`)
+      wlog('error', `Sweep error: ${e.message}`)
     }
     const elapsed = Date.now() - t0
     const wait    = Math.max(0, POLL_MS - elapsed)
