@@ -517,14 +517,17 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   wlog('info', `Worker started — mode: ${WORKER_MODE.toUpperCase()}`, { metadata: { mode: WORKER_MODE, pairs: PAIRS, threshold: CONFIDENCE_MIN } })
 
   // Main polling loop — honours 10-second interval accounting for sweep duration
+  let loopCount = 0
   while (running) {
+    loopCount++
+    if (loopCount === 1) await wlog('info', `Loop started — iteration ${loopCount}`)  // diagnostic
     const t0 = Date.now()
     try {
       await runSweep()
     } catch (e) {
       stats.errors++
       console.error('[sweep error]', e.message)
-      wlog('error', `Sweep error: ${e.message}`)
+      await wlog('error', `Sweep error: ${e.message}`)
     }
     const elapsed = Date.now() - t0
     const wait    = Math.max(0, POLL_MS - elapsed)
