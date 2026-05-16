@@ -153,13 +153,15 @@ export default function WorkerPage() {
           <>
             <div style={{ width: 1, height: 18, background: C.border }} />
             <div style={{ display: 'flex', gap: 16 }}>
-              {[
-                ['Sweeps', hbMeta.sweeps?.toLocaleString()],
-                ['Signals', hbMeta.sigChecks],
-                ['Alerts', hbMeta.alerts],
-                hbMeta.trades != null ? ['Trades', hbMeta.trades] : null,
-                ['Errors', hbMeta.errors],
-              ].filter(Boolean).map(([k, v]) => (
+              {(
+                [
+                  ['Sweeps', hbMeta.sweeps?.toLocaleString()],
+                  ['Signals', hbMeta.sigChecks],
+                  ['Alerts', hbMeta.alerts],
+                  hbMeta.trades != null ? ['Trades', hbMeta.trades] : null,
+                  ['Errors', hbMeta.errors],
+                ] as ([string, unknown] | null)[]
+              ).filter((x): x is [string, unknown] => x !== null).map(([k, v]) => (
                 <div key={k as string} style={{ textAlign: 'center' }}>
                   <div style={{ color: C.muted, fontSize: 9, letterSpacing: 1 }}>{k as string}</div>
                   <div style={{ color: C.text, fontSize: 13, fontWeight: 700 }}>{v as string}</div>
