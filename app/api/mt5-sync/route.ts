@@ -48,6 +48,7 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({ ok: true, pendingOrders: active })
   } catch (e: any) {
+    console.error('[mt5-sync] UNCAUGHT ERROR in GET:', e?.message)
     return NextResponse.json({ error: e.message }, { status: 500 })
   }
 }
@@ -67,9 +68,10 @@ export async function POST(req: NextRequest) {
     }
 
     const hasPrices  = prices  && typeof prices  === 'object' && Object.keys(prices).length  > 0
-    const hasCandles = candles && typeof candles  === 'object' && candles.data
+    const hasCandles = candles && typeof candles  === 'object' && !!candles.data
     console.log(`[mt5-sync] balance=${balance} prices=${hasPrices} candles=${hasCandles} login=${login || '?'}`)
 
+    console.log('[mt5-sync] A: querying broker_configs')
     const sb = serviceClient()
 
     // Find broker_config row with this webhook token
@@ -78,6 +80,7 @@ export async function POST(req: NextRequest) {
       .select('id, user_id, config')
       .in('broker_type', ['mt5direct', 'exness'])
 
+    console.log(`[mt5-sync] B: query result rows=${rows?.length ?? 'null'} err=${error?.message ?? 'none'}`)
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
 
     const row = (rows || []).find((r: any) => r.config?.webhookToken === token)
@@ -85,6 +88,7 @@ export async function POST(req: NextRequest) {
       console.warn('[mt5-sync] Invalid token — no matching broker_config found')
       return NextResponse.json({ error: 'Invalid token' }, { status: 401 })
     }
+    console.log('[mt5-sync] C: row found, id=', row.id?.slice(0, 8))
 
     const userId = row.user_id
 
@@ -183,6 +187,7 @@ export async function POST(req: NextRequest) {
     console.log('[mt5-sync] DB write OK')
     return NextResponse.json({ ok: true, prices: priceSymbols.length, candles: candleSymbols.length })
   } catch (e: any) {
+    console.error('[mt5-sync] UNCAUGHT ERROR in POST:', e?.message, e?.stack?.split('\n').slice(0,3).join(' | '))
     return NextResponse.json({ error: e.message }, { status: 500 })
   }
 }
