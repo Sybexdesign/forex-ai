@@ -48,6 +48,13 @@ export class Mt5DirectBroker implements IBroker {
   }
 
   async getPrices(pairs: string[]): Promise<Price[]> {
+    // MT5 Direct is webhook-only — use OANDA as the real-time price source,
+    // fall back to Capital.com if OANDA is unavailable.
+    try {
+      const { OandaBroker } = await import('./oanda.adapter')
+      const prices = await new OandaBroker().getPrices(pairs)
+      if (prices.length > 0) return prices
+    } catch { /* fall through */ }
     try {
       const { CapitalBroker } = await import('./capital.adapter')
       return new CapitalBroker().getPrices(pairs)
@@ -55,6 +62,13 @@ export class Mt5DirectBroker implements IBroker {
   }
 
   async getCandles(pair: string, timeframe: string, count = 200): Promise<Candle[]> {
+    // MT5 Direct is webhook-only — use OANDA as the real-time candle source,
+    // fall back to Capital.com if OANDA is unavailable.
+    try {
+      const { OandaBroker } = await import('./oanda.adapter')
+      const candles = await new OandaBroker().getCandles(pair, timeframe, count)
+      if (candles.length >= 50) return candles
+    } catch { /* fall through */ }
     try {
       const { CapitalBroker } = await import('./capital.adapter')
       return new CapitalBroker().getCandles(pair, timeframe, count)

@@ -1,8 +1,7 @@
 // app/api/scalper/tick/route.ts
 import { NextRequest, NextResponse } from 'next/server'
-import { getBroker } from '@/lib/brokers'
+import { getMarketCandles } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'
-import { SimulationBroker } from '@/lib/brokers/simulation.adapter'
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const ti = require('technicalindicators')
@@ -26,21 +25,7 @@ export async function GET(req: NextRequest) {
   const timeframe = searchParams.get('timeframe') || '5m'
   const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
 
-  let candles: any[]
-  let brokerName = 'Unknown'
-  let simulated  = false
-
-  try {
-    const broker = await getBroker(authToken)
-    brokerName   = broker.name
-    candles      = await broker.getCandles(pair, timeframe, 200)
-    if (!candles || candles.length < 60) throw new Error('Insufficient candles')
-  } catch {
-    const sim  = new SimulationBroker()
-    candles    = await sim.getCandles(pair, timeframe, 200)
-    brokerName = 'Simulation'
-    simulated  = true
-  }
+  const { candles, source: brokerName, simulated } = await getMarketCandles(authToken, pair, timeframe, 200)
 
   // Standard indicators (EMA20/50, RSI14, MACD, Bollinger, ADX)
   const ind = calculateIndicators(candles)

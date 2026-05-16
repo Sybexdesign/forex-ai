@@ -258,19 +258,10 @@ function generateDemoRecommendation(
 
 export async function getAdvancedContext(pair: string, timeframe: string, authToken?: string): Promise<string> {
   try {
-    const { getBroker } = await import('@/lib/brokers')
-    const { SimulationBroker } = await import('@/lib/brokers/simulation.adapter')
+    const { getMarketCandles } = await import('@/lib/marketdata')
     const { runAdvancedAnalysis } = await import('@/lib/advanced-indicators')
 
-    let candles: any[]
-    try {
-      const broker = await getBroker(authToken)
-      candles = await broker.getCandles(pair, timeframe, 200)
-      if (!candles || candles.length < 50) throw new Error('insufficient')
-    } catch {
-      const sim = new SimulationBroker()
-      candles = await sim.getCandles(pair, timeframe, 200)
-    }
+    const { candles } = await getMarketCandles(authToken, pair, timeframe, 200)
 
     const analysis = runAdvancedAnalysis(candles, pair)
     const patternList = analysis.patterns.patterns.length > 0

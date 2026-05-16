@@ -3,9 +3,8 @@
 // returns only actionable signals with full accuracy filters.
 
 import { NextRequest, NextResponse } from 'next/server'
-import { getBroker } from '@/lib/brokers'
+import { getMarketCandles } from '@/lib/marketdata'
 import { calculateIndicators, evaluateChecklist, buildIndicatorPrompt } from '@/lib/indicators'
-import { SimulationBroker } from '@/lib/brokers/simulation.adapter'
 import Anthropic from '@anthropic-ai/sdk'
 import type { StrategySettings } from '@/lib/supabase'
 import { alertNewSignal, alertScanComplete } from '@/lib/telegram'
@@ -58,32 +57,22 @@ function tfConfig(timeframe: string) {
   }
 }
 
-// Fetch candles with sim fallback
-async function getCandles(broker: any, pair: string, tf: string, count: number) {
-  let simulated = false
-  let candles: any[]
-  try {
-    candles = await broker.getCandles(pair, tf, count)
-    if (!candles || candles.length < 50) throw new Error('insufficient')
-  } catch {
-    const sim = new SimulationBroker()
-    candles = await sim.getCandles(pair, tf, count)
-    simulated = true
-  }
-  return { candles, simulated }
+// Fetch candles using the smart market-data chain (native broker → OANDA → Capital → Sim)
+async function getCandles(authToken: string | undefined, pair: string, tf: string, count: number) {
+  const result = await getMarketCandles(authToken, pair, tf, count)
+  return { candles: result.candles, simulated: result.simulated }
 }
 
 // Higher-timeframe trend confirmation: returns true if HTF trend agrees with direction
-async function confirmHTF(broker: any, pair: string, htfFrame: string, direction: 'BUY' | 'SELL'): Promise<boolean> {
+async function confirmHTF(authToken: string | undefined, pair: string, htfFrame: string, direction: 'BUY' | 'SELL'): Promise<boolean> {
   try {
-    const { candles } = await getCandles(broker, pair, htfFrame, 60)
+    const { candles } = await getCandles(authToken, pair, htfFrame, 60)
     const ind = calculateIndicators(candles)
-    // HTF must agree on both EMA cross AND MACD histogram direction
     const htfBullish = ind.emaCrossed && ind.macdHistogram > 0
     const htfBearish = !ind.emaCrossed && ind.macdHistogram < 0
     return direction === 'BUY' ? htfBullish : htfBearish
   } catch {
-    return true  // if HTF fetch fails, don't block the signal
+    return true
   }
 }
 
@@ -91,7 +80,7 @@ async function confirmHTF(broker: any, pair: string, htfFrame: string, direction
 async function scanPair(
   pair: string,
   timeframe: string,
-  broker: any,
+  authToken: string | undefined,
   strategy: StrategySettings,
   context: { newsInWindow: boolean; openPositions: number; todayPL: number; accountBalance: number },
   cfg: ReturnType<typeof tfConfig>,
@@ -100,7 +89,7 @@ async function scanPair(
   if (!isIndexInSession(pair)) return null
 
   // 1. Fetch candles for this timeframe
-  const { candles, simulated } = await getCandles(broker, pair, timeframe, 200)
+  const { candles, simulated } = await getCandles(authToken, pair, timeframe, 200)
 
   // 2. Calculate indicators
   const indicators = calculateIndicators(candles)
@@ -124,8 +113,8 @@ async function scanPair(
   // 4. Multi-timeframe confirmation for 1m / 3m
   let htfConfirmed = true
   if (cfg.htfFrame) {
-    htfConfirmed = await confirmHTF(broker, pair, cfg.htfFrame, direction)
-    if (!htfConfirmed) return null   // HTF contradicts — skip
+    htfConfirmed = await confirmHTF(authToken, pair, cfg.htfFrame, direction)
+    if (!htfConfirmed) return null
   }
 
   // 5. Checklist — TF-aware minimum pass count
@@ -235,7 +224,6 @@ export async function POST(req: NextRequest) {
     if (!pairs?.length) return NextResponse.json({ signals: [] })
 
     const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
-    const broker    = await getBroker(authToken)
     const cfg       = tfConfig(timeframe)
     const context   = { newsInWindow, openPositions, todayPL, accountBalance }
 
@@ -248,7 +236,7 @@ export async function POST(req: NextRequest) {
       const batch  = pairs.slice(i, i + BATCH)
       const settled = await Promise.allSettled(
         batch.map(pair =>
-          scanPair(pair, timeframe, broker, strategy, context, cfg)
+          scanPair(pair, timeframe, authToken, strategy, context, cfg)
             .catch(e => { console.error(`[scan] ${pair}:`, e?.message); return null })
         )
       )

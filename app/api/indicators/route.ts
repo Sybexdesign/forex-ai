@@ -1,6 +1,6 @@
 // app/api/indicators/route.ts
 import { NextRequest, NextResponse } from 'next/server'
-import { getBroker } from '@/lib/brokers'
+import { getMarketCandles } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'
 
 export async function GET(req: NextRequest) {
@@ -8,21 +8,8 @@ export async function GET(req: NextRequest) {
   const timeframe = req.nextUrl.searchParams.get('timeframe') || '1H'
   const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
   try {
-    let candles: any[]
-    let brokerName: string
-    try {
-      const broker = await getBroker(authToken)
-      candles = await broker.getCandles(pair, timeframe, 200)
-      brokerName = broker.name
-      if (!candles || candles.length < 60) throw new Error('insufficient candle data')
-    } catch {
-      const { SimulationBroker } = await import('@/lib/brokers/simulation.adapter')
-      const sim = new SimulationBroker()
-      candles = await sim.getCandles(pair, timeframe, 200)
-      brokerName = 'Simulation (fallback)'
-    }
+    const { candles, source: brokerName, simulated } = await getMarketCandles(authToken, pair, timeframe, 200)
     const indicators = calculateIndicators(candles)
-    const simulated = brokerName === 'Simulation (fallback)'
     return NextResponse.json({ indicators, pair, timeframe, broker: brokerName, candleCount: candles.length, simulated })
   } catch (error: any) {
     console.error('[indicators]', error)
