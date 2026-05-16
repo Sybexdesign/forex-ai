@@ -57,12 +57,18 @@ export async function POST(req: NextRequest) {
     const token = req.nextUrl.searchParams.get('token')
     if (!token) return NextResponse.json({ error: 'Missing token' }, { status: 400 })
 
+    console.log('[mt5-sync] POST received — token prefix:', token.slice(0, 8))
+
     const body = await req.json()
     const { balance, equity, currency, login, server, completedOrders, openPositions, prices, candles } = body
 
     if (typeof balance !== 'number') {
       return NextResponse.json({ error: 'balance must be a number' }, { status: 400 })
     }
+
+    const hasPrices  = prices  && typeof prices  === 'object' && Object.keys(prices).length  > 0
+    const hasCandles = candles && typeof candles  === 'object' && candles.data
+    console.log(`[mt5-sync] balance=${balance} prices=${hasPrices} candles=${hasCandles} login=${login || '?'}`)
 
     const sb = serviceClient()
 
@@ -75,7 +81,10 @@ export async function POST(req: NextRequest) {
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
 
     const row = (rows || []).find((r: any) => r.config?.webhookToken === token)
-    if (!row) return NextResponse.json({ error: 'Invalid token' }, { status: 401 })
+    if (!row) {
+      console.warn('[mt5-sync] Invalid token — no matching broker_config found')
+      return NextResponse.json({ error: 'Invalid token' }, { status: 401 })
+    }
 
     const userId = row.user_id
 

@@ -102,14 +102,24 @@ export class Mt5DirectBroker implements IBroker {
     try {
       const { OandaBroker } = await import('./oanda.adapter')
       const prices = await new OandaBroker().getPrices(pairs)
-      if (prices.length > 0) return prices
-    } catch { /* fall through */ }
+      if (prices.length > 0) {
+        console.log('[mt5direct] getPrices: using OANDA fallback')
+        return prices
+      }
+      console.warn('[mt5direct] getPrices: OANDA returned 0 prices')
+    } catch (e: any) {
+      console.warn('[mt5direct] getPrices: OANDA error —', e?.message)
+    }
 
     // 3. Capital.com fallback
     try {
       const { CapitalBroker } = await import('./capital.adapter')
-      return new CapitalBroker().getPrices(pairs)
-    } catch { return [] }
+      const prices = await new CapitalBroker().getPrices(pairs)
+      if (prices.length > 0) return prices
+    } catch { /* already logged by Capital adapter */ }
+
+    console.warn('[mt5direct] getPrices: all sources failed — returning []')
+    return []
   }
 
   async getCandles(pair: string, timeframe: string, count = 200): Promise<Candle[]> {
@@ -135,14 +145,24 @@ export class Mt5DirectBroker implements IBroker {
     try {
       const { OandaBroker } = await import('./oanda.adapter')
       const candles = await new OandaBroker().getCandles(pair, timeframe, count)
-      if (candles.length >= 50) return candles
-    } catch { /* fall through */ }
+      if (candles.length >= 50) {
+        console.log(`[mt5direct] getCandles ${pair}/${timeframe}: using OANDA fallback (${candles.length} bars)`)
+        return candles
+      }
+      console.warn(`[mt5direct] getCandles ${pair}/${timeframe}: OANDA returned ${candles.length} bars`)
+    } catch (e: any) {
+      console.warn(`[mt5direct] getCandles ${pair}/${timeframe}: OANDA error — ${e?.message}`)
+    }
 
     // 3. Capital.com fallback
     try {
       const { CapitalBroker } = await import('./capital.adapter')
-      return new CapitalBroker().getCandles(pair, timeframe, count)
-    } catch { return [] }
+      const candles = await new CapitalBroker().getCandles(pair, timeframe, count)
+      if (candles.length >= 50) return candles
+    } catch { /* already logged by Capital adapter */ }
+
+    console.warn(`[mt5direct] getCandles ${pair}/${timeframe}: all sources failed — returning []`)
+    return []
   }
 
   async getOpenTrades(): Promise<OpenTrade[]> { return [] }
