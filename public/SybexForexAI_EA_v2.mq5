@@ -113,12 +113,13 @@ void SendDataToApp() {
       + ",\"candles\":" + candles
       + "}";
 
-   string headers = "Content-Type: application/json\r\n";
-   char post[], result[];
+   string headers      = "Content-Type: application/json\r\n";
+   string respHeaders  = "";
+   char   post[], result[];
    StringToCharArray(body, post, 0, StringLen(body));
 
    ResetLastError();
-   int res = WebRequest("POST", WebhookURL, headers, 10000, post, result);
+   int res = WebRequest("POST", WebhookURL, headers, 10000, post, result, respHeaders);
    if (res == -1) {
       int err = GetLastError();
       Print("SybexForexAI sync FAILED (error ", err, "). Add ", WebhookURL, " to Tools→Options→Expert Advisors→Allowed URLs");
