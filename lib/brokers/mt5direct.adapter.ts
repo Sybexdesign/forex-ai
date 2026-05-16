@@ -71,11 +71,14 @@ export class Mt5DirectBroker implements IBroker {
   }
 
   async getPrices(pairs: string[]): Promise<Price[]> {
+    const eaKeys = Object.keys(this.config.latestPrices || {})
+    console.log(`[mt5direct] getPrices: latestPrices has ${eaKeys.length} symbols (${eaKeys.slice(0,4).join(',')})`)
+
     // 1. EA-pushed prices (stored in broker_configs.config.latestPrices)
-    if (this.config.latestPrices) {
+    if (this.config.latestPrices && eaKeys.length > 0) {
       const now     = Date.now()
       const results: Price[] = []
-      let allFound  = true
+      const missing: string[] = []
 
       for (const pair of pairs) {
         const sym    = pair.replace('/', '')
@@ -89,13 +92,20 @@ export class Mt5DirectBroker implements IBroker {
             time:   cached.updatedAt,
           })
         } else {
-          allFound = false
+          missing.push(sym)
         }
       }
-      if (allFound && results.length === pairs.length) {
-        console.log('[mt5direct] getPrices: using EA live data')
+
+      if (results.length > 0) {
+        if (missing.length > 0) {
+          console.log(`[mt5direct] getPrices: EA has ${results.length}/${pairs.length} — missing: ${missing.join(',')}`)
+        } else {
+          console.log(`[mt5direct] getPrices: using EA live data (${results.length} pairs)`)
+        }
+        // Return EA prices for what we have — caller gets the best available data
         return results
       }
+      console.warn('[mt5direct] getPrices: latestPrices exist but all stale or unmatched')
     }
 
     // 2. OANDA fallback

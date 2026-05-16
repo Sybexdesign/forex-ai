@@ -167,11 +167,21 @@ export async function POST(req: NextRequest) {
       candleCache,
     }
 
-    await sb.from('broker_configs')
+    const priceSymbols  = Object.keys(latestPrices)
+    const candleSymbols = Object.keys(candleCache)
+    console.log(`[mt5-sync] storing — prices:${priceSymbols.length} (${priceSymbols.slice(0,3).join(',')}) candleKeys:${candleSymbols.length}`)
+
+    const { error: updateErr } = await sb.from('broker_configs')
       .update({ config: updatedConfig, updated_at: new Date().toISOString() })
       .eq('id', row.id)
 
-    return NextResponse.json({ ok: true })
+    if (updateErr) {
+      console.error('[mt5-sync] DB write failed:', updateErr.message)
+      return NextResponse.json({ error: updateErr.message }, { status: 500 })
+    }
+
+    console.log('[mt5-sync] DB write OK')
+    return NextResponse.json({ ok: true, prices: priceSymbols.length, candles: candleSymbols.length })
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 })
   }
