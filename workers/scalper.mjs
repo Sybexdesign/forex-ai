@@ -387,9 +387,9 @@ async function runSweep() {
   const now     = new Date().toISOString().slice(11, 19)
   console.log(`── sweep #${stats.sweeps}  ${now} UTC  [${session}] ──`)
 
-  // Write a sweep summary to Supabase every 30 sweeps (~5 min) so logs page shows activity
-  if (stats.sweeps % 30 === 0) {
-    wlog('info', `Sweep #${stats.sweeps} · session ${session} · checked ${stats.sigChecks} signals · ${stats.alerts} alerts`, {
+  // Sweep ping every 6 sweeps (~1 min) so the logs page shows the worker is alive
+  if (stats.sweeps % 6 === 0) {
+    wlog('info', `▶ Sweep #${stats.sweeps} · ${session} · ${stats.sigChecks} checks · ${stats.alerts} alerts`, {
       session,
       metadata: { sweeps: stats.sweeps, sigChecks: stats.sigChecks, alerts: stats.alerts, errors: stats.errors },
     })
