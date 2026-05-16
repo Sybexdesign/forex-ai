@@ -389,7 +389,7 @@ async function runSweep() {
 
   // Sweep ping every 6 sweeps (~1 min) so the logs page shows the worker is alive
   if (stats.sweeps % 6 === 0) {
-    wlog('info', `▶ Sweep #${stats.sweeps} · ${session} · ${stats.sigChecks} checks · ${stats.alerts} alerts`, {
+    await wlog('info', `▶ Sweep #${stats.sweeps} · ${session} · ${stats.sigChecks} checks · ${stats.alerts} alerts`, {
       session,
       metadata: { sweeps: stats.sweeps, sigChecks: stats.sigChecks, alerts: stats.alerts, errors: stats.errors },
     })
