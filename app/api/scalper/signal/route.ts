@@ -117,7 +117,18 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
     const { pair, strategy, userId } = body as { pair: string; strategy: Strategy; userId?: string }
-    const t = body as TickSnapshot
+
+    // Merge safe numeric defaults so toFixed never throws on missing fields
+    const t: TickSnapshot = {
+      price: 0, rsi14: 50, rsi7: 50,
+      ema9: 0, ema21: 0, ema20: 0, ema50: 0,
+      macdHistogram: 0, macdLine: 0, macdSignal: 0,
+      bbUpper: 0, bbLower: 0, bbWidth: 0.001,
+      adx: 20, atr: 0.0001, atrPips: 1,
+      spreadPips: 1, buyPressure: 0.5, tickVolume: 0,
+      emaCrossSignal: 'FLAT',
+      ...body,
+    }
 
     const decimals = dp(pair)
     const pip      = pipSize(pair)

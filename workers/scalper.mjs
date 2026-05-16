@@ -377,23 +377,31 @@ async function processSignal(pair, tick, strategy, session) {
 async function runSweep() {
   stats.sweeps++
 
-  if (!isMarketOpen()) {
-    if (stats.sweeps % 360 === 0)  // ~hourly during weekend closure
+  const marketOpen = isMarketOpen()
+  const session    = marketOpen ? getSession() : 'CLOSED'
+
+  // Ping Supabase every 6 sweeps (~1 min) regardless of market state
+  // so the Worker Logs page shows the worker is alive during weekends too
+  if (stats.sweeps % 6 === 0) {
+    await wlog('info',
+      marketOpen
+        ? `▶ Sweep #${stats.sweeps} · ${session} · ${stats.sigChecks} checks · ${stats.alerts} alerts`
+        : `⏸ Sweep #${stats.sweeps} · Market closed — next open Sun 22:00 UTC`,
+      {
+        session,
+        metadata: { sweeps: stats.sweeps, sigChecks: stats.sigChecks, alerts: stats.alerts, errors: stats.errors, market: marketOpen ? '✅ OPEN' : '🔴 CLOSED' },
+      }
+    )
+  }
+
+  if (!marketOpen) {
+    if (stats.sweeps % 360 === 0)
       console.log(`[sweep #${stats.sweeps}] Market closed — waiting for Sunday 22:00 UTC`)
     return
   }
 
-  const session = getSession()
-  const now     = new Date().toISOString().slice(11, 19)
+  const now = new Date().toISOString().slice(11, 19)
   console.log(`── sweep #${stats.sweeps}  ${now} UTC  [${session}] ──`)
-
-  // Sweep ping every 6 sweeps (~1 min) so the logs page shows the worker is alive
-  if (stats.sweeps % 6 === 0) {
-    await wlog('info', `▶ Sweep #${stats.sweeps} · ${session} · ${stats.sigChecks} checks · ${stats.alerts} alerts`, {
-      session,
-      metadata: { sweeps: stats.sweeps, sigChecks: stats.sigChecks, alerts: stats.alerts, errors: stats.errors },
-    })
-  }
 
   // Phase 1: fetch all ticks concurrently
   const tickResults = await Promise.allSettled(
