@@ -5,7 +5,7 @@
 
 import type { IBroker, Price, Candle, AccountSummary, OpenTrade, OrderRequest, OrderResult, CloseResult } from './interface'
 import { calcStandardPositionSize, getPipValue } from './interface'
-import { createClient } from '@supabase/supabase-js'
+import { getAdminClient } from '@/lib/supabase'
 
 // EA pushes compact candle objects: { t, o, h, l, c, v }
 interface EACandle { t: number; o: number; h: number; l: number; c: number; v: number }
@@ -39,14 +39,6 @@ const TF_KEY: Record<string, string> = {
 // How stale (ms) we allow EA price/candle data to be before falling through
 const PRICE_TTL  = 2 * 60_000   // 2 minutes
 const CANDLE_TTL = 6 * 60_000   // 6 minutes (2 × M5 bar)
-
-function getServiceClient() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { autoRefreshToken: false, persistSession: false } }
-  )
-}
 
 export class Mt5DirectBroker implements IBroker {
   name = 'MT5 Direct'
@@ -201,7 +193,7 @@ export class Mt5DirectBroker implements IBroker {
     }
 
     try {
-      const sb = getServiceClient()
+      const sb = getAdminClient()
       const { data: row } = await sb
         .from('broker_configs')
         .select('config')
@@ -226,7 +218,7 @@ export class Mt5DirectBroker implements IBroker {
     }
 
     try {
-      const sb = getServiceClient()
+      const sb = getAdminClient()
       const { data: row } = await sb
         .from('broker_configs')
         .select('id, user_id, config')

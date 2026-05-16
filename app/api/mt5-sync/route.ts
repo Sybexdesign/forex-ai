@@ -3,7 +3,7 @@
 // Secured by per-user webhook token — no user auth required.
 
 import { NextRequest, NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
+import { getAdminClient } from '@/lib/supabase'
 
 // Convert MT5 symbol (EURUSD, EURUSDm, XAUUSD) to app pair (EUR/USD, XAU/USD)
 function mt5SymbolToPair(sym: string): string {
@@ -11,20 +11,12 @@ function mt5SymbolToPair(sym: string): string {
   return clean.slice(0, 3) + '/' + clean.slice(3)
 }
 
-function serviceClient() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { autoRefreshToken: false, persistSession: false } }
-  )
-}
-
 export async function GET(req: NextRequest) {
   try {
     const token = req.nextUrl.searchParams.get('token')
     if (!token) return NextResponse.json({ error: 'Missing token' }, { status: 400 })
 
-    const sb = serviceClient()
+    const sb = getAdminClient()
     const { data: rows, error } = await sb
       .from('broker_configs')
       .select('id, config')
@@ -72,7 +64,7 @@ export async function POST(req: NextRequest) {
     console.log(`[mt5-sync] balance=${balance} prices=${hasPrices} candles=${hasCandles} login=${login || '?'}`)
 
     console.log('[mt5-sync] A: querying broker_configs')
-    const sb = serviceClient()
+    const sb = getAdminClient()
 
     // Find broker_config row with this webhook token
     const { data: rows, error } = await sb
