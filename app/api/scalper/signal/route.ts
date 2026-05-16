@@ -144,6 +144,7 @@ export async function POST(req: NextRequest) {
     )
 
     if (!hasKey) {
+      console.warn('[scalper/signal] ANTHROPIC_API_KEY not set or is placeholder — using rule-based fallback')
       result   = fallbackSignal(t, strategy, pair)
       fallback = true
     } else {
