@@ -14,8 +14,8 @@ import AdvancedPage from './pages/AdvancedPage'
 import AutoTradePage from './pages/AutoTradePage'
 import PropFirmPage from './pages/PropFirmPage'
 import AdminPage from './pages/AdminPage'
-import ScalpPage from './pages/ScalpPage'
-import ScalperPage from './pages/ScalperPage'
+// import ScalpPage from './pages/ScalpPage'
+// import ScalperPage from './pages/ScalperPage'
 import WorkerPage from './pages/WorkerPage'
 import AuthPage from './AuthPage'
 import { usePriceFeed, useAccount, useNews, useStrategy, useTrades, useSignals } from '@/hooks/useForex'
@@ -38,8 +38,8 @@ function buildNav(isAdmin: boolean) {
     { id: 'metals',    label: 'Gold & Silver', icon: '🥇', shortcut: 'M' },
     { id: 'propfirm',  label: 'Prop Firm',    icon: '🏆', shortcut: 'P' },
     { id: 'broker',    label: 'Brokers',      icon: '🔌', shortcut: 'B' },
-    { id: 'scalp',     label: 'Scalp Mode',   icon: '⚡', shortcut: 'X' },
-    { id: 'scalper',   label: 'AI Scalper',   icon: '🤖', shortcut: 'R' },
+    // { id: 'scalp',     label: 'Scalp Mode',   icon: '⚡', shortcut: 'X' },
+    // { id: 'scalper',   label: 'AI Scalper',   icon: '🤖', shortcut: 'R' },
     { id: 'worker',    label: 'Worker Logs',  icon: '📟', shortcut: 'W' },
   ]
   if (isAdmin) nav.push({ id: 'admin', label: 'Admin', icon: '🛡', shortcut: 'Z' })
@@ -57,8 +57,8 @@ const PAGE_TITLES: Record<string, string> = {
   metals:    'GOLD & SILVER TRADING',
   propfirm:  'PROP FIRM EVALUATION',
   broker:    'BROKER CONNECTIONS',
-  scalp:     '⚡ 5M SCALPING MODE',
-  scalper:   '🤖 FOREXAI SCALPER',
+  // scalp:     '⚡ 5M SCALPING MODE',
+  // scalper:   '🤖 FOREXAI SCALPER',
   worker:    '📟 WORKER MONITOR',
   admin:     'ADMIN — USER MANAGEMENT',
 }
@@ -427,8 +427,8 @@ export default function AppShell() {
           {page === 'metals' && <MetalsPage prices={prices} strategy={strategy} news={news} account={account} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />}
           {page === 'propfirm' && <PropFirmPage trades={trades} onToast={addToast} />}
           {page === 'broker' && <BrokerPage onToast={addToast} onBrokerSaved={refreshAccount} />}
-          {page === 'scalp' && <ScalpPage prices={prices} account={account} strategy={strategy} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />}
-          {page === 'scalper' && <ScalperPage prices={prices} account={account} strategy={strategy} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />}
+          {/* {page === 'scalp' && <ScalpPage prices={prices} account={account} strategy={strategy} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />} */}
+          {/* {page === 'scalper' && <ScalperPage prices={prices} account={account} strategy={strategy} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />} */}
           {page === 'worker' && <WorkerPage />}
           {page === 'admin' && isAdmin && <AdminPage onToast={addToast} />}
         </div>
