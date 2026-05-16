@@ -104,9 +104,12 @@ const stats = {
 // Writes key events to the worker_logs table so the web app can display them.
 
 async function wlog(level, message, { pair, session, metadata } = {}) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.log(`[wlog] skipped — no SUPABASE_URL/KEY (url=${!!SUPABASE_URL} key=${!!SUPABASE_KEY})`)
+    return
+  }
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/worker_logs`, {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/worker_logs`, {
       method:  'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -117,7 +120,10 @@ async function wlog(level, message, { pair, session, metadata } = {}) {
       body:   JSON.stringify({ level, message, pair, session, metadata }),
       signal: AbortSignal.timeout(5_000),
     })
-  } catch { /* non-critical — never let logging crash the worker */ }
+    if (!res.ok) console.error(`[wlog] HTTP ${res.status}:`, await res.text().catch(() => ''))
+  } catch (e) {
+    console.error(`[wlog] fetch error:`, e.message)
+  }
 }
 
 // ── Pip / Price Helpers ───────────────────────────────────────────────────────
