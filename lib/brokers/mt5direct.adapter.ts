@@ -186,8 +186,8 @@ export class Mt5DirectBroker implements IBroker {
       symbol:    req.pair.replace('/', ''),
       direction: req.direction,
       lots:      req.lots,
-      slPips:    req.stopLossPips,
-      tpPips:    req.takeProfitPips,
+      slPrice,
+      tpPrice,
       createdAt: new Date().toISOString(),
       expiresAt: Math.floor(Date.now() / 1000) + 300,
     }
