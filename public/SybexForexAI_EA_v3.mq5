@@ -12,7 +12,7 @@ input int    SyncEverySeconds = 30;
 input int    CandleBars       = 200;
 input int    MagicNumber      = 20260001;
 input int    SlippagePoints   = 10;
-input ENUM_ORDER_TYPE_FILLING FillMode = ORDER_FILLING_FOK; // Change to IOC if FOK fails on your broker
+input ENUM_ORDER_TYPE_FILLING FillMode = ORDER_FILLING_IOC; // IOC works with most brokers; change to FOK only if required
 
 // Pairs to monitor — must be valid symbols on your broker
 string SYMBOLS[] = {"EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","XAGUSD","USDCAD"};
