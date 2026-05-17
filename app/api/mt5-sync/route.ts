@@ -63,8 +63,6 @@ export async function POST(req: NextRequest) {
     const hasCandles = candles && typeof candles  === 'object' && !!candles.data
     console.log(`[mt5-sync] balance=${balance} prices=${hasPrices} candles=${hasCandles} login=${login || '?'}`)
 
-    const svcKey = process.env.SUPABASE_SERVICE_ROLE_KEY || ''
-    console.log(`[mt5-sync] A: querying broker_configs — svcKey=${svcKey ? svcKey.slice(0,12)+'…' : 'MISSING'}`)
     const sb = getAdminClient()
 
     // Find broker_config row with this webhook token
@@ -73,22 +71,13 @@ export async function POST(req: NextRequest) {
       .select('id, user_id, config')
       .in('broker_type', ['mt5direct', 'exness'])
 
-    console.log(`[mt5-sync] B: query result rows=${rows?.length ?? 'null'} err=${error?.message ?? 'none'}`)
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
-
-    // If 0 rows, check if it's RLS blocking or genuinely empty
-    if (!rows || rows.length === 0) {
-      const { count } = await sb.from('broker_configs').select('*', { count: 'exact', head: true })
-      console.warn(`[mt5-sync] Invalid token — 0 mt5direct/exness rows (total broker_configs visible: ${count ?? 'error'})`)
-      return NextResponse.json({ error: 'Invalid token' }, { status: 401 })
-    }
 
     const row = (rows || []).find((r: any) => r.config?.webhookToken === token)
     if (!row) {
-      console.warn('[mt5-sync] Token not matched — broker_type rows found but token mismatch')
+      console.warn('[mt5-sync] Invalid token — no matching broker_config found')
       return NextResponse.json({ error: 'Invalid token' }, { status: 401 })
     }
-    console.log('[mt5-sync] C: row found, id=', row.id?.slice(0, 8))
 
     const userId = row.user_id
 
