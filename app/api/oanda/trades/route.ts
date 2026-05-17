@@ -3,9 +3,10 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getBroker } from '@/lib/brokers'
 import { getAdminClient } from '@/lib/supabase'
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
-    const broker = await getBroker()
+    const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
+    const broker = await getBroker(authToken)
     const trades = await broker.getOpenTrades()
     return NextResponse.json({ trades, broker: broker.name })
   } catch (error: any) {
@@ -16,7 +17,8 @@ export async function GET() {
 export async function DELETE(req: NextRequest) {
   try {
     const { tradeId, userId } = await req.json()
-    const broker = await getBroker()
+    const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
+    const broker = await getBroker(authToken)
     const result = await broker.closeTrade(tradeId)
 
     if (result.success && userId) {

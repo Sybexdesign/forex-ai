@@ -161,6 +161,7 @@ export async function POST(req: NextRequest) {
       pendingOrders,
       latestPrices,
       candleCache,
+      openPositions: Array.isArray(openPositions) ? openPositions : (row.config?.openPositions || []),
     }
 
     const priceSymbols  = Object.keys(latestPrices)

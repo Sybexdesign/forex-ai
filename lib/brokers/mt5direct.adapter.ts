@@ -167,7 +167,26 @@ export class Mt5DirectBroker implements IBroker {
     return []
   }
 
-  async getOpenTrades(): Promise<OpenTrade[]> { return [] }
+  async getOpenTrades(): Promise<OpenTrade[]> {
+    const positions: any[] = this.config.openPositions || []
+    return positions.map(p => {
+      const sym: string = p.symbol || ''
+      const pair = sym.length === 6 ? `${sym.slice(0, 3)}/${sym.slice(3)}` : sym
+      return {
+        id:              String(p.ticket),
+        pair,
+        direction:       (p.type === 'BUY' ? 'BUY' : 'SELL') as 'BUY' | 'SELL',
+        units:           Math.round((p.lots || 0) * 100000),
+        lots:            p.lots || 0,
+        entryPrice:      p.openPrice || 0,
+        currentPrice:    p.openPrice || 0,
+        unrealizedPL:    p.profit   || 0,
+        takeProfitPrice: p.tp       || undefined,
+        stopLossPrice:   p.sl       || undefined,
+        openTime:        this.config.updatedAt || new Date().toISOString(),
+      }
+    })
+  }
 
   async placeOrder(req: OrderRequest): Promise<OrderResult> {
     if (!this.config._configId) {
