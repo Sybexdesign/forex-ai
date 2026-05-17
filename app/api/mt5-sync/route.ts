@@ -84,6 +84,9 @@ export async function POST(req: NextRequest) {
     // ── Process completed orders ──────────────────────────────────────────
     let pendingOrders: any[] = row.config?.pendingOrders || []
     if (Array.isArray(completedOrders) && completedOrders.length > 0) {
+      for (const c of completedOrders) {
+        console.log(`[mt5-sync] completedOrder id=${c.id?.slice(0,8)} success=${c.success} filledPrice=${c.filledPrice ?? 'n/a'} error=${c.error ?? 'none'}`)
+      }
       const completedIds = new Set(completedOrders.map((o: any) => o.id))
 
       // Update Supabase trades for each successfully filled order
