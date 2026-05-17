@@ -168,33 +168,19 @@ export class CapitalBroker implements IBroker {
 
   async getCandles(pair: string, timeframe: string, count = 200): Promise<Candle[]> {
     const resolution = TF_MAP[timeframe] || 'HOUR'
-    let lastErr: Error = new Error('getCandles failed')
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        if (attempt > 0) {
-          // Force a fresh session and back off before retrying
-          _sessionToken = null; _cst = null
-          _epicCache[pair] && delete _epicCache[pair]
-          await sleep(400 * attempt)
-        }
-        const { epic, scale } = await getEpicInfo(pair)
-        const data = await capitalFetch(`/v1/prices/${epic}?resolution=${resolution}&max=${count}`)
-        const candles = (data.prices || []).map((p: any) => ({
-          time: p.snapshotTimeUTC,
-          open:   (p.openPrice?.mid  ?? p.openPrice?.bid)  / scale,
-          high:   (p.highPrice?.mid  ?? p.highPrice?.bid)  / scale,
-          low:    (p.lowPrice?.mid   ?? p.lowPrice?.bid)   / scale,
-          close:  (p.closePrice?.mid ?? p.closePrice?.bid) / scale,
-          volume: p.lastTradedVolume || 0,
-        }))
-        if (candles.length === 0) throw new Error('empty candle response')
-        return candles
-      } catch (e: any) {
-        lastErr = e
-        console.warn(`[capital] getCandles attempt ${attempt + 1} failed for ${pair}/${timeframe}: ${e.message}`)
-      }
-    }
-    throw lastErr
+    // Single attempt — caller (marketdata.ts) handles circuit-breaking and retry spacing
+    const { epic, scale } = await getEpicInfo(pair)
+    const data = await capitalFetch(`/v1/prices/${epic}?resolution=${resolution}&max=${count}`)
+    const candles = (data.prices || []).map((p: any) => ({
+      time: p.snapshotTimeUTC,
+      open:   (p.openPrice?.mid  ?? p.openPrice?.bid)  / scale,
+      high:   (p.highPrice?.mid  ?? p.highPrice?.bid)  / scale,
+      low:    (p.lowPrice?.mid   ?? p.lowPrice?.bid)   / scale,
+      close:  (p.closePrice?.mid ?? p.closePrice?.bid) / scale,
+      volume: p.lastTradedVolume || 0,
+    }))
+    if (candles.length === 0) throw new Error('empty candle response')
+    return candles
   }
 
   async getAccountSummary(): Promise<AccountSummary> {
