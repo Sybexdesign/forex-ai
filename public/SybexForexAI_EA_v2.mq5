@@ -13,7 +13,7 @@ input int    CandleBars       = 200;   // Historical bars to push (keep ≤ 200)
 
 // Pairs to monitor — add or remove to match what you trade.
 // Use EXACT symbol names from your broker (e.g. EURUSDm if your broker uses a suffix).
-string SYMBOLS[] = {"EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","USDCAD"};
+string SYMBOLS[] = {"EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","XAGUSD","USDCAD"};
 
 //── Globals ───────────────────────────────────────────────────────────
 int    g_totalSymbols = 0;
