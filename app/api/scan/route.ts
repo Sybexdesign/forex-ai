@@ -386,7 +386,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (results.length > 0) {
-      alertScanComplete({
+      await alertScanComplete({
         pairsScanned: pairs.length,
         signalsFound: results.length,
         pairs: results.map(s => `${s.pair} ${s.direction} (${s.confidence}%)`),

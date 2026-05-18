@@ -5,8 +5,9 @@
 
 import { createClient } from '@supabase/supabase-js'
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || ''
-const CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || ''
+// Read at call-time (not module init) so Vercel runtime env vars are always available
+function getBotToken() { return process.env.TELEGRAM_BOT_TOKEN || '' }
+function getChatId()   { return process.env.TELEGRAM_CHAT_ID   || '' }
 
 // Per-pair cooldown: suppress repeat Telegram alerts for the same pair+direction
 // within this window. Prevents spamming when the scanner fires every 60 s on
@@ -24,16 +25,23 @@ function serviceClient() {
 
 // ── Core send: always delivers to admin CHAT_ID ───────────────────────────────
 async function send(text: string): Promise<void> {
-  if (!BOT_TOKEN || !CHAT_ID) return
+  const token  = getBotToken()
+  const chatId = getChatId()
+  if (!token || !chatId) {
+    console.error('[telegram] send: missing BOT_TOKEN or CHAT_ID — message not sent')
+    return
+  }
   try {
-    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: 'HTML' }),
+      body:    JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
     })
     if (!res.ok) {
       const err = await res.text()
       console.error('[telegram] send failed:', res.status, err)
+    } else {
+      console.log('[telegram] send: message delivered to', chatId)
     }
   } catch (e: any) {
     console.error('[telegram] send failed:', e?.message)
@@ -46,7 +54,7 @@ async function broadcast(text: string): Promise<void> {
   await send(text)
 
   // Additionally send to any extra subscribers in the DB
-  if (!BOT_TOKEN) return
+  if (!getBotToken()) return
   try {
     const sb = serviceClient()
     const { data: subscribers } = await sb
@@ -55,9 +63,9 @@ async function broadcast(text: string): Promise<void> {
       .eq('active', true)
 
     for (const sub of (subscribers || [])) {
-      if (sub.chat_id === CHAT_ID) continue  // admin already received it above
+      if (sub.chat_id === getChatId()) continue  // admin already received it above
       try {
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        await fetch(`https://api.telegram.org/bot${getBotToken()}/sendMessage`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ chat_id: sub.chat_id, text, parse_mode: 'HTML' }),
