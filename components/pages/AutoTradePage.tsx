@@ -468,7 +468,7 @@ function SignalCard({
   const riskAmt = (accountBalance * strategy.riskPct / 100).toFixed(2)
   const tpProfit = (pipPerLot * lots * strategy.tpPips).toFixed(2)
   const slLoss = (pipPerLot * lots * strategy.slPips).toFixed(2)
-  const dp = signal.pair.includes('JPY') ? 3 : signal.pair.startsWith('XAU') ? 2 : signal.pair.startsWith('XAG') ? 3 : 5
+  const dp = signal.pair.includes('JPY') ? 3 : signal.pair.startsWith('XA') ? 2 : 5
   const sign = signal.direction === 'BUY' ? 1 : -1
   const tpPrice = (price + strategy.tpPips * pip * sign).toFixed(dp)
   const slPrice = (price - strategy.slPips * pip * sign).toFixed(dp)

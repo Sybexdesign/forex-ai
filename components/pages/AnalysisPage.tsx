@@ -474,7 +474,7 @@ export default function AnalysisPage({
                 const lots = calcStandardPositionSize(accountSize, strategy.riskPct, strategy.slPips, pair)
                 const riskAmt = (accountSize * strategy.riskPct / 100).toFixed(2)
                 const sign = rec.direction === 'BUY' ? 1 : -1
-                const dp = pair.includes('JPY') ? 3 : pair.startsWith('XAU') ? 2 : pair.startsWith('XAG') ? 3 : 5
+                const dp = pair.includes('JPY') ? 3 : pair.startsWith('XA') ? 2 : 5
                 const entryPrice = prices[pair]?.bid || indicators.currentPrice
                 const tpPrice = (entryPrice + strategy.tpPips * pip * sign).toFixed(dp)
                 const slPrice = (entryPrice - strategy.slPips * pip * sign).toFixed(dp)

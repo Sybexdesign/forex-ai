@@ -28,6 +28,8 @@ interface Mt5DirectConfig {
   latestPrices?:  Record<string, { bid: number; ask: number; updatedAt: string }>
   // Candle cache pushed by EA: { "EURUSD_M5": { candles: [...], updatedAt } }
   candleCache?:   Record<string, CandleCacheEntry>
+  // Open positions pushed by EA: [{ticket, symbol, type, lots, openPrice, sl, tp, profit}]
+  openPositions?: any[]
 }
 
 // Map our timeframe strings to MT5 suffix used as cache keys
