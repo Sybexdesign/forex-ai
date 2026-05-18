@@ -20,13 +20,14 @@ interface TickSnapshot {
 
 function pipSize(pair: string): number {
   if (pair.includes('JPY')) return 0.01
-  if (pair.startsWith('XAU') || pair.startsWith('XAG')) return 0.1
+  if (pair.startsWith('XAU')) return 0.1
+  if (pair.startsWith('XAG')) return 0.01
   return 0.0001
 }
 
 function dp(pair: string): number {
-  if (pair.includes('JPY')) return 3
-  if (pair.startsWith('XAU')) return 2
+  if (pair.includes('JPY'))   return 3
+  if (pair.startsWith('XA'))  return 2
   return 5
 }
 
@@ -117,6 +118,19 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
     const { pair, strategy, userId } = body as { pair: string; strategy: Strategy; userId?: string }
+
+    // Hard block: never generate a tradable signal from simulated market data
+    if (body.simulated === true) {
+      return NextResponse.json({
+        direction: 'HOLD' as Direction,
+        confidence: 0,
+        reasons: ['Live data required — simulated feed detected'],
+        risk_note: 'Signal blocked: MT5 EA not connected or all live broker feeds unavailable. Check your broker connection.',
+        entry: body.price || 0, sl: body.price || 0, tp: body.price || 0,
+        fallback: false,
+        simulationBlocked: true,
+      })
+    }
 
     // Merge safe numeric defaults so toFixed never throws on missing fields
     const t: TickSnapshot = {

@@ -34,6 +34,14 @@ export async function POST(req: NextRequest) {
     const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
     const broker = await getBroker(authToken)
 
+    // Hard block: never place real orders through the simulation broker
+    if (broker.name === 'Simulation (Demo)') {
+      return NextResponse.json(
+        { success: false, blocked: true, reasons: ['No live broker connected — configure MT5 Direct or another broker before trading live'] },
+        { status: 422 }
+      )
+    }
+
     // Fetch real-time account data for risk checks
     let openTrades: any[] = []
     let balance = 10000

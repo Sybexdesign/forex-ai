@@ -297,6 +297,15 @@ async function processSignal(pair, tick, strategy, session) {
 
   if (dir === 'HOLD' || conf < CONFIDENCE_MIN) return
 
+  // Hard block: never act on simulated data in live mode
+  if (tick.simulated) {
+    if (WORKER_MODE === 'live') {
+      console.warn(`[risk] LIVE ORDER BLOCKED — simulated market data detected for ${pair}. MT5 EA may be disconnected or all live feeds unavailable.`)
+      wlog('error', `Simulated data in LIVE mode — order blocked`, { pair, session, metadata: { reason: 'simulated_data', broker: tick.broker } })
+    }
+    return
+  }
+
   // Alert cooldown
   const coolKey = `${pair}:${dir}`
   const lastAt  = alertCooldowns.get(coolKey) || 0

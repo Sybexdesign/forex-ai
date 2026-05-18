@@ -156,6 +156,9 @@ export async function getBroker(authToken?: string): Promise<IBroker> {
 
   if (_defaultBroker) return _defaultBroker
   const key = (process.env.TRADING_BROKER || 'simulation').toLowerCase()
+  if (key === 'simulation') {
+    console.warn('[broker] WARNING: No TRADING_BROKER env var set — falling back to Simulation. Live orders will be blocked.')
+  }
   _defaultBroker = await instantiateBroker(key)
   console.log(`[broker] Default: ${_defaultBroker.name}`)
   return _defaultBroker
