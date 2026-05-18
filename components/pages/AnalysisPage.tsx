@@ -37,7 +37,7 @@ export default function AnalysisPage({
     ? rawWatchlist.filter(p => p === 'XAU/USD' || p === 'XAG/USD')
     : DEFAULT_PAIRS
   const [pair, setPair] = useState(() => watchlist[0] || 'XAU/USD')
-  const [tf, setTf] = useState('1H')
+  const [tf, setTf] = useState('5m')
   const [evalDir, setEvalDir] = useState<'BUY' | 'SELL'>('BUY')
   const [loading, setLoading] = useState(false)
   const [rec, setRec] = useState<any>(null)

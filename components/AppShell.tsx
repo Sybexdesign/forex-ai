@@ -82,7 +82,7 @@ export default function AppShell() {
   // Falls back to DEFAULT_STRATEGY only when the user has never saved (no localStorage entry).
   const strategy = savedStrategy ?? DEFAULT_STRATEGY
 
-  const [scanTimeframe, setScanTimeframe] = useState('1H')
+  const [scanTimeframe, setScanTimeframe] = useState('5m')
   const [anthropicOk, setAnthropicOk] = useState<boolean | null>(null)
   const [showCreditAlert, setShowCreditAlert] = useState(false)
   const creditCheckRef = useRef<ReturnType<typeof setInterval> | null>(null)
