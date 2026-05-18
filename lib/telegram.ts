@@ -1,14 +1,18 @@
 // lib/telegram.ts
-// Telegram Bot alerts.
-//
-// Two delivery modes:
-//   send()      → admin only  (TELEGRAM_CHAT_ID)  — private order/trade events
-//   broadcast() → all active subscribers in telegram_subscribers table — public signals
+// Telegram Bot alerts — two delivery modes:
+//   send()      → admin TELEGRAM_CHAT_ID only  (orders, errors — always reliable)
+//   broadcast() → admin CHAT_ID + any DB subscribers  (signals)
 
 import { createClient } from '@supabase/supabase-js'
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || ''
 const CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || ''
+
+// Per-pair cooldown: suppress repeat Telegram alerts for the same pair+direction
+// within this window. Prevents spamming when the scanner fires every 60 s on
+// unchanged market conditions.
+const SIGNAL_COOLDOWN_MS = 15 * 60_000  // 15 minutes
+const signalCooldowns    = new Map<string, number>()
 
 function serviceClient() {
   return createClient(
@@ -18,24 +22,30 @@ function serviceClient() {
   )
 }
 
-// ── Private: sends to the one admin CHAT_ID ───────────────────────────────────
-
+// ── Core send: always delivers to admin CHAT_ID ───────────────────────────────
 async function send(text: string): Promise<void> {
   if (!BOT_TOKEN || !CHAT_ID) return
   try {
-    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: 'HTML' }),
+      body:    JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: 'HTML' }),
     })
+    if (!res.ok) {
+      const err = await res.text()
+      console.error('[telegram] send failed:', res.status, err)
+    }
   } catch (e: any) {
     console.error('[telegram] send failed:', e?.message)
   }
 }
 
-// ── Public: broadcasts to all active subscribers ──────────────────────────────
-
+// ── Broadcast: admin CHAT_ID first (guaranteed), then DB subscribers ──────────
 async function broadcast(text: string): Promise<void> {
+  // Admin always gets the message — this path has no DB dependency
+  await send(text)
+
+  // Additionally send to any extra subscribers in the DB
   if (!BOT_TOKEN) return
   try {
     const sb = serviceClient()
@@ -44,30 +54,22 @@ async function broadcast(text: string): Promise<void> {
       .select('chat_id')
       .eq('active', true)
 
-    if (!subscribers?.length) {
-      // Fall back to admin chat if no subscribers yet
-      await send(text)
-      return
-    }
-
-    for (const sub of subscribers) {
+    for (const sub of (subscribers || [])) {
+      if (sub.chat_id === CHAT_ID) continue  // admin already received it above
       try {
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
+          method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: sub.chat_id, text, parse_mode: 'HTML' }),
+          body:    JSON.stringify({ chat_id: sub.chat_id, text, parse_mode: 'HTML' }),
         })
       } catch { /* skip individual failures */ }
     }
-  } catch (e: any) {
-    console.error('[telegram] broadcast failed:', e?.message)
-    await send(text) // fall back to admin on DB error
-  }
+  } catch { /* table may not exist yet — admin was already notified */ }
 }
 
 // ── Alert types ───────────────────────────────────────────────────────────────
 
-// PUBLIC — sent to all subscribers
+// Signal alert — rate-limited per pair+direction to avoid 60 s spam
 export async function alertNewSignal(opts: {
   pair: string
   direction: 'BUY' | 'SELL'
@@ -82,6 +84,15 @@ export async function alertNewSignal(opts: {
   lots: number
   reasons: string[]
 }) {
+  // Cooldown: skip if the same pair+direction was alerted within the last 15 min
+  const coolKey  = `${opts.pair}:${opts.direction}`
+  const lastSent = signalCooldowns.get(coolKey) ?? 0
+  if (Date.now() - lastSent < SIGNAL_COOLDOWN_MS) {
+    console.log(`[telegram] ${coolKey} — cooldown active, skipping duplicate alert`)
+    return
+  }
+  signalCooldowns.set(coolKey, Date.now())
+
   const dir = opts.direction === 'BUY' ? '🟢 BUY' : '🔴 SELL'
   const dp  = opts.pair.includes('JPY') ? 3 : opts.pair.startsWith('XA') ? 2 : 5
   const text = [
@@ -99,16 +110,17 @@ export async function alertNewSignal(opts: {
     ``,
     `<i>⚠️ Review in the Sybex ForexAI terminal before trading.</i>`,
   ].join('\n')
+
   await broadcast(text)
 }
 
-// PUBLIC — sent to all subscribers when scan finds setups
+// Scan summary — only fires when signals are found
 export async function alertScanComplete(opts: {
   pairsScanned: number
   signalsFound: number
   pairs: string[]
 }) {
-  if (opts.signalsFound === 0) return  // only notify when signals found
+  if (opts.signalsFound === 0) return
   const text = [
     `🔍 <b>MARKET SCAN — ${opts.signalsFound} SIGNAL${opts.signalsFound > 1 ? 'S' : ''} FOUND</b>`,
     ``,
@@ -116,12 +128,13 @@ export async function alertScanComplete(opts: {
     ``,
     opts.pairs.map(p => `• ${p}`).join('\n'),
     ``,
-    `<i>Full details coming in individual signal alerts.</i>`,
+    `<i>Full details in individual signal alerts above.</i>`,
   ].join('\n')
   await broadcast(text)
 }
 
-// PRIVATE — admin only (personal order events)
+// ── Private order/trade alerts (admin only) ───────────────────────────────────
+
 export async function alertOrderPlaced(opts: {
   pair: string
   direction: 'BUY' | 'SELL'
@@ -147,7 +160,6 @@ export async function alertOrderPlaced(opts: {
   await send(text)
 }
 
-// PRIVATE — admin only
 export async function alertOrderBlocked(opts: {
   pair: string
   direction: 'BUY' | 'SELL'
@@ -162,7 +174,6 @@ export async function alertOrderBlocked(opts: {
   await send(text)
 }
 
-// PRIVATE — admin only
 export async function alertOrderFailed(opts: {
   pair: string
   direction: 'BUY' | 'SELL'
@@ -177,18 +188,17 @@ export async function alertOrderFailed(opts: {
   await send(text)
 }
 
-// PRIVATE — admin only
 export async function alertTradeClosed(opts: {
   pair: string
   direction: 'BUY' | 'SELL'
   pl?: number
   broker: string
 }) {
-  const plStr = opts.pl !== undefined
+  const plStr  = opts.pl !== undefined
     ? (opts.pl >= 0 ? `+$${opts.pl.toFixed(2)}` : `-$${Math.abs(opts.pl).toFixed(2)}`)
     : '—'
-  const emoji = opts.pl !== undefined ? (opts.pl >= 0 ? '💚' : '🔴') : '⬜'
-  const text = [
+  const emoji  = opts.pl !== undefined ? (opts.pl >= 0 ? '💚' : '🔴') : '⬜'
+  const text   = [
     `${emoji} <b>TRADE CLOSED — ${opts.pair}</b>`,
     ``,
     `Direction: ${opts.direction}`,
