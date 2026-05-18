@@ -83,7 +83,7 @@ export async function alertNewSignal(opts: {
   reasons: string[]
 }) {
   const dir = opts.direction === 'BUY' ? '🟢 BUY' : '🔴 SELL'
-  const dp  = opts.pair.includes('JPY') ? 3 : opts.pair.startsWith('XAU') ? 2 : opts.pair.startsWith('XAG') ? 3 : 5
+  const dp  = opts.pair.includes('JPY') ? 3 : opts.pair.startsWith('XA') ? 2 : 5
   const text = [
     `⚡ <b>NEW SIGNAL — ${opts.pair}</b>`,
     ``,
@@ -133,7 +133,7 @@ export async function alertOrderPlaced(opts: {
   broker: string
 }) {
   const dir = opts.direction === 'BUY' ? '🟢 BUY' : '🔴 SELL'
-  const dp  = opts.pair.includes('JPY') ? 3 : opts.pair.startsWith('XAU') ? 2 : opts.pair.startsWith('XAG') ? 3 : 5
+  const dp  = opts.pair.includes('JPY') ? 3 : opts.pair.startsWith('XA') ? 2 : 5
   const text = [
     `✅ <b>ORDER PLACED — ${opts.pair}</b>`,
     ``,

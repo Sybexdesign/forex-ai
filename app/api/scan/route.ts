@@ -340,7 +340,7 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
     htfConfirmed,
   }
 
-  alertNewSignal({
+  await alertNewSignal({
     pair, direction: rec.direction, confidence: finalConfidence,
     checklistScore: checklist.passCount,
     currentPrice: indicators.currentPrice, timeframe,
