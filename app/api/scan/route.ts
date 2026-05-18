@@ -201,8 +201,9 @@ async function scanPair(
     }
   }
 
-  // 9. AI analysis
+  // 9. AI analysis — with rule-based fallback if AI is unavailable (no key / out of credits)
   let rec: any = null
+  let aiUnavailable = false
   const hasKey = !!(process.env.ANTHROPIC_API_KEY &&
     process.env.ANTHROPIC_API_KEY !== 'your_anthropic_api_key_here')
 
@@ -233,10 +234,17 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
       })
       const text = msg.content.find(b => b.type === 'text')?.text || '{}'
       rec = JSON.parse(text.replace(/```json|```/g, '').trim())
-    } catch { /* fall through */ }
+    } catch (e: any) {
+      const msg = e?.message || ''
+      if (msg.includes('credit') || msg.includes('billing') || msg.includes('quota') || msg.includes('429') || msg.includes('insufficient')) {
+        console.warn(`[scan] AI unavailable (${msg.slice(0, 80)}) — using rule-based fallback`)
+        aiUnavailable = true
+      }
+      // fall through to rule-based fallback below
+    }
 
     // If AI says WAIT on first pass, try a fallback prompt focused on best current setup
-    if ((!rec || rec.direction === 'WAIT') && isMetals(pair)) {
+    if (!aiUnavailable && (!rec || rec.direction === 'WAIT') && isMetals(pair)) {
       try {
         const fallbackPrompt = buildIndicatorPrompt(pair, timeframe, indicators, checklist, direction) +
           `\n\nFallback analysis request: The pre-filter passed. Even if the setup is not perfect, identify the BEST directional bias right now. If there is ANY measurable momentum or trend, report it with honest confidence (may be 55–65%). Do not return WAIT unless the market is genuinely flat with no discernible direction.`
@@ -252,6 +260,37 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
           rec = fallbackRec
         }
       } catch { /* ignore */ }
+    }
+  }
+
+  // Rule-based confidence fallback: used when AI key missing or API unavailable (credits/rate limit)
+  if (!rec || rec.direction === 'WAIT') {
+    const base     = Math.min(50, checklist.passCount * 7)   // up to 56 from 8/8
+    const adxBonus = indicators.adx > 30 ? 10 : indicators.adx > 25 ? 6 : indicators.adx > 20 ? 3 : 0
+    const rsiBonus = direction === 'BUY'
+      ? (indicators.rsi > 55 && indicators.rsi < 72 ? 6 : 0)
+      : (indicators.rsi < 45 && indicators.rsi > 28 ? 6 : 0)
+    const macdBonus = Math.abs(indicators.macdHistogram) > 0.3 ? 5 : Math.abs(indicators.macdHistogram) > 0.1 ? 3 : 0
+    const htfBonus2 = htfBoost ? 6 : (!htfConfirmed ? -6 : 0)
+    const ruleConf  = base + adxBonus + rsiBonus + macdBonus + htfBonus2
+
+    if (ruleConf >= cfg.minConfidence) {
+      const isBuy = direction === 'BUY'
+      rec = {
+        direction,
+        confidence: ruleConf,
+        entry_zone: { low: indicators.currentPrice, high: indicators.currentPrice },
+        reasons: [
+          `${checklist.passCount}/8 checklist items pass`,
+          `ADX ${indicators.adx.toFixed(1)} — ${indicators.adx > 25 ? 'strong' : 'moderate'} trend`,
+          `RSI ${indicators.rsi.toFixed(1)} — ${isBuy ? 'bullish' : 'bearish'} momentum`,
+          `MACD histogram ${indicators.macdHistogram > 0 ? '+' : ''}${indicators.macdHistogram.toFixed(3)}`,
+        ].filter(Boolean),
+        risk_note: aiUnavailable
+          ? 'Rule-based signal — AI credits needed for enhanced analysis'
+          : 'Rule-based signal — AI key not configured',
+        checklist_passed: checklist.passCount,
+      }
     }
   }
 
