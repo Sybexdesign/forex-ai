@@ -181,7 +181,8 @@ async function scanPair(
     balance:        context.accountBalance,
     maxLossPct:     strategy.maxLoss,
   })
-  if (!checklist.canTrade || checklist.passCount < cfg.minChecklistPass) return null
+  // Use our own per-config minimum, not the hardcoded canTrade threshold (which always requires 6)
+  if (checklist.passCount < cfg.minChecklistPass) return null
 
   // 8. S/R room check — skipped for metals.
   // Metals are momentum/breakout assets; historical S/R is continuously broken in trending moves.
