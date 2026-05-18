@@ -459,6 +459,7 @@ async function sendHeartbeat() {
       market:  isMarketOpen() ? '✅ OPEN' : '🔴 CLOSED',
       session: getSession(),
       mode:    WORKER_MODE.toUpperCase(),
+      pairs:   PAIRS,
     },
   })
 }

@@ -60,7 +60,7 @@ interface Props {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const SCALPER_PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD', 'XAU/USD']
+const SCALPER_PAIRS = ['XAU/USD', 'XAG/USD']
 const TIMEFRAMES    = ['1m', '3m', '5m', '15m']
 const STRATEGIES    = ['Momentum', 'Mean Reversion', 'Breakout', 'Order Flow']
 const TICK_INTERVAL = 10_000
@@ -74,8 +74,8 @@ const C = {
   muted: 'var(--text-muted)',
 }
 
-function dp(pair: string) { return pair.includes('JPY') ? 3 : pair.startsWith('XAU') ? 2 : 5 }
-function pipSize(pair: string) { return pair.includes('JPY') ? 0.01 : pair.startsWith('XAU') ? 0.1 : 0.0001 }
+function dp(pair: string) { return pair.includes('JPY') ? 3 : pair.startsWith('XA') ? 2 : 5 }
+function pipSize(pair: string) { return pair.includes('JPY') ? 0.01 : pair.startsWith('XAU') ? 0.1 : pair.startsWith('XAG') ? 0.01 : 0.0001 }
 
 // ─── Risk gate ────────────────────────────────────────────────────────────────
 
@@ -125,9 +125,9 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
   const [engineStatus, setEngineStatus]     = useState<EngineStatus>('STOPPED')
   const [mode, setMode]                     = useState<Mode>('PAPER')
   const [confirmLive, setConfirmLive]       = useState(false)
-  const [pair, setPair]                     = useState('EUR/USD')
+  const [pair, setPair]                     = useState('XAU/USD')
   const [timeframe, setTimeframe]           = useState('5m')
-  const [activeStrategy, setActiveStrategy] = useState('Momentum')
+  const [activeStrategy, setActiveStrategy] = useState('Breakout')
 
   const [tickData, setTickData]       = useState<TickData | null>(null)
   const [signal, setSignal]           = useState<Signal | null>(null)

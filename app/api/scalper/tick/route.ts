@@ -7,8 +7,9 @@ import { calculateIndicators } from '@/lib/indicators'
 const ti = require('technicalindicators')
 
 function pipSize(pair: string): number {
-  if (pair.includes('JPY')) return 0.01
-  if (pair.startsWith('XAU') || pair.startsWith('XAG')) return 0.1
+  if (pair.includes('JPY'))    return 0.01
+  if (pair.startsWith('XAU'))  return 0.1
+  if (pair.startsWith('XAG'))  return 0.01
   return 0.0001
 }
 
@@ -21,7 +22,7 @@ function defaultSpread(pair: string): number {
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url)
-  const pair      = searchParams.get('pair')      || 'EUR/USD'
+  const pair      = searchParams.get('pair')      || 'XAU/USD'
   const timeframe = searchParams.get('timeframe') || '5m'
   const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
 

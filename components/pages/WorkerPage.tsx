@@ -169,10 +169,18 @@ export default function WorkerPage() {
               ))}
             </div>
             <div style={{ width: 1, height: 18, background: C.border }} />
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
               {pill(hbMeta.mode || 'PAPER', hbMeta.mode === 'LIVE' ? C.green : C.amber)}
               {pill(hbMeta.session || '—', C.blue)}
               {pill(hbMeta.market || '—', hbMeta.market === '✅ OPEN' ? C.green : C.muted)}
+              {Array.isArray(hbMeta.pairs) && hbMeta.pairs.map((p: string) => (
+                <span key={p} style={{
+                  background: 'rgba(0,229,180,0.08)', color: C.green,
+                  border: `1px solid rgba(0,229,180,0.25)`,
+                  borderRadius: 4, padding: '1px 7px', fontSize: 10,
+                  fontWeight: 700, letterSpacing: 0.5, fontFamily: 'monospace',
+                }}>{p}</span>
+              ))}
             </div>
           </>
         )}
@@ -213,6 +221,11 @@ export default function WorkerPage() {
         ))}
         <span style={{ marginLeft: 'auto', color: C.muted, fontSize: 11, alignSelf: 'center' }}>
           {logs.length} entries
+          {logs.some(l => l.pair && l.pair !== 'XAU/USD' && l.pair !== 'XAG/USD') && (
+            <span style={{ marginLeft: 8, color: '#6b7280', fontSize: 10, border: `1px solid ${C.border}`, borderRadius: 3, padding: '1px 6px' }}>
+              historical logs may include old pairs
+            </span>
+          )}
         </span>
       </div>
 
