@@ -24,7 +24,8 @@ import { useAuth } from '@/hooks/useAuth'
 import type { StrategySettings } from '@/lib/supabase'
 import { DEFAULT_STRATEGY } from '@/lib/supabase'
 
-const FALLBACK_PAIRS = ['XAU/USD', 'XAG/USD']
+const METALS_ONLY = ['XAU/USD', 'XAG/USD']
+const FALLBACK_PAIRS = METALS_ONLY
 
 function buildNav(isAdmin: boolean) {
   const nav = [
@@ -91,7 +92,7 @@ export default function AppShell() {
     localStorage.setItem('forexai_theme', theme)
   }, [theme])
 
-  const pricePairs = strategy.watchlist?.length ? strategy.watchlist : FALLBACK_PAIRS
+  const pricePairs = METALS_ONLY
   const { prices } = usePriceFeed(pricePairs, 5000)
   const { account, refresh: refreshAccount } = useAccount()
   const news = useNews()
@@ -148,8 +149,11 @@ export default function AppShell() {
   const wins = trades.filter((t: any) => t.result === 'WIN').length
   const winRate = trades.length ? Math.round((wins / trades.length) * 100) : 0
 
-  // Single scanner instance
-  const watchlist = strategy.watchlist?.length ? strategy.watchlist : FALLBACK_PAIRS
+  // Single scanner instance — always metals only, regardless of what's saved in strategy.watchlist
+  const rawWatchlist = strategy.watchlist?.length ? strategy.watchlist : FALLBACK_PAIRS
+  const watchlist = rawWatchlist.filter(p => METALS_ONLY.includes(p)).length
+    ? rawWatchlist.filter(p => METALS_ONLY.includes(p))
+    : METALS_ONLY
   const scanner = useScanner(
     strategy,
     {

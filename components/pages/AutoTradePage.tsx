@@ -10,6 +10,7 @@ import type { ScanSignal } from '@/hooks/useScanner'
 import type { StrategySettings } from '@/lib/supabase'
 
 const TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1H', '4H']
+const METALS_ONLY = ['XAU/USD', 'XAG/USD']
 const DIR_COLOR: Record<string, string> = { BUY: 'var(--color-buy)', SELL: 'var(--color-sell)' }
 const PAGE_SIZE = 5
 
@@ -51,7 +52,11 @@ interface AutoTradePageProps {
   watchlist: string[]
 }
 
-export default function AutoTradePage({ strategy, account, onToast, newsInWindow = false, userId, prices = {}, onRefreshAccount, onRefreshTrades, scanner, timeframe, setTimeframe, watchlist }: AutoTradePageProps) {
+export default function AutoTradePage({ strategy, account, onToast, newsInWindow = false, userId, prices = {}, onRefreshAccount, onRefreshTrades, scanner, timeframe, setTimeframe, watchlist: rawWatchlist }: AutoTradePageProps) {
+  // Always restrict to metals — defensive filter in case AppShell passes extra pairs
+  const watchlist = rawWatchlist.filter(p => METALS_ONLY.includes(p)).length
+    ? rawWatchlist.filter(p => METALS_ONLY.includes(p))
+    : METALS_ONLY
   const [approvingId, setApprovingId] = useState<string | null>(null)
   const [autoExecute, setAutoExecute] = useState(false)
   const [openTrades, setOpenTrades] = useState<any[]>([])
