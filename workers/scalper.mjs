@@ -2,7 +2,7 @@
 /**
  * SybexForexAI — 24/7 Background Scalper Worker
  *
- * - 10-second polling across 6 pairs (concurrent tick fetch + pre-filter)
+ * - 10-second polling across XAU/USD and XAG/USD (concurrent tick fetch + pre-filter)
  * - Session-aware strategy rotation: Momentum during London/NY, Mean Reversion Asian
  * - Two-stage scan: fast indicator pre-filter → Claude signal only when needed
  * - Risk guards: 1% max risk, 3% daily loss limit, max 3 concurrent trades
@@ -33,15 +33,11 @@ const CONFIDENCE_MIN   = 70           // minimum confidence to alert/trade
 
 // ── Pairs + Strategy Defaults ─────────────────────────────────────────────────
 
-const PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD', 'XAU/USD']
+const PAIRS = ['XAU/USD', 'XAG/USD']
 
 const PAIR_STRATEGY = {
-  'EUR/USD': 'Momentum',
-  'GBP/USD': 'Momentum',
-  'USD/JPY': 'Momentum',
-  'AUD/USD': 'Mean Reversion',
-  'USD/CAD': 'Momentum',
   'XAU/USD': 'Breakout',
+  'XAG/USD': 'Breakout',
 }
 
 // ── Session Detection ─────────────────────────────────────────────────────────
@@ -67,8 +63,7 @@ function getSession() {
 }
 
 function getStrategy(pair, session) {
-  if (pair === 'XAU/USD') return 'Breakout'
-  if (session === 'Asian') return 'Mean Reversion'
+  if (pair.startsWith('XA')) return 'Breakout'
   return PAIR_STRATEGY[pair] || 'Momentum'
 }
 
@@ -131,6 +126,7 @@ async function wlog(level, message, { pair, session, metadata } = {}) {
 function pipSize(pair) {
   if (pair.includes('JPY'))    return 0.01
   if (pair.startsWith('XAU'))  return 0.1
+  if (pair.startsWith('XAG'))  return 0.01
   return 0.0001
 }
 
@@ -140,7 +136,7 @@ function toPips(pair, priceDiff) {
 
 function decimals(pair) {
   if (pair.includes('JPY'))   return 3
-  if (pair.startsWith('XAU')) return 2
+  if (pair.startsWith('XA')) return 2
   return 5
 }
 
