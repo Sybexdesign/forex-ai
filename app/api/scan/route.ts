@@ -1,6 +1,6 @@
 // app/api/scan/route.ts
-// Scans all watchlist pairs in parallel, runs AI analysis,
-// returns only actionable signals with full accuracy filters.
+// Scans XAU/USD and XAG/USD (metals only) — live data required, simulation rejected.
+// Multi-timeframe confirmation, metals-tuned thresholds, AI analysis with fallback path.
 
 import { NextRequest, NextResponse } from 'next/server'
 import { getMarketCandles } from '@/lib/marketdata'
@@ -13,6 +13,9 @@ import { detectSupportResistance, calcATRIndicator } from '@/lib/advanced-indica
 import { isIndexInSession, getPairDecimalPlaces } from '@/lib/instruments'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+
+// Only these two pairs are permitted
+const METALS_ONLY = ['XAU/USD', 'XAG/USD']
 
 export interface ScanSignal {
   id: string
@@ -29,13 +32,12 @@ export interface ScanSignal {
   expiresAt: string
   indicators: any
   simulated?: boolean
-  htfConfirmed?: boolean   // higher-timeframe trend confirmed
+  htfConfirmed?: boolean
 }
 
-// Tighter expiry for short timeframes — a 1m signal is stale after 2 candles
 const TF_EXPIRY_MS: Record<string, number> = {
-  '1m':   2 * 60_000,    // 2 min  (was 5 — stale after 2 candles)
-  '3m':   5 * 60_000,    // 5 min  (was 10)
+  '1m':   3 * 60_000,
+  '3m':   6 * 60_000,
   '5m':   15 * 60_000,
   '15m':  30 * 60_000,
   '30m':  60 * 60_000,
@@ -44,39 +46,79 @@ const TF_EXPIRY_MS: Record<string, number> = {
   'Daily': 1440 * 60_000,
 }
 
-// Per-timeframe thresholds
-function tfConfig(timeframe: string) {
+// HTF to use for each timeframe (metals always get multi-TF confirmation)
+const HTF_MAP: Record<string, string | null> = {
+  '1m': '15m', '3m': '15m', '5m': '15m',
+  '15m': '1H', '30m': '1H', '1H': '4H', '4H': null, 'Daily': null,
+}
+
+function isMetals(pair: string) { return pair.startsWith('XA') }
+
+function tfConfig(timeframe: string, pair: string) {
   const isShort  = ['1m', '3m', '5m'].includes(timeframe)
   const isMicro  = ['1m', '3m'].includes(timeframe)
+  const metals   = isMetals(pair)
   return {
-    minChecklistPass: isShort ? 5 : 6,     // 1m/3m/5m allow one extra miss (noisier)
-    atrGuardMult:     isShort ? 3 : 2,     // short TF ATR is naturally small
-    minConfidence:    isMicro ? 55 : 60,   // slightly lower bar for micro scalps
-    htfFrame:         isMicro ? '15m' : null, // multi-TF check for 1m/3m
+    minChecklistPass: metals ? 4 : (isShort ? 5 : 6),
+    skipAtrGuard:     metals,                           // metals ATR dwarfs FX slPips baseline
+    atrGuardMult:     isShort ? 3 : 2,
+    minConfidence:    metals ? 55 : (isMicro ? 55 : 60),
+    rsiExtremeBuy:    metals ? 87 : 75,                 // metals sustain high RSI in trends
+    rsiExtremeSell:   metals ? 13 : 25,
+    htfFrame:         HTF_MAP[timeframe] ?? null,
     htfCandleCount:   60,
+    srRoomPct:        metals ? 0.55 : 0.70,             // metals often break through S/R
   }
 }
 
-// Fetch candles using the smart market-data chain (native broker → OANDA → Capital → Sim)
 async function getCandles(authToken: string | undefined, pair: string, tf: string, count: number) {
   const result = await getMarketCandles(authToken, pair, tf, count)
   return { candles: result.candles, simulated: result.simulated }
 }
 
-// Higher-timeframe trend confirmation: returns true if HTF trend agrees with direction
-async function confirmHTF(authToken: string | undefined, pair: string, htfFrame: string, direction: 'BUY' | 'SELL'): Promise<boolean> {
+// HTF confirmation: returns { confirmed: boolean, boostConfidence: boolean }
+// For metals, disagreement reduces confidence rather than hard-blocking
+async function confirmHTF(
+  authToken: string | undefined,
+  pair: string,
+  htfFrame: string,
+  direction: 'BUY' | 'SELL',
+): Promise<{ confirmed: boolean; boost: boolean }> {
   try {
-    const { candles } = await getCandles(authToken, pair, htfFrame, 60)
+    const { candles, simulated } = await getCandles(authToken, pair, htfFrame, 60)
+    if (simulated) return { confirmed: true, boost: false }  // no penalty for unavailable HTF
     const ind = calculateIndicators(candles)
-    const htfBullish = ind.emaCrossed && ind.macdHistogram > 0
-    const htfBearish = !ind.emaCrossed && ind.macdHistogram < 0
-    return direction === 'BUY' ? htfBullish : htfBearish
+    const htfBullish = ind.emaCrossed && ind.macdHistogram > 0 && ind.rsi > 45
+    const htfBearish = !ind.emaCrossed && ind.macdHistogram < 0 && ind.rsi < 55
+    const confirmed = direction === 'BUY' ? htfBullish : htfBearish
+    const boost     = confirmed && (direction === 'BUY' ? ind.adx > 25 : ind.adx > 25)
+    return { confirmed, boost }
   } catch {
-    return true
+    return { confirmed: true, boost: false }
   }
 }
 
-// Scan a single pair — returns a ScanSignal or null
+// Determine signal direction — primary: EMA+MACD, fallback: RSI momentum for metals
+function resolveDirection(
+  indicators: ReturnType<typeof calculateIndicators>,
+  pair: string,
+): { direction: 'BUY' | 'SELL' | null; method: 'ema_macd' | 'rsi_momentum' } {
+  const emaDir:  'BUY' | 'SELL' = indicators.emaCrossed       ? 'BUY' : 'SELL'
+  const macdDir: 'BUY' | 'SELL' = indicators.macdHistogram > 0 ? 'BUY' : 'SELL'
+
+  if (emaDir === macdDir) return { direction: emaDir, method: 'ema_macd' }
+
+  // For metals: if EMA/MACD disagree but RSI + ADX strongly indicate momentum, use RSI direction
+  if (isMetals(pair) && indicators.adx > 22) {
+    if (indicators.rsi > 62 && indicators.macdHistogram > 0)
+      return { direction: 'BUY', method: 'rsi_momentum' }
+    if (indicators.rsi < 38 && indicators.macdHistogram < 0)
+      return { direction: 'SELL', method: 'rsi_momentum' }
+  }
+
+  return { direction: null, method: 'ema_macd' }
+}
+
 async function scanPair(
   pair: string,
   timeframe: string,
@@ -85,106 +127,154 @@ async function scanPair(
   context: { newsInWindow: boolean; openPositions: number; todayPL: number; accountBalance: number },
   cfg: ReturnType<typeof tfConfig>,
 ): Promise<ScanSignal | null> {
-  // Skip index instruments outside their market session
   if (!isIndexInSession(pair)) return null
 
-  // 1. Fetch candles for this timeframe
+  // 1. Fetch candles — reject simulation outright
   const { candles, simulated } = await getCandles(authToken, pair, timeframe, 200)
-
-  // 2. Calculate indicators
-  const indicators = calculateIndicators(candles)
-
-  // 3. EMA + MACD must agree on direction
-  const emaDir:  'BUY' | 'SELL' = indicators.emaCrossed      ? 'BUY' : 'SELL'
-  const macdDir: 'BUY' | 'SELL' = indicators.macdHistogram > 0 ? 'BUY' : 'SELL'
-  if (emaDir !== macdDir) return null
-
-  const direction = emaDir
-
-  // 3b. RSI must not be extreme against direction
-  // BUY when RSI overbought (>75) is a low-probability entry; same for SELL at oversold (<25)
-  if (direction === 'BUY'  && indicators.rsi > 75) return null
-  if (direction === 'SELL' && indicators.rsi < 25) return null
-
-  // 3c. ATR volatility guard — TF-aware multiplier
-  const atrResult = calcATRIndicator(candles, pair)
-  if (atrResult.suggestedSL > strategy.slPips * cfg.atrGuardMult) return null
-
-  // 4. Multi-timeframe confirmation for 1m / 3m
-  let htfConfirmed = true
-  if (cfg.htfFrame) {
-    htfConfirmed = await confirmHTF(authToken, pair, cfg.htfFrame, direction)
-    if (!htfConfirmed) return null
+  if (simulated) {
+    console.log(`[scan] ${pair}/${timeframe}: simulated data — live feed required, skipping`)
+    return null
   }
 
-  // 5. Checklist — TF-aware minimum pass count
-  const checklist = evaluateChecklist(indicators, direction, {
-    newsInWindow:  context.newsInWindow,
-    signalStrength: indicators.adx,
-    minStrength:   strategy.minStrength,
-    openPositions: context.openPositions,
-    maxPositions:  strategy.maxPositions,
-    todayPL:       context.todayPL,
-    balance:       context.accountBalance,
-    maxLossPct:    strategy.maxLoss,
-  })
+  // 2. Indicators
+  const indicators = calculateIndicators(candles)
 
+  // 3. Direction resolution (EMA+MACD primary; RSI momentum fallback for metals)
+  const { direction: resolvedDir, method: dirMethod } = resolveDirection(indicators, pair)
+  if (!resolvedDir) return null
+
+  const direction = resolvedDir
+
+  // 4. RSI extreme guard (metals use wider thresholds — they trend at high RSI)
+  if (direction === 'BUY'  && indicators.rsi > cfg.rsiExtremeBuy)  return null
+  if (direction === 'SELL' && indicators.rsi < cfg.rsiExtremeSell) return null
+
+  // 5. ATR guard (skipped for metals — their natural ATR dwarfs FX-calibrated slPips)
+  const atrResult = calcATRIndicator(candles, pair)
+  if (!cfg.skipAtrGuard) {
+    if (atrResult.suggestedSL > strategy.slPips * cfg.atrGuardMult) return null
+  }
+
+  // 6. Multi-timeframe confirmation — metals always get this
+  let htfConfirmed = true
+  let htfBoost = false
+  if (cfg.htfFrame) {
+    const htf = await confirmHTF(authToken, pair, cfg.htfFrame, direction)
+    htfBoost = htf.boost
+    if (isMetals(pair)) {
+      // For metals: HTF contradiction reduces confidence but doesn't hard-block
+      htfConfirmed = htf.confirmed
+    } else {
+      // For non-metals: hard filter (not used since only metals are scanned, kept for safety)
+      if (!htf.confirmed) return null
+      htfConfirmed = true
+    }
+  }
+
+  // 7. Checklist
+  const checklist = evaluateChecklist(indicators, direction, {
+    newsInWindow:   context.newsInWindow,
+    signalStrength: indicators.adx,
+    minStrength:    strategy.minStrength,
+    openPositions:  context.openPositions,
+    maxPositions:   strategy.maxPositions,
+    todayPL:        context.todayPL,
+    balance:        context.accountBalance,
+    maxLossPct:     strategy.maxLoss,
+  })
   if (!checklist.canTrade || checklist.passCount < cfg.minChecklistPass) return null
 
-  // 6. S/R room check — TP must have 70% clear runway before nearest S/R
+  // 8. S/R room check (reduced threshold for metals)
   const pip      = getPipValue(pair)
   const srResult = detectSupportResistance(candles, pair)
   if (direction === 'BUY' && srResult.nearestResistance) {
     const roomPips = (srResult.nearestResistance.price - indicators.currentPrice) / pip
-    if (roomPips < strategy.tpPips * 0.7) return null
+    if (roomPips < strategy.tpPips * cfg.srRoomPct) return null
   }
   if (direction === 'SELL' && srResult.nearestSupport) {
     const roomPips = (indicators.currentPrice - srResult.nearestSupport.price) / pip
-    if (roomPips < strategy.tpPips * 0.7) return null
+    if (roomPips < strategy.tpPips * cfg.srRoomPct) return null
   }
 
-  // 7. AI analysis
+  // 9. AI analysis
   let rec: any = null
   const hasKey = !!(process.env.ANTHROPIC_API_KEY &&
     process.env.ANTHROPIC_API_KEY !== 'your_anthropic_api_key_here')
 
   if (hasKey) {
-    const isShort = ['1m', '3m', '5m'].includes(timeframe)
-    const systemPrompt = `You are a disciplined forex scalping analyst. Respond ONLY with valid JSON — no markdown.
+    const assetName  = pair === 'XAU/USD' ? 'Gold' : 'Silver'
+    const systemPrompt = `You are a specialist precious metals trader analysing ${assetName} (${pair}).
+Respond ONLY with valid JSON — no markdown, no explanation outside the JSON.
 JSON format: {"direction":"BUY"|"SELL"|"WAIT","confidence":0-100,"entry_zone":{"low":number,"high":number},"reasons":["r1","r2","r3"],"risk_note":"string","checklist_passed":number}
-${isShort ? `You are analysing a SHORT timeframe (${timeframe}). Signals must be crisp — momentum and immediate price action matter more than lagging indicators. Require tight confluence.` : ''}
-Rules: Only recommend BUY/SELL if ${cfg.minChecklistPass}+ of 8 checklist rules pass. Otherwise return WAIT.`
+
+${assetName} trading rules:
+- ${assetName} can sustain RSI 70–87 in strong bull trends; high RSI alone is NOT a reason to avoid BUY
+- ATR is naturally high — focus on momentum, breakout structures, and Bollinger Band expansion
+- ADX > 20 confirms a trending environment; prioritise trend-following signals
+- Bollinger Band width expansion signals breakout setups; price near upper/lower band with momentum is actionable
+- Multi-timeframe trend alignment (EMA stack direction) is the highest-weight factor
+- Direction method "${dirMethod}" was used — if "rsi_momentum", require stronger AI confirmation
+- Checklist passed: ${checklist.passCount}/8 items${htfBoost ? ' — higher-timeframe trend strongly confirmed (boost confidence)' : (!htfConfirmed ? ' — higher-timeframe trend conflicts (reduce confidence slightly)' : '')}
+
+Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason briefly in risk_note.`
 
     try {
       const prompt = buildIndicatorPrompt(pair, timeframe, indicators, checklist, direction)
       const msg = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+        model:      'claude-sonnet-4-6',
         max_tokens: 600,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: prompt }],
+        system:     systemPrompt,
+        messages:   [{ role: 'user', content: prompt }],
       })
       const text = msg.content.find(b => b.type === 'text')?.text || '{}'
       rec = JSON.parse(text.replace(/```json|```/g, '').trim())
-    } catch { /* fall through to null */ }
+    } catch { /* fall through */ }
+
+    // If AI says WAIT on first pass, try a fallback prompt focused on best current setup
+    if ((!rec || rec.direction === 'WAIT') && isMetals(pair)) {
+      try {
+        const fallbackPrompt = buildIndicatorPrompt(pair, timeframe, indicators, checklist, direction) +
+          `\n\nFallback analysis request: The pre-filter passed. Even if the setup is not perfect, identify the BEST directional bias right now. If there is ANY measurable momentum or trend, report it with honest confidence (may be 55–65%). Do not return WAIT unless the market is genuinely flat with no discernible direction.`
+        const msg2 = await anthropic.messages.create({
+          model:      'claude-sonnet-4-6',
+          max_tokens: 600,
+          system:     systemPrompt,
+          messages:   [{ role: 'user', content: fallbackPrompt }],
+        })
+        const text2 = msg2.content.find(b => b.type === 'text')?.text || '{}'
+        const fallbackRec = JSON.parse(text2.replace(/```json|```/g, '').trim())
+        if (fallbackRec.direction !== 'WAIT' && (fallbackRec.confidence ?? 0) >= cfg.minConfidence) {
+          rec = fallbackRec
+        }
+      } catch { /* ignore */ }
+    }
   }
 
   if (!rec || rec.direction === 'WAIT' || (rec.confidence ?? 0) < cfg.minConfidence) return null
 
-  // 8. Build signal
-  const now        = new Date()
-  const sign       = rec.direction === 'BUY' ? 1 : -1
-  const dp         = getPairDecimalPlaces(pair)
-  const lots       = calcStandardPositionSize(context.accountBalance, strategy.riskPct, strategy.slPips, pair)
-  const tpPrice    = +(indicators.currentPrice + strategy.tpPips * pip * sign).toFixed(dp)
-  const slPrice    = +(indicators.currentPrice - strategy.slPips * pip * sign).toFixed(dp)
-  const expiryMs   = TF_EXPIRY_MS[timeframe] ?? 15 * 60_000
+  // Confidence adjustment: HTF boost/penalty
+  let finalConfidence = rec.confidence as number
+  if (htfBoost)      finalConfidence = Math.min(98, finalConfidence + 8)
+  if (!htfConfirmed) finalConfidence = Math.max(cfg.minConfidence, finalConfidence - 8)
+  if (dirMethod === 'rsi_momentum') finalConfidence = Math.max(cfg.minConfidence, finalConfidence - 5)
+
+  if (finalConfidence < cfg.minConfidence) return null
+
+  // 10. Build signal
+  const now      = new Date()
+  const sign     = rec.direction === 'BUY' ? 1 : -1
+  const dp       = getPairDecimalPlaces(pair)
+  const lots     = calcStandardPositionSize(context.accountBalance, strategy.riskPct, strategy.slPips, pair)
+  const tpPrice  = +(indicators.currentPrice + strategy.tpPips * pip * sign).toFixed(dp)
+  const slPrice  = +(indicators.currentPrice - strategy.slPips * pip * sign).toFixed(dp)
+  const expiryMs = TF_EXPIRY_MS[timeframe] ?? 15 * 60_000
 
   const signal: ScanSignal = {
     id:            `scan-${pair.replace('/', '')}-${now.getTime()}`,
     pair,
     timeframe,
     direction:     rec.direction,
-    confidence:    rec.confidence,
+    confidence:    finalConfidence,
     checklistScore: checklist.passCount,
     entryZone:     rec.entry_zone || { low: indicators.currentPrice, high: indicators.currentPrice },
     reasons:       rec.reasons || [],
@@ -193,13 +283,12 @@ Rules: Only recommend BUY/SELL if ${cfg.minChecklistPass}+ of 8 checklist rules 
     scannedAt:     now.toISOString(),
     expiresAt:     new Date(now.getTime() + expiryMs).toISOString(),
     indicators,
-    simulated,
+    simulated:     false,
     htfConfirmed,
   }
 
-  // Telegram alert (non-blocking)
   alertNewSignal({
-    pair, direction: rec.direction, confidence: rec.confidence,
+    pair, direction: rec.direction, confidence: finalConfidence,
     checklistScore: checklist.passCount,
     currentPrice: indicators.currentPrice, timeframe,
     entryLow: signal.entryZone.low, entryHigh: signal.entryZone.high,
@@ -214,35 +303,33 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
     const {
-      pairs, timeframe = '1H', strategy,
+      pairs: rawPairs,
+      timeframe = '5m',
+      strategy,
       newsInWindow = false, openPositions = 0, todayPL = 0, accountBalance = 10000,
     } = body as {
       pairs: string[]; timeframe: string; strategy: StrategySettings
       newsInWindow: boolean; openPositions: number; todayPL: number; accountBalance: number
     }
 
-    if (!pairs?.length) return NextResponse.json({ signals: [] })
+    // Enforce metals-only — filter out any non-metals pairs
+    const pairs = (rawPairs || METALS_ONLY).filter(p => METALS_ONLY.includes(p))
+    if (!pairs.length) return NextResponse.json({ signals: [], note: 'No metals pairs to scan' })
 
     const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
-    const cfg       = tfConfig(timeframe)
     const context   = { newsInWindow, openPositions, todayPL, accountBalance }
 
-    // Run all pairs in parallel — cuts total scan time from 60-90 s → 10-15 s
-    // Batch in groups of 3 to avoid hitting Claude rate limits
-    const results: ScanSignal[] = []
-    const BATCH = 3
-
-    for (let i = 0; i < pairs.length; i += BATCH) {
-      const batch  = pairs.slice(i, i + BATCH)
-      const settled = await Promise.allSettled(
-        batch.map(pair =>
-          scanPair(pair, timeframe, authToken, strategy, context, cfg)
-            .catch(e => { console.error(`[scan] ${pair}:`, e?.message); return null })
-        )
+    // Scan both metals concurrently
+    const settled = await Promise.allSettled(
+      pairs.map(pair =>
+        scanPair(pair, timeframe, authToken, strategy, context, tfConfig(timeframe, pair))
+          .catch(e => { console.error(`[scan] ${pair}:`, e?.message); return null })
       )
-      for (const r of settled) {
-        if (r.status === 'fulfilled' && r.value) results.push(r.value)
-      }
+    )
+
+    const results: ScanSignal[] = []
+    for (const r of settled) {
+      if (r.status === 'fulfilled' && r.value) results.push(r.value)
     }
 
     if (results.length > 0) {

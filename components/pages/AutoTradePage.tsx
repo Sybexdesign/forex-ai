@@ -99,10 +99,6 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   }
 
   async function handleApprove(signal: ScanSignal) {
-    if (signal.simulated) {
-      onToast('⚠ Simulated data — cannot place real order', '#ffb800')
-      return
-    }
     setApprovingId(signal.id)
     try {
       const data = await placeOrder(signal)
@@ -129,11 +125,6 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     if (!autoExecute || !enabled) return
     for (const signal of pendingSignals) {
       if (autoExecutedRef.current.has(signal.id)) continue
-      if (signal.simulated) {
-        autoExecutedRef.current.add(signal.id)
-        onToast(`⚠ Skipped ${signal.pair}: simulated data`, '#ffb800')
-        continue
-      }
       autoExecutedRef.current.add(signal.id)
       placeOrder(signal).then(data => {
         if (data.blocked) {
@@ -252,7 +243,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
                 </div>
               )}
               {scanning && (
-                <div style={{ fontSize: 11, color: 'var(--color-wait)' }}>Scanning {watchlist.length} pairs…</div>
+                <div style={{ fontSize: 11, color: 'var(--color-wait)' }}>Scanning Gold &amp; Silver…</div>
               )}
               {lastScan && !scanning && (
                 <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
@@ -372,11 +363,11 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-accent)', letterSpacing: 1 }}>HOW IT WORKS</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {[
-              ['1', 'Scanner checks all watchlist pairs every 5 minutes using live data + AI'],
-              ['2', 'Only signals passing 6/8 checklist rules and all risk guards appear'],
-              ['3', 'Manual mode: review each signal and tap APPROVE to place on your broker'],
-              ['4', 'Auto-execute mode: qualifying signals execute instantly on your MT5 broker'],
-              ['5', 'Prop firm rules (daily loss, drawdown, news) are enforced on every trade'],
+              ['1', 'Scanner analyses XAU/USD (Gold) and XAG/USD (Silver) continuously using live MT5 data + AI'],
+              ['2', 'Multi-timeframe confirmation: 5m signals verified on 15m, 15m on 1H, 1H on 4H'],
+              ['3', 'Only signals with live market data and ≥ 55% AI confidence appear — simulation is blocked'],
+              ['4', 'Manual mode: review each signal and tap APPROVE to queue it on your MT5 broker'],
+              ['5', 'Auto-execute mode: qualifying signals execute instantly — all risk guards enforced'],
             ].map(([n, text]) => (
               <div key={n} style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
                 <span style={{
@@ -577,24 +568,13 @@ function SignalCard({
         </div>
       </div>
 
-      {/* Simulated data warning */}
-      {signal.simulated && (
-        <div style={{
-          marginBottom: 10, padding: '7px 12px', borderRadius: 3,
-          background: 'rgba(255,184,0,0.08)', border: '1px solid rgba(255,184,0,0.3)',
-          fontSize: 12, color: '#ffb800',
-        }}>
-          ⚠ <strong>SIMULATED DATA</strong> — live broker data unavailable. Trade execution blocked.
-        </div>
-      )}
-
       {/* Action buttons */}
       <div style={{ display: 'flex', gap: 10 }}>
         <button
           className={`btn ${signal.direction === 'BUY' ? 'btn-buy' : 'btn-sell'}`}
           onClick={onApprove}
-          disabled={approving || signal.simulated}
-          style={{ flex: 2, padding: '12px', fontSize: 14, letterSpacing: 2, opacity: signal.simulated ? 0.4 : 1 }}
+          disabled={approving}
+          style={{ flex: 2, padding: '12px', fontSize: 14, letterSpacing: 2 }}
         >
           {approving ? <LoadingDots color={color} /> : `✓ APPROVE & PLACE ${signal.direction}`}
         </button>

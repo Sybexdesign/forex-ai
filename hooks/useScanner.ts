@@ -19,19 +19,19 @@ export interface ScannerState {
   error: string | null
 }
 
-// Adaptive scan interval — matches the timeframe so signals stay fresh
+// Adaptive scan interval — faster for metals which move quickly
 function getScanInterval(tf: string): number {
   const MAP: Record<string, number> = {
-    '1m':  60,   // scan every 60 s — 1m candles change every 60 s
-    '3m':  90,   // scan every 90 s
-    '5m':  120,  // scan every 2 min
-    '15m': 300,  // scan every 5 min
-    '30m': 300,
-    '1H':  300,
-    '4H':  600,
-    'Daily': 1800,
+    '1m':    45,   // 45 s — metals can set up within a single candle
+    '3m':    75,
+    '5m':    60,   // 60 s — frequent enough to catch metal breakouts
+    '15m':  120,   // 2 min
+    '30m':  180,   // 3 min
+    '1H':   180,   // 3 min
+    '4H':   300,   // 5 min
+    'Daily': 900,
   }
-  return MAP[tf] ?? 300
+  return MAP[tf] ?? 180
 }
 
 export function useScanner(

@@ -24,7 +24,7 @@ import { useAuth } from '@/hooks/useAuth'
 import type { StrategySettings } from '@/lib/supabase'
 import { DEFAULT_STRATEGY } from '@/lib/supabase'
 
-const FALLBACK_PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'XAU/USD', 'XAG/USD']
+const FALLBACK_PAIRS = ['XAU/USD', 'XAG/USD']
 
 function buildNav(isAdmin: boolean) {
   const nav = [

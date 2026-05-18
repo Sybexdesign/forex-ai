@@ -8,7 +8,7 @@ import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/
 import { authFetch } from '@/lib/api'
 import type { StrategySettings } from '@/lib/supabase'
 
-const DEFAULT_PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'XAU/USD', 'XAG/USD']
+const DEFAULT_PAIRS = ['XAU/USD', 'XAG/USD']
 const TIMEFRAMES = ['1m', '3m', '5m', '15m', '1H', '4H', 'Daily']
 
 const DIR_COLOR: Record<string, string> = {
@@ -31,8 +31,12 @@ interface AnalysisProps {
 export default function AnalysisPage({
   prices, strategy, news, account, openPositions, todayPL, onToast, userId, onRefreshAccount, onRefreshTrades
 }: AnalysisProps) {
-  const watchlist = strategy.watchlist?.length ? strategy.watchlist : DEFAULT_PAIRS
-  const [pair, setPair] = useState(() => watchlist[0] || 'EUR/USD')
+  const rawWatchlist = strategy.watchlist?.length ? strategy.watchlist : DEFAULT_PAIRS
+  // Restrict to metals only
+  const watchlist = rawWatchlist.filter(p => p === 'XAU/USD' || p === 'XAG/USD').length > 0
+    ? rawWatchlist.filter(p => p === 'XAU/USD' || p === 'XAG/USD')
+    : DEFAULT_PAIRS
+  const [pair, setPair] = useState(() => watchlist[0] || 'XAU/USD')
   const [tf, setTf] = useState('1H')
   const [evalDir, setEvalDir] = useState<'BUY' | 'SELL'>('BUY')
   const [loading, setLoading] = useState(false)
@@ -49,7 +53,7 @@ export default function AnalysisPage({
 
   // If the selected pair was removed from the watchlist, switch to the first available
   useEffect(() => {
-    if (!watchlist.includes(pair)) setPair(watchlist[0] || 'EUR/USD')
+    if (!watchlist.includes(pair)) setPair(watchlist[0] || 'XAU/USD')
   }, [watchlist.join(',')]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load persisted account size from localStorage
