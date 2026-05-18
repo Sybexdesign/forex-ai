@@ -67,7 +67,6 @@ function tfConfig(timeframe: string, pair: string) {
     rsiExtremeSell:   metals ? 13 : 25,
     htfFrame:         HTF_MAP[timeframe] ?? null,
     htfCandleCount:   60,
-    srRoomPct:        metals ? 0.55 : 0.70,             // metals often break through S/R
   }
 }
 
@@ -184,16 +183,21 @@ async function scanPair(
   })
   if (!checklist.canTrade || checklist.passCount < cfg.minChecklistPass) return null
 
-  // 8. S/R room check (reduced threshold for metals)
-  const pip      = getPipValue(pair)
-  const srResult = detectSupportResistance(candles, pair)
-  if (direction === 'BUY' && srResult.nearestResistance) {
-    const roomPips = (srResult.nearestResistance.price - indicators.currentPrice) / pip
-    if (roomPips < strategy.tpPips * cfg.srRoomPct) return null
-  }
-  if (direction === 'SELL' && srResult.nearestSupport) {
-    const roomPips = (indicators.currentPrice - srResult.nearestSupport.price) / pip
-    if (roomPips < strategy.tpPips * cfg.srRoomPct) return null
+  // 8. S/R room check — skipped for metals.
+  // Metals are momentum/breakout assets; historical S/R is continuously broken in trending moves.
+  // In a trending XAU/XAG market there are always recent swing highs nearby, which would
+  // kill every valid BUY signal. The ATR guard and checklist provide sufficient risk filtering.
+  const pip = getPipValue(pair)
+  if (!isMetals(pair)) {
+    const srResult = detectSupportResistance(candles, pair)
+    if (direction === 'BUY' && srResult.nearestResistance) {
+      const roomPips = (srResult.nearestResistance.price - indicators.currentPrice) / pip
+      if (roomPips < strategy.tpPips * 0.70) return null
+    }
+    if (direction === 'SELL' && srResult.nearestSupport) {
+      const roomPips = (indicators.currentPrice - srResult.nearestSupport.price) / pip
+      if (roomPips < strategy.tpPips * 0.70) return null
+    }
   }
 
   // 9. AI analysis
