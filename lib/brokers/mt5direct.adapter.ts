@@ -198,7 +198,7 @@ export class Mt5DirectBroker implements IBroker {
     const orderId  = crypto.randomUUID()
     const pip      = getPipValue(req.pair)
     const sign     = req.direction === 'BUY' ? 1 : -1
-    const dp       = req.pair.includes('JPY') ? 3 : req.pair.startsWith('XAU') ? 2 : 5
+    const dp       = req.pair.includes('JPY') ? 3 : req.pair.startsWith('XA') ? 2 : 5
     const slPrice  = +(req.currentPrice - req.stopLossPips * pip * sign).toFixed(dp)
     const tpPrice  = +(req.currentPrice + req.takeProfitPips * pip * sign).toFixed(dp)
 
