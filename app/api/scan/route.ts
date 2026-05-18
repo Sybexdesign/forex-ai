@@ -107,12 +107,21 @@ function resolveDirection(
 
   if (emaDir === macdDir) return { direction: emaDir, method: 'ema_macd' }
 
-  // For metals: if EMA/MACD disagree but RSI + ADX strongly indicate momentum, use RSI direction
-  if (isMetals(pair) && indicators.adx > 22) {
-    if (indicators.rsi > 62 && indicators.macdHistogram > 0)
-      return { direction: 'BUY', method: 'rsi_momentum' }
-    if (indicators.rsi < 38 && indicators.macdHistogram < 0)
-      return { direction: 'SELL', method: 'rsi_momentum' }
+  if (isMetals(pair)) {
+    // MACD histogram is price-scaled: -0.03 for XAU at 4500 is < 0.001% of price — pure noise.
+    // When the histogram is within a negligible band, trust EMA trend alignment instead.
+    const flatThreshold = pair.startsWith('XAU') ? 0.5 : 0.05
+    if (Math.abs(indicators.macdHistogram) < flatThreshold)
+      return { direction: emaDir, method: 'ema_macd' }
+
+    // When EMA and MACD genuinely disagree, use RSI to confirm EMA direction (ADX must show trend)
+    // Note: macdHistogram condition removed — it was logically unreachable in this branch
+    if (indicators.adx > 22) {
+      if (emaDir === 'BUY'  && indicators.rsi > 58)
+        return { direction: 'BUY',  method: 'rsi_momentum' }
+      if (emaDir === 'SELL' && indicators.rsi < 42)
+        return { direction: 'SELL', method: 'rsi_momentum' }
+    }
   }
 
   return { direction: null, method: 'ema_macd' }
