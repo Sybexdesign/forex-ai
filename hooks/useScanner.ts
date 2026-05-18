@@ -40,7 +40,7 @@ export function useScanner(
   pairs: string[],
   timeframe = '1H',
 ) {
-  const [enabled, setEnabled] = useState(false)
+  const [enabled, setEnabled] = useState(true)
   const [scanning, setScanning] = useState(false)
   const [lastScan, setLastScan] = useState<Date | null>(null)
   const [countdown, setCountdown] = useState(0)
