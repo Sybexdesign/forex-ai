@@ -274,7 +274,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
               </div>
             ))}
             {(editing.broker_type === 'mt5direct' || editing.broker_type === 'exness') && editing.config?.webhookToken && (() => {
-              const webhookUrl = `${typeof window !== 'undefined' ? window.location.origin : 'https://forex.sybexdesigns.co.uk'}/api/mt5-sync?token=${editing.config.webhookToken}`
+              const webhookUrl = `https://forex.sybexdesigns.co.uk/api/mt5-sync?token=${editing.config.webhookToken}`
               const eaCode = `//+------------------------------------------------------------------+
 //| SybexForexAI Sync EA — MQL5 (MT5 native)                         |
 //+------------------------------------------------------------------+

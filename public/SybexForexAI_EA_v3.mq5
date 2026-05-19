@@ -350,11 +350,13 @@ void SendDataToApp() {
    if (res == -1) {
       Print("SybexForexAI sync FAILED (err=", GetLastError(),
             "). Ensure URL is in Tools→Options→Expert Advisors→Allowed URLs");
-   } else {
+   } else if (res == 200) {
       Print("SybexForexAI sync OK"
             " | Balance: ", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
             " | Pairs: ",   g_totalSymbols,
-            " | Pos: ",     PositionsTotal(),
-            " | HTTP: ",    res);
+            " | Pos: ",     PositionsTotal());
+   } else {
+      string responseBody = CharArrayToString(result);
+      Print("SybexForexAI sync HTTP ", res, " — body: ", StringSubstr(responseBody, 0, 200));
    }
 }
