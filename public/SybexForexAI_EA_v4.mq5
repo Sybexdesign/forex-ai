@@ -43,8 +43,20 @@ void OnDeinit(const int reason) { EventKillTimer(); }
 void OnTimer() {
    // 1. Pull pending orders
    string resp = FetchPendingOrders();
-   if (StringLen(resp) > 10)
+   if (StringLen(resp) > 10) {
+      // Count pending orders for diagnostics
+      int orderCount = 0;
+      int searchPos = 0;
+      while (StringFind(resp, "\"id\":", searchPos) >= 0) {
+         searchPos = StringFind(resp, "\"id\":", searchPos) + 1;
+         orderCount++;
+      }
+      if (orderCount > 0)
+         Print("SybexForexAI v4: ", orderCount, " pending order(s) received — executing...");
+      else
+         Print("SybexForexAI v4: pull OK — no pending orders");
       g_completedJson = ExecuteOrders(resp);
+   }
 
    // 2. Push data
    SendDataToApp();
