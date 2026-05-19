@@ -3,7 +3,7 @@
 // Full-auto + semi-auto trading with prop firm enforcement
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Panel, LoadingDots } from '../ui'
+import { Panel, LoadingDots, CopyValue } from '../ui'
 import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { authFetch } from '@/lib/api'
 import type { ScanSignal } from '@/hooks/useScanner'
@@ -521,7 +521,9 @@ function SignalCard({
       <div className="entry-zone-bar" style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', borderRadius: 3, background: 'rgba(96,192,255,0.06)', border: '1px solid rgba(96,192,255,0.22)', marginBottom: 10 }}>
         <div style={{ fontSize: 9, color: 'var(--color-accent)', letterSpacing: 1.5, fontWeight: 700, flexShrink: 0 }}>ENTRY ZONE</div>
         <div className="mono" style={{ fontSize: 14, fontWeight: 700, color: 'var(--color-accent)' }}>
-          {signal.entryZone.low.toFixed(dp)} – {signal.entryZone.high.toFixed(dp)}
+          <CopyValue value={signal.entryZone.low.toFixed(dp)}>{signal.entryZone.low.toFixed(dp)}</CopyValue>
+          {' – '}
+          <CopyValue value={signal.entryZone.high.toFixed(dp)}>{signal.entryZone.high.toFixed(dp)}</CopyValue>
         </div>
         <div className="entry-zone-hint" style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-muted)', fontStyle: 'italic' }}>
           Wait for price to enter this zone
@@ -530,16 +532,22 @@ function SignalCard({
 
       {/* Price levels */}
       <div className="signal-price-grid" style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-        {[
-          ['LIVE PRICE', price.toFixed(dp), 'var(--color-accent-dim)'],
-          ['TAKE PROFIT', tpPrice, 'var(--color-profit)'],
-          ['STOP LOSS', slPrice, 'var(--color-loss)'],
-        ].map(([label, val, c]) => (
-          <div key={label} style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.1)', borderRadius: 3, padding: '6px 10px' }}>
-            <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 2 }}>{label}</div>
-            <div className="mono" style={{ fontSize: 11, color: c, fontWeight: 700 }}>{val}</div>
+        <div style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.1)', borderRadius: 3, padding: '6px 10px' }}>
+          <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 2 }}>LIVE PRICE</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--color-accent-dim)', fontWeight: 700 }}>{price.toFixed(dp)}</div>
+        </div>
+        <div style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.1)', borderRadius: 3, padding: '6px 10px' }}>
+          <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 2 }}>TAKE PROFIT</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--color-profit)', fontWeight: 700 }}>
+            <CopyValue value={tpPrice}>{tpPrice}</CopyValue>
           </div>
-        ))}
+        </div>
+        <div style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.1)', borderRadius: 3, padding: '6px 10px' }}>
+          <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 2 }}>STOP LOSS</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--color-loss)', fontWeight: 700 }}>
+            <CopyValue value={slPrice}>{slPrice}</CopyValue>
+          </div>
+        </div>
       </div>
 
       {/* Reasons */}

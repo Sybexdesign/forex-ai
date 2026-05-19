@@ -256,6 +256,19 @@ export function CopyValue({
           <path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/>
         </svg>
       )}
+      {copied && (
+        <span style={{
+          position: 'absolute', bottom: 'calc(100% + 6px)', left: '50%',
+          transform: 'translateX(-50%)',
+          background: '#0d2010', border: '1px solid #00c060',
+          color: '#00c060', fontSize: 11, fontWeight: 700,
+          padding: '3px 10px', borderRadius: 4,
+          whiteSpace: 'nowrap', pointerEvents: 'none', zIndex: 9999,
+          letterSpacing: 0.5, boxShadow: '0 2px 8px rgba(0,192,96,0.25)',
+        }}>
+          Copied!
+        </span>
+      )}
     </span>
   )
 }
