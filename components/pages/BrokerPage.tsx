@@ -274,244 +274,56 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
               </div>
             ))}
             {(editing.broker_type === 'mt5direct' || editing.broker_type === 'exness') && editing.config?.webhookToken && (() => {
-              const webhookUrl = `https://forex.sybexdesigns.co.uk/api/mt5-sync?token=${editing.config.webhookToken}`
-              const eaCode = `//+------------------------------------------------------------------+
-//| SybexForexAI Sync EA — MQL5 (MT5 native)                         |
-//+------------------------------------------------------------------+
-#include <Trade\\Trade.mqh>
-
-input string WebhookURL     = "${webhookUrl}";
-input int    BalanceSyncSec = 30;
-input int    OrderPollSec   = 5;
-
-CTrade       trade;
-datetime     lastBalance = 0;
-datetime     lastPoll    = 0;
-string       completedJson = "";
-
-int OnInit() {
-   trade.SetExpertMagicNumber(202501);
-   EventSetTimer(1);
-   Print("SybexAI EA started. Webhook: ", WebhookURL);
-   return INIT_SUCCEEDED;
-}
-void OnDeinit(const int) { EventKillTimer(); Print("SybexAI EA stopped."); }
-
-void OnTimer() {
-   datetime now = TimeCurrent();
-   if(now - lastPoll    >= OrderPollSec)    { PollAndExecute(); lastPoll    = now; }
-   if(now - lastBalance >= BalanceSyncSec)  { SendBalance();    lastBalance = now; }
-}
-
-//--- Build open positions JSON array
-string BuildPositionsJson() {
-   string posJson = "";
-   int total = PositionsTotal();
-   for(int i = 0; i < total; i++) {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-      string sym    = PositionGetString(POSITION_SYMBOL);
-      string type   = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL");
-      double lots   = PositionGetDouble(POSITION_VOLUME);
-      double open   = PositionGetDouble(POSITION_PRICE_OPEN);
-      double profit = PositionGetDouble(POSITION_PROFIT);
-      if(posJson != "") posJson += ",";
-      posJson += StringFormat(
-         "{\\"ticket\\":%d,\\"symbol\\":\\"%s\\",\\"type\\":\\"%s\\",\\"lots\\":%.2f,\\"openPrice\\":%.5f,\\"profit\\":%.2f}",
-         (int)ticket, sym, type, lots, open, profit
-      );
-   }
-   return posJson;
-}
-
-//--- Send balance + completed orders + open positions back to app
-void SendBalance() {
-   string posJson = BuildPositionsJson();
-   string body = StringFormat(
-      "{\\"balance\\":%.2f,\\"equity\\":%.2f,\\"currency\\":\\"%s\\",\\"login\\":\\"%d\\",\\"server\\":\\"%s\\",\\"completedOrders\\":[%s],\\"openPositions\\":[%s]}",
-      AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY),
-      AccountInfoString(ACCOUNT_CURRENCY), (int)AccountInfoInteger(ACCOUNT_LOGIN),
-      AccountInfoString(ACCOUNT_SERVER), completedJson, posJson
-   );
-   completedJson = "";
-   char post[], res[];
-   string resHdr = "";
-   StringToCharArray(body, post, 0, StringLen(body));
-   int code = WebRequest("POST", WebhookURL, "Content-Type: application/json\\r\\n", 5000, post, res, resHdr);
-   if(code != 200) Print("Balance sync failed. HTTP: ", code, " Error: ", GetLastError());
-}
-
-//--- Auto-detect broker filling mode for a symbol
-ENUM_ORDER_TYPE_FILLING GetFilling(string symbol) {
-   long modes = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
-   if((modes & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
-   if((modes & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
-   return ORDER_FILLING_RETURN;
-}
-
-//--- Poll webhook and execute any pending orders / close commands
-void PollAndExecute() {
-   char data[], result[];
-   string resHdr = "";
-   ArrayResize(data, 0);
-   int code = WebRequest("GET", WebhookURL, "", 5000, data, result, resHdr);
-   if(code != 200) { Print("Poll failed. HTTP: ", code, " Error: ", GetLastError(), " — Is the URL added to Tools→Options→Expert Advisors→Allow WebRequest?"); return; }
-   string resp = CharArrayToString(result);
-   if(StringFind(resp, "\\"id\\"") < 0) return;
-   Print("Orders found in queue — executing...");
-
-   int pos = 0;
-   while(true) {
-      int idStart = StringFind(resp, "\\"id\\":\\"", pos);
-      if(idStart < 0) break;
-      idStart += 6;
-      int idEnd = StringFind(resp, "\\"", idStart);
-      if(idEnd < 0) break;
-      string orderId = StringSubstr(resp, idStart, idEnd - idStart);
-
-      // Detect order type: close commands have no "lots" field (lots==0)
-      double lots = ExtractNum(resp, "\\"lots\\":", idStart);
-
-      if(lots == 0) {
-         // ── Close command ──
-         string symbol = ExtractStr(resp, "\\"symbol\\":\\"", idStart);
-         bool closed = false;
-         string closeErr = "";
-         if(StringLen(symbol) > 0 && SymbolSelect(symbol, true)) {
-            int total = PositionsTotal();
-            for(int i = total - 1; i >= 0; i--) {
-               ulong ticket = PositionGetTicket(i);
-               if(ticket == 0) continue;
-               if(PositionGetString(POSITION_SYMBOL) == symbol) {
-                  if(trade.PositionClose(ticket)) {
-                     closed = true;
-                     Print("Closed position ticket=", ticket, " symbol=", symbol);
-                  } else {
-                     closeErr = IntegerToString(trade.ResultRetcode());
-                     Print("Close failed ticket=", ticket, " retcode=", trade.ResultRetcode());
-                  }
-               }
-            }
-            if(!closed && StringLen(closeErr) == 0) closeErr = "no_position_found";
-         } else {
-            closeErr = (StringLen(symbol) == 0 ? "no_symbol" : "symbol_not_in_marketwatch");
-            Print("Close: symbol not found: ", symbol);
-         }
-         string entry = StringFormat(
-            "{\\"id\\":\\"%s\\",\\"success\\":%s,\\"ticket\\":0,\\"filledPrice\\":0,\\"error\\":\\"%s\\"}",
-            orderId, (closed ? "true" : "false"), closeErr
-         );
-         if(completedJson != "") completedJson += ",";
-         completedJson += entry;
-         pos = idEnd;
-         continue;
-      }
-
-      // ── Regular buy/sell order ──
-      string symbol    = ExtractStr(resp, "\\"symbol\\":\\"", idStart);
-      string direction = ExtractStr(resp, "\\"direction\\":\\"", idStart);
-      double slPips    = ExtractNum(resp, "\\"slPips\\":", idStart);
-      double tpPips    = ExtractNum(resp, "\\"tpPips\\":", idStart);
-      if(!SymbolSelect(symbol, true)) {
-         Print("Symbol not found in Market Watch: ", symbol, " — check exact name in MT5 Market Watch (Ctrl+M)");
-         pos = idEnd; continue;
-      }
-      ENUM_ORDER_TYPE type  = (direction == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-      double          price = (type == ORDER_TYPE_BUY)
-                              ? SymbolInfoDouble(symbol, SYMBOL_ASK)
-                              : SymbolInfoDouble(symbol, SYMBOL_BID);
-
-      // Compute SL/TP from current live price so they are always valid at execution
-      bool   isJPY   = StringFind(symbol, "JPY") >= 0;
-      bool   isXAU   = StringFind(symbol, "XAU") >= 0;
-      bool   isXAG   = StringFind(symbol, "XAG") >= 0;
-      double pipSize = isJPY ? 0.01 : (isXAU ? 0.1 : (isXAG ? 0.01 : 0.0001));
-      double sl = (type == ORDER_TYPE_BUY) ? price - slPips * pipSize : price + slPips * pipSize;
-      double tp = (type == ORDER_TYPE_BUY) ? price + tpPips * pipSize : price - tpPips * pipSize;
-
-      // Enforce broker minimum stop distance
-      int    stopsLevel = (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-      double point      = SymbolInfoDouble(symbol, SYMBOL_POINT);
-      double minDist    = (stopsLevel + 5) * point;
-      if(minDist > 0) {
-         if(type == ORDER_TYPE_BUY) {
-            if(price - sl < minDist) sl = price - minDist;
-            if(tp - price < minDist) tp = price + minDist;
-         } else {
-            if(sl - price < minDist) sl = price + minDist;
-            if(price - tp < minDist) tp = price - minDist;
-         }
-      }
-      Print("Executing: ", direction, " ", lots, " ", symbol, " @ ", price,
-            " SL=", sl, " TP=", tp, " minStopDist=", minDist);
-
-      MqlTradeRequest req = {};
-      MqlTradeResult  res = {};
-      req.action       = TRADE_ACTION_DEAL;
-      req.symbol       = symbol;
-      req.volume       = lots;
-      req.type         = type;
-      req.price        = price;
-      req.sl           = sl;
-      req.tp           = tp;
-      req.deviation    = 10;
-      req.magic        = 202501;
-      req.comment      = "SybexAI";
-      req.type_filling = GetFilling(symbol);
-
-      bool ok = OrderSend(req, res);
-      if(ok) Print("Order executed: ", direction, " ", lots, " ", symbol, " ticket=", res.deal, " price=", res.price);
-      else   Print("Order FAILED: ", direction, " ", lots, " ", symbol, " retcode=", res.retcode, " comment=", res.comment, " error=", GetLastError());
-      string entry = StringFormat(
-         "{\\"id\\":\\"%s\\",\\"success\\":%s,\\"ticket\\":%d,\\"filledPrice\\":%.5f,\\"error\\":\\"%s\\"}",
-         orderId, (ok ? "true" : "false"), (int)res.deal, res.price,
-         (ok ? "" : IntegerToString(GetLastError()))
-      );
-      if(completedJson != "") completedJson += ",";
-      completedJson += entry;
-      pos = idEnd;
-   }
-   if(completedJson != "") SendBalance();
-}
-
-string ExtractStr(string src, string key, int from) {
-   int s = StringFind(src, key, from); if(s < 0) return "";
-   s += StringLen(key);
-   int e = StringFind(src, "\\"", s); if(e < 0) return "";
-   return StringSubstr(src, s, e - s);
-}
-double ExtractNum(string src, string key, int from) {
-   int s = StringFind(src, key, from); if(s < 0) return 0;
-   s += StringLen(key);
-   return StringToDouble(StringSubstr(src, s, 20));
-}`
+              const token = editing.config.webhookToken
+              const supabaseUrl = `https://lfurosnmkwvqtlifggaa.supabase.co/rest/v1/rpc/mt5_webhook_sync`
               return (
                 <div style={{ marginBottom: 14 }}>
-                  <div style={{ padding: '12px 14px', background: 'rgba(0,255,135,0.04)', border: '1px solid rgba(0,255,135,0.2)', borderRadius: 3, fontSize: 12, color: '#80d0a0', marginBottom: 10 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 8, color: '#00ff87' }}>3-step setup — no MetaApi needed:</div>
-                    <div style={{ marginBottom: 6 }}>1. Save this broker config first</div>
-                    <div style={{ marginBottom: 6 }}>2. In MT5: <strong>Tools → Options → Expert Advisors → Allow WebRequest</strong> → add your app URL</div>
-                    <div>3. Copy the EA code below into MT5 and attach it to any chart</div>
+                  {/* Setup instructions */}
+                  <div style={{ padding: '12px 14px', background: 'rgba(0,255,135,0.04)', border: '1px solid rgba(0,255,135,0.2)', borderRadius: 3, fontSize: 12, color: '#80d0a0', marginBottom: 12 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 8, color: '#00ff87' }}>EA v4 setup — direct Supabase sync (stable, no Vercel edge issues):</div>
+                    <div style={{ marginBottom: 5 }}>1. Save this broker config, then download <strong>SybexForexAI_EA_v4.mq5</strong> below</div>
+                    <div style={{ marginBottom: 5 }}>2. In MT5: <strong>Tools → Options → Expert Advisors → Allow WebRequest</strong> → add the Supabase URL below</div>
+                    <div style={{ marginBottom: 5 }}>3. Compile the EA in MetaEditor and attach to any chart</div>
+                    <div>4. In EA Inputs, paste your <strong>Webhook Token</strong> — copy it below</div>
                   </div>
-                  <label style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, display: 'block', marginBottom: 6 }}>WEBHOOK URL (add this in MT5 WebRequest allowed URLs)</label>
+
+                  {/* Supabase URL to add to MT5 allowed list */}
+                  <label style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, display: 'block', marginBottom: 6 }}>ADD THIS URL TO MT5 ALLOWED WEBREQUEST URLS</label>
                   <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-                    <input readOnly value={webhookUrl} style={{ ...inputSt, flex: 1, fontSize: 11, color: '#60c0ff' }} />
+                    <input readOnly value={supabaseUrl} style={{ ...inputSt, flex: 1, fontSize: 11, color: '#60c0ff' }} />
                     <button
-                      onClick={() => { navigator.clipboard.writeText(webhookUrl); onToast?.('URL copied', '#00ff87') }}
+                      onClick={() => { navigator.clipboard.writeText(supabaseUrl); onToast?.('URL copied', '#00ff87') }}
                       className="btn btn-ghost" style={{ fontSize: 11, padding: '6px 12px', flexShrink: 0 }}
                     >Copy</button>
                   </div>
-                  <label style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, display: 'block', marginBottom: 6 }}>MT5 EXPERT ADVISOR CODE</label>
-                  <textarea
-                    readOnly
-                    value={eaCode}
-                    rows={8}
-                    style={{ ...inputSt, fontSize: 10, lineHeight: 1.5, resize: 'vertical', fontFamily: 'JetBrains Mono' }}
-                  />
-                  <button
-                    onClick={() => { navigator.clipboard.writeText(eaCode); onToast?.('EA code copied', '#00ff87') }}
-                    className="btn btn-ghost" style={{ fontSize: 11, padding: '6px 16px', marginTop: 6 }}
-                  >Copy EA Code</button>
+
+                  {/* Webhook token */}
+                  <label style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, display: 'block', marginBottom: 6 }}>WEBHOOK TOKEN (paste into EA v4 Inputs → WebhookToken)</label>
+                  <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+                    <input readOnly value={token} style={{ ...inputSt, flex: 1, fontSize: 13, color: '#00e5b4', letterSpacing: 1, fontFamily: 'monospace' }} />
+                    <button
+                      onClick={() => { navigator.clipboard.writeText(token); onToast?.('Token copied', '#00ff87') }}
+                      className="btn btn-ghost" style={{ fontSize: 11, padding: '6px 12px', flexShrink: 0 }}
+                    >Copy</button>
+                  </div>
+
+                  {/* Download EA v4 */}
+                  <a
+                    href="/SybexForexAI_EA_v4.mq5"
+                    download="SybexForexAI_EA_v4.mq5"
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 8,
+                      background: 'rgba(0,229,180,0.12)', color: '#00e5b4',
+                      border: '1px solid rgba(0,229,180,0.4)', borderRadius: 5,
+                      padding: '8px 18px', fontSize: 13, fontWeight: 700,
+                      textDecoration: 'none', letterSpacing: 0.3,
+                    }}
+                  >
+                    ↓ Download SybexForexAI_EA_v4.mq5
+                  </a>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
+                    v4 posts directly to Supabase — bypasses Vercel edge, fixes the intermittent 403 issue
+                  </div>
                 </div>
               )
             })()}
