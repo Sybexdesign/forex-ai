@@ -235,36 +235,26 @@ export function CopyValue({
         position: 'relative',
         display: 'inline-flex',
         alignItems: 'center',
+        gap: 3,
         userSelect: 'none',
         WebkitUserSelect: 'none',
         WebkitTapHighlightColor: 'transparent',
-        borderRadius: 2,
-        transition: 'opacity 0.1s',
+        borderBottom: copied ? '1px solid #00c060' : '1px dashed rgba(144,176,208,0.4)',
+        paddingBottom: 1,
+        borderRadius: 0,
+        transition: 'border-color 0.15s',
         ...style,
       }}
     >
       {children ?? String(value)}
-      {copied && (
-        <span style={{
-          position: 'absolute',
-          bottom: '100%',
-          left: '50%',
-          transform: 'translateX(-50%)',
-          marginBottom: 5,
-          background: '#0d1a0d',
-          border: '1px solid #00c060',
-          color: '#00c060',
-          fontSize: 10,
-          fontWeight: 700,
-          padding: '2px 8px',
-          borderRadius: 4,
-          whiteSpace: 'nowrap',
-          pointerEvents: 'none',
-          zIndex: 9999,
-          letterSpacing: 0.5,
-        }}>
-          ✓ Copied
-        </span>
+      {copied ? (
+        <span style={{ fontSize: 9, color: '#00c060', fontWeight: 700, letterSpacing: 0.3, flexShrink: 0 }}>✓</span>
+      ) : (
+        <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor"
+          style={{ opacity: 0.45, flexShrink: 0, marginTop: 1 }}>
+          <path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1z"/>
+          <path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/>
+        </svg>
       )}
     </span>
   )
