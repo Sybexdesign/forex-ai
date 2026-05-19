@@ -3,7 +3,7 @@
 
 import React, { useState, useMemo } from 'react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts'
-import { Panel, StatCard, DirectionBadge } from '../ui'
+import { Panel, StatCard, DirectionBadge, CopyValue } from '../ui'
 
 interface SignalsPageProps { signals: any[] }
 
@@ -287,7 +287,9 @@ export default function SignalsPage({ signals }: SignalsPageProps) {
                               {(s.entry_zone_low && s.entry_zone_high) && (
                                 <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-muted)' }}>
                                   Entry zone: <span className="mono" style={{ color: '#90b0d0' }}>
-                                    {s.entry_zone_low?.toFixed(5)} — {s.entry_zone_high?.toFixed(5)}
+                                    <CopyValue value={s.entry_zone_low.toFixed(5)}>{s.entry_zone_low.toFixed(5)}</CopyValue>
+                                    {' — '}
+                                    <CopyValue value={s.entry_zone_high.toFixed(5)}>{s.entry_zone_high.toFixed(5)}</CopyValue>
                                   </span>
                                 </div>
                               )}

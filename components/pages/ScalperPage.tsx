@@ -2,7 +2,7 @@
 // components/pages/ScalperPage.tsx — ForexAI Scalper Phase 2 (Real Infrastructure)
 
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Panel, ChecklistItem, LiveDot, StrengthBar } from '../ui'
+import { Panel, ChecklistItem, LiveDot, StrengthBar, CopyValue } from '../ui'
 import { authJson } from '@/lib/api'
 import type { PriceData } from '@/hooks/useForex'
 import type { StrategySettings } from '@/lib/supabase'
@@ -685,9 +685,9 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                   <span className="mono" style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t.openTime}</span>
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4, marginTop: 8, fontSize: 10 }}>
-                  <div><span style={{ color: 'var(--text-muted)' }}>Entry: </span><span className="mono">{t.entry.toFixed(decimals)}</span></div>
-                  <div><span style={{ color: C.red }}>SL: </span><span className="mono">{t.sl ? t.sl.toFixed(decimals) : '—'}</span></div>
-                  <div><span style={{ color: C.green }}>TP: </span><span className="mono">{t.tp ? t.tp.toFixed(decimals) : '—'}</span></div>
+                  <div><span style={{ color: 'var(--text-muted)' }}>Entry: </span><span className="mono"><CopyValue value={t.entry.toFixed(decimals)}>{t.entry.toFixed(decimals)}</CopyValue></span></div>
+                  <div><span style={{ color: C.red }}>SL: </span><span className="mono">{t.sl ? <CopyValue value={t.sl.toFixed(decimals)}>{t.sl.toFixed(decimals)}</CopyValue> : '—'}</span></div>
+                  <div><span style={{ color: C.green }}>TP: </span><span className="mono">{t.tp ? <CopyValue value={t.tp.toFixed(decimals)}>{t.tp.toFixed(decimals)}</CopyValue> : '—'}</span></div>
                 </div>
                 {t.mode === 'LIVE' && (
                   <div style={{ marginTop: 6, fontSize: 11, fontWeight: 700, color: t.pnl >= 0 ? C.green : C.red }}>

@@ -7,7 +7,7 @@
 // 4. Support & Resistance Auto-Detection
 
 import { useState, useEffect } from 'react'
-import { Panel, LoadingDots, StatCard } from '../ui'
+import { Panel, LoadingDots, StatCard, CopyValue } from '../ui'
 import { authFetch } from '@/lib/api'
 
 const PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD', 'EUR/GBP', 'GBP/JPY', 'USD/CHF', 'NZD/USD', 'EUR/JPY', 'XAU/USD', 'XAG/USD']
@@ -198,7 +198,9 @@ function ATRPanel({ atr, direction }: { atr: any; direction: 'BUY' | 'SELL' }) {
             <div>
               <div style={{ fontSize: 10, color: '#ff6060', letterSpacing: 1, marginBottom: 2 }}>STOP LOSS (1.5x ATR)</div>
               <div className="mono" style={{ fontSize: 13, color: '#ff3056' }}>
-                {direction === 'BUY' ? atr.slPrice?.buy : atr.slPrice?.sell}
+                <CopyValue value={String(direction === 'BUY' ? atr.slPrice?.buy : atr.slPrice?.sell)}>
+                  {direction === 'BUY' ? atr.slPrice?.buy : atr.slPrice?.sell}
+                </CopyValue>
               </div>
             </div>
             <div className="mono" style={{ fontSize: 18, color: '#ff3056', fontWeight: 700 }}>
@@ -219,7 +221,9 @@ function ATRPanel({ atr, direction }: { atr: any; direction: 'BUY' | 'SELL' }) {
             }}>
               <div>
                 <div style={{ fontSize: 10, color: tp.color, letterSpacing: 1, marginBottom: 2 }}>{tp.label}</div>
-                <div className="mono" style={{ fontSize: 13, color: tp.color }}>{tp.price}</div>
+                <div className="mono" style={{ fontSize: 13, color: tp.color }}>
+                  <CopyValue value={String(tp.price)}>{tp.price}</CopyValue>
+                </div>
               </div>
               <div className="mono" style={{ fontSize: 18, color: tp.color, fontWeight: 700 }}>{tp.pips}p</div>
             </div>

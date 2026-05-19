@@ -2,7 +2,7 @@
 // components/pages/AnalysisPage.tsx
 
 import { useState, useEffect } from 'react'
-import { Panel, ChecklistItem, RsiGauge, LoadingDots, DirectionBadge } from '../ui'
+import { Panel, ChecklistItem, RsiGauge, LoadingDots, DirectionBadge, CopyValue } from '../ui'
 import { useIndicators } from '@/hooks/useForex'
 import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { authFetch } from '@/lib/api'
@@ -439,7 +439,9 @@ export default function AnalysisPage({
                 }}>
                   <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>ENTRY ZONE</span>
                   <span className="mono" style={{ fontSize: 13, color: 'var(--color-accent-dim)' }}>
-                    {rec.entry_zone.low?.toFixed?.(5)} — {rec.entry_zone.high?.toFixed?.(5)}
+                    <CopyValue value={rec.entry_zone.low?.toFixed?.(5) ?? ''}>{rec.entry_zone.low?.toFixed?.(5)}</CopyValue>
+                    {' — '}
+                    <CopyValue value={rec.entry_zone.high?.toFixed?.(5) ?? ''}>{rec.entry_zone.high?.toFixed?.(5)}</CopyValue>
                   </span>
                 </div>
               )}
@@ -487,7 +489,9 @@ export default function AnalysisPage({
                       ].map(([label, val, color]) => (
                         <div key={label} style={{ flex: 1, background: 'rgba(0,0,0,0.1)', borderRadius: 3, padding: '6px 10px' }}>
                           <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 3 }}>{label}</div>
-                          <div className="mono" style={{ fontSize: 13, color, fontWeight: 700 }}>{val}</div>
+                          <div className="mono" style={{ fontSize: 13, color, fontWeight: 700 }}>
+                            <CopyValue value={val as string}>{val}</CopyValue>
+                          </div>
                         </div>
                       ))}
                     </div>

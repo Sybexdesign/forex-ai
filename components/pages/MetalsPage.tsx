@@ -3,7 +3,7 @@
 // Dedicated Gold (XAU/USD) and Silver (XAG/USD) trading page
 
 import { useState, useEffect } from 'react'
-import { Panel, LoadingDots, DirectionBadge, StatCard } from '../ui'
+import { Panel, LoadingDots, DirectionBadge, StatCard, CopyValue } from '../ui'
 import { METAL_CONFIG, goldSilverRatio, goldAIContext, goldPositionSize } from '@/lib/metals'
 import { authFetch } from '@/lib/api'
 
@@ -483,7 +483,9 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
                 <div style={{ background: 'rgba(0,0,0,0.2)', borderRadius: 3, padding: '8px 12px', marginBottom: 12 }}>
                   <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>ENTRY ZONE </span>
                   <span className="mono" style={{ color: cfg.color }}>
-                    ${rec.entry_zone.low?.toFixed(2)} — ${rec.entry_zone.high?.toFixed(2)}
+                    <CopyValue value={`$${rec.entry_zone.low?.toFixed(2)}`}>${rec.entry_zone.low?.toFixed(2)}</CopyValue>
+                    {' — '}
+                    <CopyValue value={`$${rec.entry_zone.high?.toFixed(2)}`}>${rec.entry_zone.high?.toFixed(2)}</CopyValue>
                   </span>
                 </div>
               )}
@@ -492,14 +494,16 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
               {rec.direction !== 'WAIT' && (
                 <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
                   {[
-                    ['TP', currentPrice != null ? `$${(currentPrice + strategy.tpPips * cfg.pipSize * (rec.direction === 'BUY' ? 1 : -1)).toFixed(2)}` : '—', '#00c060'],
-                    ['SL', currentPrice != null ? `$${(currentPrice - strategy.slPips * cfg.pipSize * (rec.direction === 'BUY' ? 1 : -1)).toFixed(2)}` : '—', '#c02040'],
-                    ['LOTS', lotSize, cfg.color],
-                    ['P/L per pip', `$${(cfg.pipValuePerLot * lotSize).toFixed(2)}`, '#60c0ff'],
-                  ].map(([label, val, color]) => (
-                    <div key={label} style={{ flex: 1, background: 'rgba(0,0,0,0.2)', borderRadius: 3, padding: '6px 8px' }}>
+                    ['TP',          currentPrice != null ? `$${(currentPrice + strategy.tpPips * cfg.pipSize * (rec.direction === 'BUY' ? 1 : -1)).toFixed(2)}` : '—', '#00c060',  true],
+                    ['SL',          currentPrice != null ? `$${(currentPrice - strategy.slPips * cfg.pipSize * (rec.direction === 'BUY' ? 1 : -1)).toFixed(2)}` : '—', '#c02040',  true],
+                    ['LOTS',        lotSize,                                                                                                                           cfg.color,  false],
+                    ['P/L per pip', `$${(cfg.pipValuePerLot * lotSize).toFixed(2)}`,                                                                                  '#60c0ff',  false],
+                  ].map(([label, val, color, copyable]) => (
+                    <div key={label as string} style={{ flex: 1, background: 'rgba(0,0,0,0.2)', borderRadius: 3, padding: '6px 8px' }}>
                       <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 3 }}>{label}</div>
-                      <div className="mono" style={{ fontSize: 12, color: color as string, fontWeight: 700 }}>{val}</div>
+                      <div className="mono" style={{ fontSize: 12, color: color as string, fontWeight: 700 }}>
+                        {copyable && val !== '—' ? <CopyValue value={val as string}>{val}</CopyValue> : val}
+                      </div>
                     </div>
                   ))}
                 </div>

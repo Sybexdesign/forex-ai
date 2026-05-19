@@ -1,7 +1,7 @@
 'use client'
 // components/ui.tsx — shared UI components
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 
 // ─── SIGNAL CONFIG ────────────────────────────────────────────────────────────
 
@@ -190,6 +190,82 @@ export function PriceDisplay({ value, prev, decimals = 5, size = 22 }: { value: 
   return (
     <span className="mono" style={{ fontSize: size, fontWeight: 700, color, transition: 'color 0.3s' }}>
       {value.toFixed(decimals)}
+    </span>
+  )
+}
+
+// ─── COPY VALUE ──────────────────────────────────────────────────────────────
+
+export function CopyValue({
+  value,
+  children,
+  style,
+}: {
+  value: string | number
+  children?: React.ReactNode
+  style?: React.CSSProperties
+}) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = useCallback(async (e: React.MouseEvent | React.TouchEvent) => {
+    e.stopPropagation()
+    const text = String(value)
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0'
+      document.body.appendChild(ta)
+      ta.focus()
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }, [value])
+
+  return (
+    <span
+      onClick={handleCopy}
+      title="Tap to copy"
+      style={{
+        cursor: 'pointer',
+        position: 'relative',
+        display: 'inline-flex',
+        alignItems: 'center',
+        userSelect: 'none',
+        WebkitUserSelect: 'none',
+        WebkitTapHighlightColor: 'transparent',
+        borderRadius: 2,
+        transition: 'opacity 0.1s',
+        ...style,
+      }}
+    >
+      {children ?? String(value)}
+      {copied && (
+        <span style={{
+          position: 'absolute',
+          bottom: '100%',
+          left: '50%',
+          transform: 'translateX(-50%)',
+          marginBottom: 5,
+          background: '#0d1a0d',
+          border: '1px solid #00c060',
+          color: '#00c060',
+          fontSize: 10,
+          fontWeight: 700,
+          padding: '2px 8px',
+          borderRadius: 4,
+          whiteSpace: 'nowrap',
+          pointerEvents: 'none',
+          zIndex: 9999,
+          letterSpacing: 0.5,
+        }}>
+          ✓ Copied
+        </span>
+      )}
     </span>
   )
 }
