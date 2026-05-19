@@ -70,6 +70,7 @@ string FetchPendingOrders() {
    // Pull = no balance in payload
    string body = "{\"p_token\":\"" + WebhookToken + "\",\"p_payload\":null}";
    StringToCharArray(body, post, 0, StringLen(body));
+   ArrayResize(post, StringLen(body)); // strip null terminator added by StringToCharArray
 
    ResetLastError();
    int res = WebRequest("POST", SYNC_URL, headers, 10000, post, result, respHeaders);
@@ -110,6 +111,7 @@ void SendDataToApp() {
    string respHeaders = "";
    char   post[], result[];
    StringToCharArray(body, post, 0, StringLen(body));
+   ArrayResize(post, StringLen(body)); // strip null terminator
 
    ResetLastError();
    int res = WebRequest("POST", SYNC_URL, headers, 15000, post, result, respHeaders);
