@@ -27,14 +27,14 @@ int    g_totalSymbols  = 0;
 string g_completedJson = "[]";
 
 int OnInit() {
-   if (WebhookToken == "YOUR_TOKEN_HERE") {
-      Print("SybexForexAI v4: ERROR — paste your Webhook Token in the Inputs tab");
-      return INIT_FAILED;
-   }
    g_totalSymbols = ArraySize(SYMBOLS);
    EventSetTimer(SyncEverySeconds);
-   Print("SybexForexAI EA v4 started — direct Supabase sync every ", SyncEverySeconds, "s");
-   Print("Token prefix: ", StringSubstr(WebhookToken, 0, 8), "...");
+   if (WebhookToken == "YOUR_TOKEN_HERE") {
+      Print("SybexForexAI v4: WARNING — token not set. Edit Inputs and paste your Webhook Token.");
+   } else {
+      Print("SybexForexAI EA v4 started — direct Supabase sync every ", SyncEverySeconds, "s");
+      Print("Token prefix: ", StringSubstr(WebhookToken, 0, 8), "...");
+   }
    return INIT_SUCCEEDED;
 }
 
