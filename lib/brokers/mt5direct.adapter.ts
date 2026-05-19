@@ -39,8 +39,9 @@ const TF_KEY: Record<string, string> = {
 }
 
 // How stale (ms) we allow EA price/candle data to be before falling through
-const PRICE_TTL  = 2 * 60_000   // 2 minutes
-const CANDLE_TTL = 6 * 60_000   // 6 minutes (2 × M5 bar)
+const PRICE_TTL   = 2 * 60_000   // 2 minutes
+const CANDLE_TTL  = 6 * 60_000   // 6 minutes (2 × M5 bar)
+const BALANCE_TTL = 5 * 60_000   // 5 minutes — return 0 if EA hasn't synced recently
 
 export class Mt5DirectBroker implements IBroker {
   name = 'MT5 Direct'
@@ -52,8 +53,11 @@ export class Mt5DirectBroker implements IBroker {
   }
 
   async getAccountSummary(): Promise<AccountSummary> {
-    const balance = parseFloat(this.config.balance || '0')
-    const equity  = parseFloat(this.config.equity  || String(balance))
+    const eaStale = !this.config.updatedAt ||
+      (Date.now() - new Date(this.config.updatedAt).getTime()) > BALANCE_TTL
+
+    const balance = eaStale ? 0 : parseFloat(this.config.balance || '0')
+    const equity  = eaStale ? 0 : parseFloat(this.config.equity  || String(balance))
     return {
       balance,
       unrealizedPL:   equity - balance,
