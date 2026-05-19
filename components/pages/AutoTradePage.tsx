@@ -183,7 +183,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       {/* Header controls */}
       <Panel title="AUTO TRADER" bright>
         <div style={{ padding: '14px 16px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <div className="auto-controls-row" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
 
             {/* Scanner ON/OFF */}
             <button
@@ -241,7 +241,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             </button>
 
             {/* Status */}
-            <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
+            <div className="controls-status" style={{ marginLeft: 'auto', textAlign: 'right' }}>
               {enabled && !scanning && countdown > 0 && (
                 <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
                   Next scan in <span className="mono" style={{ color: 'var(--color-accent)' }}>{fmtCountdown(countdown)}</span>
@@ -486,8 +486,8 @@ function SignalCard({
   return (
     <div className="dir-card" data-dir={signal.direction} style={{ padding: 16 }}>
       {/* Top row */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 14 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+      <div className="signal-top-row" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 14, gap: 10 }}>
+        <div className="signal-meta-group" style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
           <div>
             <div style={{ fontSize: 22, fontWeight: 900, color, fontFamily: 'Rajdhani', letterSpacing: 2, lineHeight: 1 }}>
               {signal.direction}
@@ -509,7 +509,7 @@ function SignalCard({
             <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1 }}>CHECKLIST</div>
           </div>
         </div>
-        <div style={{ textAlign: 'right', fontSize: 11, color: 'var(--text-dim)' }}>
+        <div className="signal-expiry" style={{ textAlign: 'right', fontSize: 11, color: 'var(--text-dim)', flexShrink: 0 }}>
           <div style={{ color: minsLeft < 5 ? 'var(--color-sell)' : 'var(--text-muted)' }}>
             Expires in {minsLeft}m {secsLeft}s
           </div>
@@ -517,14 +517,25 @@ function SignalCard({
         </div>
       </div>
 
+      {/* Entry zone */}
+      <div className="entry-zone-bar" style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', borderRadius: 3, background: 'rgba(96,192,255,0.06)', border: '1px solid rgba(96,192,255,0.22)', marginBottom: 10 }}>
+        <div style={{ fontSize: 9, color: 'var(--color-accent)', letterSpacing: 1.5, fontWeight: 700, flexShrink: 0 }}>ENTRY ZONE</div>
+        <div className="mono" style={{ fontSize: 14, fontWeight: 700, color: 'var(--color-accent)' }}>
+          {signal.entryZone.low.toFixed(dp)} – {signal.entryZone.high.toFixed(dp)}
+        </div>
+        <div className="entry-zone-hint" style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-muted)', fontStyle: 'italic' }}>
+          Wait for price to enter this zone
+        </div>
+      </div>
+
       {/* Price levels */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+      <div className="signal-price-grid" style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
         {[
           ['LIVE PRICE', price.toFixed(dp), 'var(--color-accent-dim)'],
           ['TAKE PROFIT', tpPrice, 'var(--color-profit)'],
           ['STOP LOSS', slPrice, 'var(--color-loss)'],
         ].map(([label, val, c]) => (
-          <div key={label} style={{ flex: 1, background: 'rgba(0,0,0,0.1)', borderRadius: 3, padding: '6px 10px' }}>
+          <div key={label} style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.1)', borderRadius: 3, padding: '6px 10px' }}>
             <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 2 }}>{label}</div>
             <div className="mono" style={{ fontSize: 11, color: c, fontWeight: 700 }}>{val}</div>
           </div>

@@ -77,6 +77,7 @@ export function useScanner(
         headers,
         body: JSON.stringify({ pairs, timeframe, strategy, ...context }),
       })
+      if (!res.ok) throw new Error(`Scan server error (${res.status}) — check connection`)
       const data = await res.json()
       if (data.error) throw new Error(data.error)
 

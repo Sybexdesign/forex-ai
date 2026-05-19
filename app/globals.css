@@ -397,9 +397,8 @@ input[type="number"]:focus { border-color: var(--blue); }
 .ind-row:last-child { border-bottom: none; }
 
 
-/* ─── Mobile Responsive ──────────────────────────────────────────────────────── */
+/* ─── Responsive grid utilities ──────────────────────────────────────────────── */
 
-/* Responsive grid utilities — stack on mobile */
 .grid-2col {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -418,87 +417,110 @@ input[type="number"]:focus { border-color: var(--blue); }
   gap: 10px;
 }
 
-/* Bottom mobile nav — hidden on desktop */
-.mobile-nav {
+/* ─── Hamburger / Mobile Drawer ─────────────────────────────────────────────── */
+
+/* Hidden on desktop; shown on ≤1024px via breakpoint below */
+.hamburger-btn {
   display: none;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-primary);
+  font-size: 20px;
+  line-height: 1;
+}
+.hamburger-btn:hover { background: rgba(255,255,255,0.05); border-color: var(--border-bright); }
+
+/* Mobile brand shown in header when sidebar is hidden */
+.mobile-logo {
+  display: none;
+  font-family: 'Rajdhani', sans-serif;
+  font-weight: 900;
+  font-size: 18px;
+  letter-spacing: 2px;
+  line-height: 1;
 }
 
-@media (max-width: 767px) {
-  /* Hide sidebar */
-  .sidebar {
-    display: none !important;
-  }
+/* Dark semi-transparent overlay behind the open drawer */
+.mobile-drawer-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.72);
+  z-index: 1999;
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+.mobile-drawer-overlay.visible { display: block; }
 
-  /* Stack 2-col grids */
-  .grid-2col {
-    grid-template-columns: 1fr;
-  }
+/* The sliding drawer panel */
+.mobile-drawer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 280px;
+  max-width: 85vw;
+  background: linear-gradient(180deg, #060e1e 0%, #040810 100%);
+  border-right: 1px solid var(--border);
+  z-index: 2000;
+  transform: translateX(-100%);
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.mobile-drawer.open { transform: translateX(0); }
 
-  .grid-3col {
-    grid-template-columns: 1fr;
-  }
+/* Nav buttons inside the drawer */
+.drawer-nav-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 14px;
+  background: transparent;
+  border: none;
+  border-left: 2px solid transparent;
+  color: var(--text-muted);
+  font-family: 'Rajdhani', sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.15s;
+  text-align: left;
+}
+.drawer-nav-btn:hover { background: rgba(255,255,255,0.04); color: var(--text-secondary); }
+.drawer-nav-btn.active { background: rgba(0,128,255,0.1); border-left-color: var(--blue); color: #60c0ff; }
 
-  .grid-4col {
-    grid-template-columns: 1fr 1fr;
-  }
+/* Bottom nav — hidden; drawer replaces it */
+.mobile-nav { display: none !important; }
 
-  /* Show mobile bottom nav */
-  .mobile-nav {
-    display: flex;
-    position: fixed;
-    bottom: 0; left: 0; right: 0;
-    height: 60px;
-    background: #060e1e;
-    border-top: 1px solid var(--border);
-    z-index: 1000;
-    align-items: stretch;
-    overflow-x: auto;
-  }
+/* ─── Light-mode overrides for drawer ───────────────────────────────────────── */
+[data-theme="light"] .mobile-drawer { background: linear-gradient(180deg, #f0f6ff 0%, #e8f0fc 100%); }
+[data-theme="light"] .drawer-nav-btn { color: var(--text-muted); }
+[data-theme="light"] .drawer-nav-btn:hover { background: rgba(0,0,0,0.04); color: var(--text-secondary); }
+[data-theme="light"] .drawer-nav-btn.active { background: rgba(0,85,176,0.1); border-left-color: #0055b0; color: #0055b0; }
+[data-theme="light"] .hamburger-btn { color: var(--text-muted); border-color: var(--border); }
+[data-theme="light"] .hamburger-btn:hover { background: rgba(0,0,0,0.04); }
 
-  .mobile-nav-btn {
-    flex: 1;
-    min-width: 52px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 3px;
-    background: transparent;
-    border: none;
-    color: var(--text-muted);
-    font-family: 'Rajdhani', sans-serif;
-    font-size: 9px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    cursor: pointer;
-    transition: color 0.15s;
-    padding: 4px 2px;
-  }
+/* ─── Tablet + mobile (≤1024px) — hide sidebar, show hamburger ──────────────── */
+@media (max-width: 1024px) {
+  .sidebar { display: none !important; }
+  .hamburger-btn { display: flex; }
+  .mobile-logo { display: block; }
 
-  .mobile-nav-btn .nav-icon {
-    font-size: 18px;
-    line-height: 1;
-  }
+  /* Slightly tighter page padding */
+  .page-content { padding: 16px !important; }
 
-  .mobile-nav-btn.active {
-    color: #60c0ff;
-  }
-
-  .mobile-nav-btn.active .nav-icon {
-    filter: drop-shadow(0 0 6px rgba(0,128,255,0.8));
-  }
-
-  /* Mobile header adjustments */
-  .top-bar-meta {
-    display: none !important;
-  }
-
-  /* Tighten page padding on mobile — bottom pad clears the fixed 60px nav */
-  .page-content {
-    padding: 12px 12px 80px !important;
-  }
-
-  /* Tab buttons scroll on mobile */
+  /* Tab row scrolls */
   .tab-row {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
@@ -506,14 +528,87 @@ input[type="number"]:focus { border-color: var(--blue); }
     padding-bottom: 4px;
   }
 
-  /* Tables always scroll */
+  /* Tables scroll */
   .table-wrap {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
   }
 
-  /* Stat cards min width on mobile */
+  /* 4-col → 2-col on tablet */
+  .grid-4col { grid-template-columns: 1fr 1fr; }
+}
+
+/* ─── Mobile only (≤767px) ───────────────────────────────────────────────────── */
+@media (max-width: 767px) {
+  /* Hide time/status from header — saves space */
+  .top-bar-meta { display: none !important; }
+
+  /* Tighten page padding */
+  .page-content { padding: 12px 10px 24px !important; }
+
+  /* Stack all grids to single column */
+  .grid-2col { grid-template-columns: 1fr; }
+  .grid-3col { grid-template-columns: 1fr; }
+  .grid-4col { grid-template-columns: 1fr 1fr; }
+
+  /* Stat cards wrap tightly */
   .stat-card-grid {
     grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)) !important;
+  }
+
+  /* Signal card: price levels stack */
+  .signal-price-grid {
+    flex-wrap: wrap;
+  }
+  .signal-price-grid > div {
+    flex: 1 1 calc(33% - 6px);
+    min-width: 90px;
+  }
+
+  /* Signal card top row: wrap on very small screens */
+  .signal-top-row {
+    flex-wrap: wrap;
+    gap: 8px !important;
+  }
+  .signal-top-row .signal-meta-group {
+    flex-wrap: wrap;
+    gap: 8px !important;
+  }
+  .signal-top-row .signal-expiry {
+    width: 100%;
+    text-align: left !important;
+    margin-top: 2px;
+  }
+
+  /* Entry zone: stack label and value */
+  .entry-zone-bar {
+    flex-wrap: wrap;
+    gap: 6px !important;
+  }
+  .entry-zone-bar .entry-zone-hint {
+    display: none;
+  }
+
+  /* Auto trader controls: stack buttons */
+  .auto-controls-row {
+    flex-direction: column;
+    align-items: flex-start !important;
+  }
+  .auto-controls-row .controls-status {
+    margin-left: 0 !important;
+    text-align: left !important;
+  }
+
+  /* Open positions row: tighter */
+  .position-row {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
+
+/* ─── Very small screens (≤380px) ───────────────────────────────────────────── */
+@media (max-width: 380px) {
+  .signal-price-grid > div {
+    flex: 1 1 100%;
   }
 }
