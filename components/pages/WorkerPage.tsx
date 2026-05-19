@@ -49,7 +49,7 @@ export default function WorkerPage() {
   const [filter, setFilter]     = useState('all')
   const [loading, setLoading]   = useState(true)
   const [error, setError]       = useState('')
-  const [autoScroll, setAutoScroll] = useState(true)
+  const [autoScroll, setAutoScroll] = useState(false)
   const bottomRef  = useRef<HTMLDivElement>(null)
   const listRef    = useRef<HTMLDivElement>(null)
   const timerRef   = useRef<ReturnType<typeof setInterval> | null>(null)
