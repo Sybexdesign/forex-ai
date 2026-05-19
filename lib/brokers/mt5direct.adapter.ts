@@ -39,8 +39,8 @@ const TF_KEY: Record<string, string> = {
 }
 
 // How stale (ms) we allow EA price/candle data to be before falling through
-const PRICE_TTL   = 2 * 60_000   // 2 minutes
-const CANDLE_TTL  = 6 * 60_000   // 6 minutes (2 × M5 bar)
+const PRICE_TTL   = 5 * 60_000   // 5 minutes (EA syncs every 30s; give generous buffer for failed syncs)
+const CANDLE_TTL  = 10 * 60_000  // 10 minutes (2 × M5 bar × 2 for safety)
 const BALANCE_TTL = 5 * 60_000   // 5 minutes — return 0 if EA hasn't synced recently
 
 export class Mt5DirectBroker implements IBroker {

@@ -5,6 +5,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 
+export const dynamic = 'force-dynamic'
+
 // Convert MT5 symbol (EURUSD, EURUSDm, XAUUSD) to app pair (EUR/USD, XAU/USD)
 function mt5SymbolToPair(sym: string): string {
   const clean = sym.replace(/[^A-Z]/gi, '').toUpperCase().slice(0, 6)
