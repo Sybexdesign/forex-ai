@@ -44,18 +44,21 @@ void OnTimer() {
    // 1. Pull pending orders
    string resp = FetchPendingOrders();
    if (StringLen(resp) > 10) {
-      // Count pending orders for diagnostics
       int orderCount = 0;
       int searchPos = 0;
       while (StringFind(resp, "\"id\":", searchPos) >= 0) {
          searchPos = StringFind(resp, "\"id\":", searchPos) + 1;
          orderCount++;
       }
-      if (orderCount > 0)
+      if (orderCount > 0) {
          Print("SybexForexAI v4: ", orderCount, " pending order(s) received — executing...");
-      else
+         g_completedJson = ExecuteOrders(resp);
+         Print("SybexForexAI v4: completedOrders=", g_completedJson);
+      } else {
          Print("SybexForexAI v4: pull OK — no pending orders");
-      g_completedJson = ExecuteOrders(resp);
+      }
+   } else {
+      Print("SybexForexAI v4: pull empty/short (len=", StringLen(resp), ") — resp=", StringSubstr(resp, 0, 80));
    }
 
    // 2. Push data
@@ -95,7 +98,9 @@ string FetchPendingOrders() {
       Print("SybexForexAI v4: pull HTTP ", res, " — ", StringSubstr(CharArrayToString(result), 0, 200));
       return "";
    }
-   return CharArrayToString(result);
+   string pullResp = CharArrayToString(result);
+   Print("SybexForexAI v4: pull HTTP 200 (len=", StringLen(pullResp), ") — ", StringSubstr(pullResp, 0, 150));
+   return pullResp;
 }
 
 //+------------------------------------------------------------------+
@@ -145,10 +150,14 @@ void SendDataToApp() {
 //| JSON helpers                                                      |
 //+------------------------------------------------------------------+
 string JsonStr(string j, string key) {
-   string s = "\"" + key + "\":\"";
+   string s = "\"" + key + "\":";
    int p = StringFind(j, s);
    if (p < 0) return "";
    p += StringLen(s);
+   // Skip optional whitespace (Supabase returns "key": "value" with a space)
+   while (StringGetCharacter(j, p) == 32) p++;
+   if (StringGetCharacter(j, p) != '"') return "";
+   p++; // skip opening quote
    int e = StringFind(j, "\"", p);
    return e < 0 ? "" : StringSubstr(j, p, e - p);
 }
@@ -158,6 +167,8 @@ double JsonNum(string j, string key) {
    int p = StringFind(j, s);
    if (p < 0) return 0;
    p += StringLen(s);
+   // Skip optional whitespace
+   while (StringGetCharacter(j, p) == 32) p++;
    string rest = StringSubstr(j, p, 30);
    return StringToDouble(rest);
 }
