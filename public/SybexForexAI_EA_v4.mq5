@@ -203,7 +203,7 @@ string BuildCandlesJSON() {
       data += "\"" + SYMBOLS[i] + "\":" + arr;
       first = false;
    }
-   return "{\"timeframe\":\"M5\",\"data\":" + data + "}";
+   return "{\"timeframe\":\"M5\",\"data\":" + data + "}}";
 }
 
 //+------------------------------------------------------------------+
