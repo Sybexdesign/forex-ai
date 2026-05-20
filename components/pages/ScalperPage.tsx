@@ -31,6 +31,13 @@ interface Signal {
   strategy: string; timestamp: number
 }
 
+interface MlData {
+  win_probability: number
+  should_trade: boolean
+  ml_confidence: number
+  feature_contributions: Record<string, { importance: number; value: number }>
+}
+
 interface RiskCheck {
   passed: boolean
   checks: { label: string; ok: boolean }[]
@@ -131,6 +138,7 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
 
   const [tickData, setTickData]       = useState<TickData | null>(null)
   const [signal, setSignal]           = useState<Signal | null>(null)
+  const [mlData, setMlData]           = useState<MlData | null>(null)
   const [riskResult, setRiskResult]   = useState<RiskCheck | null>(null)
   const [brokerConn, setBrokerConn]   = useState<ConnStatus>('idle')
   const [aiConn, setAiConn]           = useState<ConnStatus>('idle')
@@ -249,6 +257,7 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
       }
       setSignal(sig)
       signalRef.current = sig
+      if (data.ml) setMlData(data.ml)
       setAiConn(data.fallback ? 'fallback' : 'live')
 
       // Evaluate risk with the FRESH signal (not the stale previous one)
@@ -602,15 +611,32 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                 {signal?.confidence ?? '—'}<span style={{ fontSize: 11 }}>%</span>
               </div>
             </div>
-            <div style={{ padding: 10, borderRadius: 4, border: '1px solid var(--border)' }}>
-              <div style={{ fontSize: 10, color: C.cyan, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>
-                {aiConn === 'live' ? 'CLAUDE API' : 'RULE-BASED'}
+            <div style={{ padding: 10, borderRadius: 4, border: `1px solid ${mlData ? (mlData.should_trade ? 'rgba(0,255,135,0.3)' : 'rgba(255,48,86,0.25)') : 'var(--border)'}` }}>
+              <div style={{ fontSize: 10, color: C.cyan, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>ML MODEL</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>XGBoost · Win Probability</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
+                <span style={{ width: 5, height: 5, borderRadius: '50%', background: mlData ? C.green : 'var(--text-muted)', display: 'inline-block', flexShrink: 0 }} />
+                <span className="mono" style={{ fontSize: 9, color: mlData ? C.green : 'var(--text-muted)', letterSpacing: 0.5 }}>
+                  {mlData ? 'ACTIVE' : 'OFFLINE'}
+                </span>
               </div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{aiConn === 'live' ? 'Claude Sonnet 4.6' : 'Fallback engine'}</div>
-              <div className="mono" style={{ fontSize: 10, color: connColor[aiConn], marginTop: 2 }}>{connLabel[aiConn]}</div>
-              <div style={{ fontSize: 11, fontWeight: 500, marginTop: 8, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                {signal?.reasons?.[0] || 'Waiting for next signal cycle...'}
-              </div>
+              {mlData ? (
+                <>
+                  <div className="mono" style={{ fontSize: 22, fontWeight: 700, marginTop: 8, color: mlData.should_trade ? C.green : C.red }}>
+                    {mlData.ml_confidence}<span style={{ fontSize: 11 }}>%</span>
+                  </div>
+                  <div style={{ fontSize: 10, color: mlData.should_trade ? C.green : C.red, fontWeight: 700, marginTop: 2 }}>
+                    {mlData.should_trade ? '▲ TRADE' : '✗ SKIP'}
+                  </div>
+                  <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, marginTop: 6 }}>
+                    <div style={{ width: `${mlData.ml_confidence}%`, height: '100%', background: mlData.should_trade ? C.green : C.red, borderRadius: 2, transition: 'width 0.5s ease' }} />
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.5 }}>
+                  ML service offline<br />deploy ml/serve.py on VPS
+                </div>
+              )}
             </div>
           </div>
         </Panel>

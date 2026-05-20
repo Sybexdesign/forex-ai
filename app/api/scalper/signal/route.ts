@@ -114,6 +114,36 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
   }
 }
 
+const ML_URL = process.env.ML_SERVICE_URL || 'http://localhost:8100'
+
+async function queryMlService(body: any, pair: string, direction: Direction, confidence: number): Promise<{
+  win_probability: number; should_trade: boolean; ml_confidence: number
+  feature_contributions: Record<string, { importance: number; value: number }>
+} | null> {
+  try {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 3000)
+    const resp = await fetch(`${ML_URL}/predict`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        pair,
+        direction,
+        confidence,
+        indicators:        body,
+        scalperIndicators: body.scalper ?? {},
+        timestamp:         new Date().toISOString(),
+      }),
+    })
+    clearTimeout(timer)
+    if (!resp.ok) return null
+    return await resp.json()
+  } catch {
+    return null
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
@@ -129,6 +159,7 @@ export async function POST(req: NextRequest) {
         entry: body.price || 0, sl: body.price || 0, tp: body.price || 0,
         fallback: false,
         simulationBlocked: true,
+        ml: null,
       })
     }
 
@@ -151,6 +182,7 @@ export async function POST(req: NextRequest) {
 
     let result: any
     let fallback = false
+    let mlData: Awaited<ReturnType<typeof queryMlService>> = null
 
     const hasKey = !!(
       process.env.ANTHROPIC_API_KEY &&
@@ -207,6 +239,9 @@ Return JSON only:
       }
     }
 
+    // Query ML service in parallel with signal result (non-blocking)
+    mlData = await queryMlService(body, pair, result.direction as Direction, result.confidence)
+
     // Ensure SL/TP are present
     if (!result.entry) result.entry = t.price
     if (!result.sl) result.sl = result.direction === 'BUY' ? t.price - slPips : result.direction === 'SELL' ? t.price + slPips : t.price
@@ -232,7 +267,7 @@ Return JSON only:
       } catch { /* non-critical */ }
     }
 
-    return NextResponse.json({ ...result, fallback })
+    return NextResponse.json({ ...result, fallback, ml: mlData })
   } catch (error: any) {
     console.error('[scalper/signal]', error)
     return NextResponse.json({ error: error.message }, { status: 500 })

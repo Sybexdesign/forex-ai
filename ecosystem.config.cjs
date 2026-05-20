@@ -6,6 +6,24 @@
 module.exports = {
   apps: [
     {
+      name:               'forex-ml',
+      script:             'python',
+      args:               'ml/serve.py',
+      instances:          1,
+      autorestart:        true,
+      watch:              false,
+      max_memory_restart: '512M',
+      error_file:         './logs/ml-error.log',
+      out_file:           './logs/ml-out.log',
+      merge_logs:         true,
+      log_date_format:    'YYYY-MM-DD HH:mm:ss UTC',
+      env: {
+        ML_PORT: '8100',
+        // NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set
+        // in the shell or .env before starting PM2 (used by retrain.sh).
+      },
+    },
+    {
       name:               'scalper-worker',
       script:             './workers/scalper.mjs',
       instances:          1,
