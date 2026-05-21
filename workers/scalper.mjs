@@ -385,6 +385,33 @@ async function processSignal(pair, tick, strategy, session) {
     { pair, session, metadata: { direction: dir, confidence: conf, strategy, session, simulated: tick.simulated, entry: signal.entry, sl: signal.sl, tp: signal.tp, reasons: signal.reasons } }
   )
 
+  // Save all non-HOLD signals to DB for ML training data, regardless of confidence
+  if (WORKER_USER_ID && dir !== 'HOLD') {
+    const pip     = pipSize(pair)
+    const atr     = tick.atr || 0.0005
+    const slDist  = atr * 1.5
+    const tpDist  = atr * 2.5
+    const entry   = signal.entry || tick.price
+    const sl      = signal.sl  || (dir === 'BUY' ? entry - slDist : entry + slDist)
+    const tp      = signal.tp  || (dir === 'BUY' ? entry + tpDist : entry - tpDist)
+
+    sbInsertReturning('signals', {
+      user_id:            WORKER_USER_ID,
+      pair,
+      timeframe:          'scalper-worker',
+      direction:          dir,
+      confidence:         conf,
+      checklist_score:    (signal.reasons || []).length,
+      reasons:            signal.reasons,
+      risk_note:          signal.risk_note,
+      acted_on:           false,
+      outcome:            'PENDING',
+      indicator_snapshot: tick,
+    }).then(row => {
+      if (row?.id) trackSignal(row.id, pair, dir, entry, sl, tp)
+    }).catch(() => {})
+  }
+
   if (dir === 'HOLD' || conf < CONFIDENCE_MIN) return
 
   // Hard block: never act on simulated data in live mode
@@ -449,32 +476,7 @@ async function processSignal(pair, tick, strategy, session) {
   // Telegram alert
   await tgSend(formatAlert(pair, strategy, session, signal, placed ? 'live' : 'paper'))
 
-  // Supabase signal log (ML training data) — use returning variant to get ID for outcome tracking
-  if (WORKER_USER_ID) {
-    const pip     = pipSize(pair)
-    const atr     = tick.atr || 0.0005
-    const slDist  = atr * 1.5
-    const tpDist  = atr * 2.5
-    const entry   = signal.entry || tick.price
-    const sl      = signal.sl  || (dir === 'BUY' ? entry - slDist : entry + slDist)
-    const tp      = signal.tp  || (dir === 'BUY' ? entry + tpDist : entry - tpDist)
-
-    sbInsertReturning('signals', {
-      user_id:            WORKER_USER_ID,
-      pair,
-      timeframe:          'scalper-worker',
-      direction:          dir,
-      confidence:         conf,
-      checklist_score:    (signal.reasons || []).length,
-      reasons:            signal.reasons,
-      risk_note:          signal.risk_note,
-      acted_on:           placed,
-      outcome:            'PENDING',
-      indicator_snapshot: tick,
-    }).then(row => {
-      if (row?.id) trackSignal(row.id, pair, dir, entry, sl, tp)
-    }).catch(() => {})
-  }
+  // Signal already saved to DB earlier (before the confidence gate) for ML training
 }
 
 // ── Sweep ─────────────────────────────────────────────────────────────────────
