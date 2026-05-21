@@ -45,9 +45,11 @@ Avoid when ADX > 35 (strong trend = reversion unreliable).
 Return HOLD if no extreme reading is present.
 Respond ONLY with valid JSON — no markdown, no prose.`,
   'Breakout': `You are a scalping signal generator using BREAKOUT strategy.
-Signal BUY: Bollinger band squeeze (width < 0.002) resolves with price above upper band, MACD histogram positive, ADX > 25.
-Signal SELL: squeeze resolves downward below lower band, MACD histogram negative.
-Volume confirmation increases confidence. Return HOLD during normal (non-squeeze) conditions.
+BB squeeze is defined as normalised width (BB Width / Price) < 0.4% — this applies to ALL instruments including XAU/USD, XAG/USD, and FX pairs.
+Signal BUY: squeeze present AND price breaks above BB upper band, MACD histogram positive, ADX > 20.
+Signal SELL: squeeze present AND price breaks below BB lower band, MACD histogram negative, ADX > 20.
+Use the "BB Width / Price %" value provided. Volume confirmation increases confidence.
+Return HOLD if no squeeze or no confirmed breakout direction.
 Respond ONLY with valid JSON — no markdown, no prose.`,
   'Order Flow': `You are a scalping signal generator using ORDER FLOW strategy.
 Signal BUY: buy pressure > 62%, RSI(14) below 45 (bullish divergence), high tick volume.
@@ -203,7 +205,7 @@ Indicators:
 - EMA(9): ${t.ema9.toFixed(decimals)} | EMA(21): ${t.ema21.toFixed(decimals)}
 - EMA(20): ${t.ema20.toFixed(decimals)} | EMA(50): ${t.ema50.toFixed(decimals)}
 - EMA cross: ${t.emaCrossSignal}
-- BB Upper: ${t.bbUpper.toFixed(decimals)} | Lower: ${t.bbLower.toFixed(decimals)} | Width: ${t.bbWidth.toFixed(5)}
+- BB Upper: ${t.bbUpper.toFixed(decimals)} | Lower: ${t.bbLower.toFixed(decimals)} | Width: ${t.bbWidth.toFixed(5)} | BB Width / Price %: ${t.price > 0 ? ((t.bbWidth / t.price) * 100).toFixed(3) : '0'}%
 - ADX: ${t.adx}
 - ATR: ${t.atr.toFixed(6)} (${t.atrPips} pips)
 - Buy Pressure: ${(t.buyPressure * 100).toFixed(0)}%
