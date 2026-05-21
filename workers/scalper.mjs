@@ -597,7 +597,7 @@ function scheduleMidnightRestart() {
   setTimeout(async () => {
     console.log('[worker] Midnight restart — clearing memory')
     await tgSend('🔄 <b>SybexForexAI Worker</b> — daily midnight restart (memory clear)')
-    process.exit(0)
+    process.exit(1)  // non-zero exit triggers DO App Platform auto-restart
   }, ms)
 }
 
