@@ -76,7 +76,7 @@ function hasSignalCondition(tick, strategy) {
   switch (strategy) {
     case 'Momentum':      return (rsi14 < 42 || rsi14 > 58) && adx > 18
     case 'Mean Reversion': return rsi14 < 38 || rsi14 > 62
-    case 'Breakout':      return relBbWidth < 0.0015  // normalised for XAU/USD
+    case 'Breakout':      return relBbWidth < 0.004   // normalised squeeze: ~18pt on XAU/USD
     default:              return buyPressure < 0.38 || buyPressure > 0.62
   }
 }
