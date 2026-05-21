@@ -162,6 +162,96 @@ async function sbInsert(table, row) {
   }
 }
 
+// Returns the inserted row (including generated id) — used for outcome tracking
+async function sbInsertReturning(table, row) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey':        SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer':        'return=representation',
+      },
+      body:   JSON.stringify(row),
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) { console.error(`[sb/${table}]`, res.status, await res.text()); return null }
+    const rows = await res.json()
+    return Array.isArray(rows) ? rows[0] : null
+  } catch (e) {
+    console.error('[sb/insert]', e.message)
+    return null
+  }
+}
+
+async function sbUpdate(table, id, data) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}`, {
+      method:  'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey':        SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer':        'return=minimal',
+      },
+      body:   JSON.stringify(data),
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) console.error(`[sb/update ${table}]`, res.status, await res.text())
+  } catch (e) {
+    console.error('[sb/update]', e.message)
+  }
+}
+
+// ── Outcome Tracker ───────────────────────────────────────────────────────────
+// Tracks open signals in memory and resolves them when TP/SL is hit.
+// signalId → { pair, direction, sl, tp, insertedAt }
+
+const pendingSignals = new Map()
+const OUTCOME_MAX_AGE_MS = 4 * 60 * 60_000  // stop tracking after 4 hours
+
+function trackSignal(id, pair, direction, entry, sl, tp) {
+  if (!id) return
+  pendingSignals.set(id, { pair, direction, sl, tp, insertedAt: Date.now() })
+  console.log(`[outcome] tracking signal ${id.slice(0, 8)} — ${pair} ${direction} SL:${sl} TP:${tp}`)
+}
+
+async function checkPendingOutcomes(ticksByPair) {
+  if (pendingSignals.size === 0) return
+  const now = Date.now()
+  for (const [id, sig] of pendingSignals) {
+    if (now - sig.insertedAt > OUTCOME_MAX_AGE_MS) {
+      pendingSignals.delete(id)
+      continue
+    }
+    const tick = ticksByPair[sig.pair]
+    if (!tick) continue
+
+    const price = tick.price
+    let outcome = null
+    if (sig.direction === 'BUY') {
+      if (price <= sig.sl) outcome = 'LOSS'
+      else if (price >= sig.tp) outcome = 'WIN'
+    } else if (sig.direction === 'SELL') {
+      if (price >= sig.sl) outcome = 'LOSS'
+      else if (price <= sig.tp) outcome = 'WIN'
+    }
+
+    if (outcome) {
+      pendingSignals.delete(id)
+      await sbUpdate('signals', id, { outcome })
+      console.log(`[outcome] ${sig.pair} ${sig.direction} → ${outcome} (${id.slice(0, 8)})`)
+      wlog('info', `Signal outcome: ${sig.pair} ${sig.direction} → ${outcome}`, {
+        pair: sig.pair, session: getSession(),
+        metadata: { signalId: id, outcome, direction: sig.direction },
+      })
+    }
+  }
+}
+
 // ── Telegram ──────────────────────────────────────────────────────────────────
 
 async function tgSend(text) {
@@ -359,9 +449,17 @@ async function processSignal(pair, tick, strategy, session) {
   // Telegram alert
   await tgSend(formatAlert(pair, strategy, session, signal, placed ? 'live' : 'paper'))
 
-  // Supabase signal log (ML training data)
+  // Supabase signal log (ML training data) — use returning variant to get ID for outcome tracking
   if (WORKER_USER_ID) {
-    sbInsert('signals', {
+    const pip     = pipSize(pair)
+    const atr     = tick.atr || 0.0005
+    const slDist  = atr * 1.5
+    const tpDist  = atr * 2.5
+    const entry   = signal.entry || tick.price
+    const sl      = signal.sl  || (dir === 'BUY' ? entry - slDist : entry + slDist)
+    const tp      = signal.tp  || (dir === 'BUY' ? entry + tpDist : entry - tpDist)
+
+    sbInsertReturning('signals', {
       user_id:            WORKER_USER_ID,
       pair,
       timeframe:          'scalper-worker',
@@ -373,6 +471,8 @@ async function processSignal(pair, tick, strategy, session) {
       acted_on:           placed,
       outcome:            'PENDING',
       indicator_snapshot: tick,
+    }).then(row => {
+      if (row?.id) trackSignal(row.id, pair, dir, entry, sl, tp)
     }).catch(() => {})
   }
 }
@@ -412,6 +512,15 @@ async function runSweep() {
   const tickResults = await Promise.allSettled(
     PAIRS.map(async pair => ({ pair, tick: await fetchTick(pair) }))
   )
+
+  // Build a price map for outcome tracking
+  const ticksByPair = {}
+  for (const r of tickResults) {
+    if (r.status === 'fulfilled') ticksByPair[r.value.pair] = r.value.tick
+  }
+
+  // Check if any tracked signals have resolved
+  await checkPendingOutcomes(ticksByPair)
 
   // Phase 2: pre-filter — build signal candidate queue
   const queue = []

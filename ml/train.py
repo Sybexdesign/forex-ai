@@ -55,9 +55,12 @@ while True:
 
 print(f"✓ Total rows with WIN/LOSS outcome: {len(all_rows)}")
 
-if len(all_rows) < 100:
-    print("❌ Need at least 100 completed signals to train. Run the scanner longer.")
+MIN_ROWS = 20
+if len(all_rows) < MIN_ROWS:
+    print(f"❌ Need at least {MIN_ROWS} completed signals to train. Run the scanner longer.")
     exit(1)
+if len(all_rows) < 100:
+    print(f"⚠  Only {len(all_rows)} labeled signals — model will be weak. Aim for 500+ for production quality.")
 
 df = pd.DataFrame(all_rows)
 
