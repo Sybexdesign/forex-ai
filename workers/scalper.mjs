@@ -88,12 +88,25 @@ function hasSignalCondition(tick, strategy) {
   }
 }
 
+// ── Direction Inference ───────────────────────────────────────────────────────
+// Infers the likely signal direction from 5m tick — same logic as the pre-filter.
+// Used to pass direction into the HTF alignment check before calling AI.
+
+function inferDirection(tick) {
+  const mid = tick.bbMiddle || (tick.bbUpper + tick.bbLower) / 2
+  if (tick.price > mid && tick.macdHistogram > 0) return 'BUY'
+  if (tick.price < mid && tick.macdHistogram < 0) return 'SELL'
+  return null
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 const lastSigFetch   = new Map()   // pair → ms timestamp
 const alertCooldowns = new Map()   // `${pair}:${direction}` → ms timestamp
 const stalePriceTrack = new Map()  // pair → { price: number, count: number }
+const htfCache        = new Map()  // `${pair}:${tf}` → { tick, at }
 const STALE_SKIP_COUNT = 12        // skip signal after N identical consecutive prices (~2 min at 10s sweeps)
+const HTF_CACHE_MS    = 90_000     // cache HTF tick for 90s — 15m candle barely changes in 1 min
 let   cachedRisk     = null
 let   riskCachedAt   = 0
 let   tradingHalted  = false
@@ -332,6 +345,35 @@ async function fetchSignal(tick, pair, strategy) {
   })
 }
 
+// ── HTF Alignment ─────────────────────────────────────────────────────────────
+// Fetches 15m indicators and checks whether the higher-timeframe trend agrees
+// with the 5m signal direction before we spend an AI call on it.
+
+async function fetchHTFTick(pair) {
+  const key = `${pair}:15m`
+  const hit = htfCache.get(key)
+  if (hit && Date.now() - hit.at < HTF_CACHE_MS) return hit.tick
+  const tick = await apiFetch(`/api/scalper/tick?pair=${encodeURIComponent(pair)}&timeframe=15m`)
+  htfCache.set(key, { tick, at: Date.now() })
+  return tick
+}
+
+async function isHTFAligned(pair, direction) {
+  try {
+    const htf = await fetchHTFTick(pair)
+    if (htf.simulated) return true  // HTF feed unavailable — don't block on missing data
+    // Mirror the scan route's confirmHTF logic exactly
+    const htfBullish = htf.emaCrossSignal === 'BULLISH' && htf.macdHistogram > 0 && htf.rsi14 > 45
+    const htfBearish = htf.emaCrossSignal !== 'BULLISH' && htf.macdHistogram < 0 && htf.rsi14 < 55
+    const aligned    = direction === 'BUY' ? htfBullish : htfBearish
+    console.log(`[htf] ${pair} 15m: ema=${htf.emaCrossSignal} macd=${htf.macdHistogram?.toFixed(4)} rsi=${htf.rsi14} → ${aligned ? '✅ aligned' : '❌ misaligned'} for ${direction}`)
+    return aligned
+  } catch (e) {
+    console.warn(`[htf] ${pair} fetch failed: ${e.message} — allowing through`)
+    return true  // never block on a fetch error
+  }
+}
+
 async function fetchRiskState() {
   if (cachedRisk && Date.now() - riskCachedAt < RISK_CACHE_MS) return cachedRisk
   const acct      = await apiFetch('/api/account')
@@ -366,9 +408,21 @@ async function placeOrder(pair, direction, signal) {
 
 // ── Signal Processor ──────────────────────────────────────────────────────────
 
-async function processSignal(pair, tick, strategy, session) {
+async function processSignal(pair, tick, strategy, session, direction) {
   lastSigFetch.set(pair, Date.now())
   stats.sigChecks++
+
+  // HTF alignment: check 15m trend before spending an AI call
+  if (direction) {
+    const aligned = await isHTFAligned(pair, direction)
+    if (!aligned) {
+      console.log(`[htf] ${pair} — 15m disagrees with 5m ${direction} setup — skipping AI call`)
+      wlog('info', `HTF skip: ${pair} ${direction} — 15m trend does not confirm 5m setup`, {
+        pair, session, metadata: { direction, reason: 'htf_misaligned' },
+      })
+      return
+    }
+  }
 
   let signal
   try {
@@ -559,7 +613,8 @@ async function runSweep() {
     }
 
     if (!hasSignalCondition(tick, strategy)) continue
-    queue.push({ pair, tick, strategy })
+    const direction = inferDirection(tick)  // inferred from same BB-midline + MACD logic as pre-filter
+    queue.push({ pair, tick, strategy, direction })
   }
 
   if (queue.length)
@@ -569,7 +624,7 @@ async function runSweep() {
   for (let i = 0; i < queue.length; i += MAX_SIG_BATCH) {
     const batch = queue.slice(i, i + MAX_SIG_BATCH)
     await Promise.allSettled(
-      batch.map(({ pair, tick, strategy }) => processSignal(pair, tick, strategy, session))
+      batch.map(({ pair, tick, strategy, direction }) => processSignal(pair, tick, strategy, session, direction))
     )
   }
 }
