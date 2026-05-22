@@ -139,11 +139,12 @@ export function calcPropFirmStatus(
 
   const now = new Date()
   const day = now.getUTCDay()
-  if (settings.noWeekend && (day === 5 && now.getUTCHours() >= 21) || day === 6 || (day === 0 && now.getUTCHours() < 21)) {
+  const isWeekend = (day === 5 && now.getUTCHours() >= 21) || day === 6 || (day === 0 && now.getUTCHours() < 21)
+  if (settings.noWeekend && isWeekend) {
     blockReasons.push('Weekend trading not allowed on this prop firm account')
   }
 
-  if (settings.noOvernight && now.getUTCHours() >= 21) {
+  if (settings.noOvernight && !isWeekend && now.getUTCHours() >= 21) {
     blockReasons.push('No overnight positions allowed after 21:00 UTC — prop firm rule')
   }
 
