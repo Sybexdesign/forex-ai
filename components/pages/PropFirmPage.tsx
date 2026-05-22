@@ -22,6 +22,7 @@ interface PropFirmPageProps {
 
 export default function PropFirmPage({ trades, onToast }: PropFirmPageProps) {
   const [settings, setSettings] = useState<PropFirmSettings>(DEFAULT_PROP_FIRM)
+  const [rawInputs, setRawInputs] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const [loading, setLoading] = useState(true)
 
@@ -44,6 +45,7 @@ export default function PropFirmPage({ trades, onToast }: PropFirmPageProps) {
   function applyPreset(firmType: string) {
     const preset = FIRM_PRESETS[firmType] || FIRM_PRESETS.custom
     setSettings(s => ({ ...s, firmType: firmType as any, ...preset }))
+    setRawInputs({})  // clear draft so preset values show immediately
   }
 
   // Calculate live status from trades
@@ -140,23 +142,29 @@ export default function PropFirmPage({ trades, onToast }: PropFirmPageProps) {
           {/* Rule settings grid */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 14, marginBottom: 20 }}>
             {[
-              { label: 'Account Size ($)', key: 'accountSize', type: 'number', min: 1000 },
-              { label: 'Initial Balance ($)', key: 'initialBalance', type: 'number', min: 1000 },
-              { label: 'Max Daily Loss (%)', key: 'maxDailyLossPct', type: 'number', min: 0.5, step: 0.5 },
-              { label: 'Max Total Drawdown (%)', key: 'maxTotalDrawdownPct', type: 'number', min: 1, step: 0.5 },
-              { label: 'Profit Target (%)', key: 'profitTargetPct', type: 'number', min: 1, step: 0.5 },
-              { label: 'Min Trading Days', key: 'minTradingDays', type: 'number', min: 0 },
-              { label: 'Consistency Rule (%)', key: 'consistencyRulePct', type: 'number', min: 0, max: 100 },
-            ].map(({ label, key, type, ...rest }) => (
+              { label: 'Account Size ($)', key: 'accountSize', min: 1000 },
+              { label: 'Initial Balance ($)', key: 'initialBalance', min: 1000 },
+              { label: 'Max Daily Loss (%)', key: 'maxDailyLossPct', min: 0.5, step: 0.5 },
+              { label: 'Max Total Drawdown (%)', key: 'maxTotalDrawdownPct', min: 1, step: 0.5 },
+              { label: 'Profit Target (%)', key: 'profitTargetPct', min: 1, step: 0.5 },
+              { label: 'Min Trading Days', key: 'minTradingDays', min: 0 },
+              { label: 'Consistency Rule (%)', key: 'consistencyRulePct', min: 0, max: 100 },
+            ].map(({ label, key, min = 0, ...rest }) => (
               <div key={key}>
                 <label style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, display: 'block', marginBottom: 4 }}>{label}</label>
                 <input
-                  type={type}
-                  value={(settings as any)[key]}
-                  onChange={e => setSettings(s => ({ ...s, [key]: +e.target.value }))}
-                  {...rest}
+                  type="text"
+                  inputMode="decimal"
+                  value={key in rawInputs ? rawInputs[key] : String((settings as any)[key] ?? '')}
+                  onChange={e => setRawInputs(ri => ({ ...ri, [key]: e.target.value }))}
+                  onBlur={e => {
+                    const num = parseFloat(e.target.value)
+                    const final = isNaN(num) ? min : Math.max(min, num)
+                    setSettings(s => ({ ...s, [key]: final }))
+                    setRawInputs(ri => { const n = { ...ri }; delete n[key]; return n })
+                  }}
                   style={{
-                    width: '100%', padding: '8px 10px', borderRadius: 3, boxSizing: 'border-box',
+                    width: '100%', padding: '8px 10px', borderRadius: 3, boxSizing: 'border-box' as const,
                     background: 'rgba(0,0,0,0.3)', border: '1px solid var(--border)',
                     color: 'var(--text-primary)', fontSize: 13, fontFamily: 'JetBrains Mono',
                   }}
