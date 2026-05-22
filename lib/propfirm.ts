@@ -139,7 +139,7 @@ export function calcPropFirmStatus(
 
   const now = new Date()
   const day = now.getUTCDay()
-  const isWeekend = (day === 5 && now.getUTCHours() >= 21) || day === 6 || (day === 0 && now.getUTCHours() < 21)
+  const isWeekend = (day === 5 && now.getUTCHours() >= 22) || day === 6 || (day === 0 && now.getUTCHours() < 22)
   if (settings.noWeekend && isWeekend) {
     blockReasons.push('Weekend trading not allowed on this prop firm account')
   }
