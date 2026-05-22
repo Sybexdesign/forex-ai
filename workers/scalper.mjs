@@ -86,7 +86,7 @@ function hasSignalCondition(tick, strategy) {
 const lastSigFetch   = new Map()   // pair → ms timestamp
 const alertCooldowns = new Map()   // `${pair}:${direction}` → ms timestamp
 const stalePriceTrack = new Map()  // pair → { price: number, count: number }
-const STALE_SKIP_COUNT = 3         // skip signal after N identical consecutive prices
+const STALE_SKIP_COUNT = 12        // skip signal after N identical consecutive prices (~2 min at 10s sweeps)
 let   cachedRisk     = null
 let   riskCachedAt   = 0
 let   tradingHalted  = false
