@@ -62,7 +62,7 @@ function tfConfig(timeframe: string, pair: string) {
     minChecklistPass: metals ? 4 : (isShort ? 5 : 6),
     skipAtrGuard:     metals,                           // metals ATR dwarfs FX slPips baseline
     atrGuardMult:     isShort ? 3 : 2,
-    minConfidence:    metals ? 55 : (isMicro ? 55 : 60),
+    minConfidence:    metals ? 65 : (isMicro ? 55 : 60),
     rsiExtremeBuy:    metals ? 87 : 75,                 // metals sustain high RSI in trends
     rsiExtremeSell:   metals ? 13 : 25,
     htfFrame:         HTF_MAP[timeframe] ?? null,
@@ -157,10 +157,18 @@ async function scanPair(
   if (direction === 'BUY'  && indicators.rsi > cfg.rsiExtremeBuy)  return null
   if (direction === 'SELL' && indicators.rsi < cfg.rsiExtremeSell) return null
 
-  // 5. ATR guard (skipped for metals — their natural ATR dwarfs FX-calibrated slPips)
+  // 5. ATR guard
   const atrResult = calcATRIndicator(candles, pair)
   if (!cfg.skipAtrGuard) {
     if (atrResult.suggestedSL > strategy.slPips * cfg.atrGuardMult) return null
+  } else if (isMetals(pair)) {
+    // Metals ATR dwarfs FX pip baselines, but a SL inside 1x ATR gets stopped by noise alone.
+    // suggestedSL = ATR_pips * 1.5, so ATR_pips = suggestedSL / 1.5
+    const atrPips = atrResult.suggestedSL / 1.5
+    if (strategy.slPips < atrPips) {
+      console.log(`[scan] ${pair}/${timeframe}: SL ${strategy.slPips}p < ATR ${atrPips.toFixed(0)}p — blocked (widen SL to trade ${pair})`)
+      return null
+    }
   }
 
   // 6. Multi-timeframe confirmation — metals always get this

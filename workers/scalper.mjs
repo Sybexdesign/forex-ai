@@ -85,6 +85,8 @@ function hasSignalCondition(tick, strategy) {
 
 const lastSigFetch   = new Map()   // pair → ms timestamp
 const alertCooldowns = new Map()   // `${pair}:${direction}` → ms timestamp
+const stalePriceTrack = new Map()  // pair → { price: number, count: number }
+const STALE_SKIP_COUNT = 3         // skip signal after N identical consecutive prices
 let   cachedRisk     = null
 let   riskCachedAt   = 0
 let   tradingHalted  = false
@@ -532,6 +534,23 @@ async function runSweep() {
     const strategy       = getStrategy(pair, session)
     if (Date.now() - (lastSigFetch.get(pair) || 0) < SIG_COOLDOWN_MS) continue
     if (session === 'Asian' && strategy === 'Breakout') continue  // false breakouts in low-vol Asian session
+
+    // Stale data guard: skip if MT5 EA is sending identical prices repeatedly
+    const stale = stalePriceTrack.get(pair)
+    if (stale && stale.price === tick.price) {
+      const newCount = stale.count + 1
+      stalePriceTrack.set(pair, { price: tick.price, count: newCount })
+      if (newCount >= STALE_SKIP_COUNT) {
+        if (newCount === STALE_SKIP_COUNT) {
+          console.warn(`[stale] ${pair} price ${tick.price} unchanged for ${newCount} readings — MT5 EA frozen? Skipping signals.`)
+          wlog('warn', `Stale price detected: ${pair} = ${tick.price} for ${newCount}+ sweeps — MT5 EA may be frozen`, { pair, session, metadata: { price: tick.price, staleCount: newCount } })
+        }
+        continue
+      }
+    } else {
+      stalePriceTrack.set(pair, { price: tick.price, count: 1 })
+    }
+
     if (!hasSignalCondition(tick, strategy)) continue
     queue.push({ pair, tick, strategy })
   }
