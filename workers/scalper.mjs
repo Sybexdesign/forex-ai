@@ -531,6 +531,7 @@ async function runSweep() {
     const { pair, tick } = r.value
     const strategy       = getStrategy(pair, session)
     if (Date.now() - (lastSigFetch.get(pair) || 0) < SIG_COOLDOWN_MS) continue
+    if (session === 'Asian' && strategy === 'Breakout') continue  // false breakouts in low-vol Asian session
     if (!hasSignalCondition(tick, strategy)) continue
     queue.push({ pair, tick, strategy })
   }
