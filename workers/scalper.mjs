@@ -71,12 +71,19 @@ function getStrategy(pair, session) {
 // Avoids calling Claude unless the market shows a genuine setup.
 
 function hasSignalCondition(tick, strategy) {
-  const { rsi14, adx, bbWidth, price, buyPressure } = tick
+  const { rsi14, adx, bbWidth, bbUpper, bbLower, bbMiddle, macdHistogram, price, buyPressure } = tick
   const relBbWidth = price > 0 ? bbWidth / price : bbWidth
   switch (strategy) {
     case 'Momentum':      return (rsi14 < 42 || rsi14 > 58) && adx > 18
     case 'Mean Reversion': return rsi14 < 38 || rsi14 > 62
-    case 'Breakout':      return relBbWidth < 0.004   // normalised squeeze: ~18pt on XAU/USD
+    case 'Breakout': {
+      if (relBbWidth >= 0.004) return false  // no squeeze — skip
+      if (adx <= 25) return false            // weak trend = false breakout
+      const mid = bbMiddle || (bbUpper + bbLower) / 2
+      const buySetup  = price > mid && macdHistogram > 0  // price above midline + bullish MACD
+      const sellSetup = price < mid && macdHistogram < 0  // price below midline + bearish MACD
+      return buySetup || sellSetup
+    }
     default:              return buyPressure < 0.38 || buyPressure > 0.62
   }
 }

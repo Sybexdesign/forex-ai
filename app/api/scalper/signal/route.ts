@@ -45,11 +45,14 @@ Avoid when ADX > 35 (strong trend = reversion unreliable).
 Return HOLD if no extreme reading is present.
 Respond ONLY with valid JSON — no markdown, no prose.`,
   'Breakout': `You are a scalping signal generator using BREAKOUT strategy.
-BB squeeze is defined as normalised width (BB Width / Price) < 0.4% — this applies to ALL instruments including XAU/USD, XAG/USD, and FX pairs.
-Signal BUY: squeeze present AND price breaks above BB upper band, MACD histogram positive, ADX > 20.
-Signal SELL: squeeze present AND price breaks below BB lower band, MACD histogram negative, ADX > 20.
-Use the "BB Width / Price %" value provided. Volume confirmation increases confidence.
-Return HOLD if no squeeze or no confirmed breakout direction.
+BB squeeze is defined as normalised width (BB Width / Price) < 0.4% — applies to all instruments including XAU/USD, XAG/USD, and FX pairs.
+Signal BUY: squeeze present AND price is ABOVE BB midline AND price is at or near BB upper band, MACD histogram positive, ADX > 25.
+Signal SELL: squeeze present AND price is BELOW BB midline AND price is at or near BB lower band, MACD histogram negative, ADX > 25.
+CRITICAL: Do NOT signal BUY if price is below BB midline — that is a breakdown, not a breakout.
+CRITICAL: Do NOT signal SELL if price is above BB midline — that is a breakout, not a breakdown.
+ADX must exceed 25 — ADX 20-24 is a weak trend where breakouts fail at high rates.
+Use the "BB Width / Price %" and "BB Midline" values provided. Volume confirmation increases confidence.
+Return HOLD if: no squeeze, ADX ≤ 25, price on the wrong side of BB midline, or direction is ambiguous.
 Respond ONLY with valid JSON — no markdown, no prose.`,
   'Order Flow': `You are a scalping signal generator using ORDER FLOW strategy.
 Signal BUY: buy pressure > 62%, RSI(14) below 45 (bullish divergence), high tick volume.
@@ -84,10 +87,22 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
     if (t.rsi7  < 25) { score  += 8; reasons.push(`RSI(7) extreme low (${t.rsi7.toFixed(0)})`) }
     if (t.rsi7  > 75) { score  -= 8; reasons.push(`RSI(7) extreme high (${t.rsi7.toFixed(0)})`) }
   } else if (strategy === 'Breakout') {
-    if (t.bbWidth < 0.002 && t.price > t.bbUpper) { score += 22; reasons.push('BB squeeze breakout ↑') }
-    if (t.bbWidth < 0.002 && t.price < t.bbLower) { score -= 22; reasons.push('BB squeeze breakout ↓') }
-    if (t.macdHistogram > 0) { score  += 8; reasons.push('MACD confirms direction') }
-    if (t.adx > 25)          { score  += 6; reasons.push(`Strong trend ADX ${t.adx.toFixed(0)}`) }
+    const bbMid    = (t.bbUpper + t.bbLower) / 2
+    const relWidth = t.price > 0 ? t.bbWidth / t.price : 1
+    const squeeze  = relWidth < 0.004
+    if (!squeeze)    { reasons.push('No BB squeeze — breakout condition not met') }
+    if (t.adx <= 25) { reasons.push(`ADX ${t.adx.toFixed(1)} ≤ 25 — trend too weak for breakout`) }
+    if (squeeze && t.adx > 25) {
+      if (t.price > bbMid) {
+        score += 20; reasons.push('BB squeeze above midline (bullish breakout setup)')
+        if (t.price >= t.bbUpper) { score  += 8; reasons.push('Price at BB upper — breakout confirmed') }
+        if (t.macdHistogram > 0)  { score  += 8; reasons.push('MACD positive — bullish momentum') }
+      } else {
+        score -= 20; reasons.push('BB squeeze below midline (bearish breakout setup)')
+        if (t.price <= t.bbLower) { score  -= 8; reasons.push('Price at BB lower — breakdown confirmed') }
+        if (t.macdHistogram < 0)  { score  -= 8; reasons.push('MACD negative — bearish momentum') }
+      }
+    }
   } else {
     if (t.buyPressure > 0.62) { score += 18; reasons.push(`Buy pressure ${(t.buyPressure * 100).toFixed(0)}%`) }
     if (t.buyPressure < 0.38) { score -= 18; reasons.push(`Sell pressure ${((1 - t.buyPressure) * 100).toFixed(0)}%`) }
@@ -205,7 +220,8 @@ Indicators:
 - EMA(9): ${t.ema9.toFixed(decimals)} | EMA(21): ${t.ema21.toFixed(decimals)}
 - EMA(20): ${t.ema20.toFixed(decimals)} | EMA(50): ${t.ema50.toFixed(decimals)}
 - EMA cross: ${t.emaCrossSignal}
-- BB Upper: ${t.bbUpper.toFixed(decimals)} | Lower: ${t.bbLower.toFixed(decimals)} | Width: ${t.bbWidth.toFixed(5)} | BB Width / Price %: ${t.price > 0 ? ((t.bbWidth / t.price) * 100).toFixed(3) : '0'}%
+- BB Upper: ${t.bbUpper.toFixed(decimals)} | Midline: ${((t.bbUpper + t.bbLower) / 2).toFixed(decimals)} | Lower: ${t.bbLower.toFixed(decimals)} | Width / Price %: ${t.price > 0 ? ((t.bbWidth / t.price) * 100).toFixed(3) : '0'}%
+- Price vs BB midline: ${t.price > (t.bbUpper + t.bbLower) / 2 ? 'ABOVE midline (bullish side)' : 'BELOW midline (bearish side)'}
 - ADX: ${t.adx}
 - ATR: ${t.atr.toFixed(6)} (${t.atrPips} pips)
 - Buy Pressure: ${(t.buyPressure * 100).toFixed(0)}%
