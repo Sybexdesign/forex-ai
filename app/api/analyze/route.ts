@@ -98,6 +98,18 @@ export async function POST(req: NextRequest) {
     const body = await req.json()
     const { pair, timeframe, direction, indicators, strategy, context, userId } = body
 
+    // Block analysis on simulated data — broker feed unavailable
+    if (indicators?.simulated === true) {
+      return NextResponse.json({
+        direction: 'WAIT',
+        confidence: 0,
+        reasons: ['Live market data required — broker feed unavailable or MT5 EA disconnected'],
+        risk_note: '⚠ Simulated data detected. Reconnect your broker before analysing.',
+        entry_zone: null,
+        checklist: { passCount: 0, canTrade: false, items: [] },
+      })
+    }
+
     const checklist = evaluateChecklist(indicators, direction, {
       newsInWindow: context.newsInWindow,
       signalStrength: context.signalStrength ?? 70,

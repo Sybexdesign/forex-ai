@@ -265,7 +265,7 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
         })
         const text2 = msg2.content.find(b => b.type === 'text')?.text || '{}'
         const fallbackRec = JSON.parse(text2.replace(/```json|```/g, '').trim())
-        if (fallbackRec.direction !== 'WAIT' && (fallbackRec.confidence ?? 0) >= cfg.minConfidence) {
+        if (fallbackRec.direction !== 'WAIT' && (fallbackRec.confidence ?? 0) >= 65) {
           rec = fallbackRec
         }
       } catch { /* ignore */ }

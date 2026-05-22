@@ -142,6 +142,11 @@ export default function AnalysisPage({
         }),
       })
       const data = await res.json()
+      // Downgrade low-confidence results to WAIT — don't show tradable signal below 55%
+      if (data.direction !== 'WAIT' && (data.confidence ?? 0) < 55) {
+        data.direction = 'WAIT'
+        data.risk_note = `Confidence too low (${data.confidence}%) — minimum 55% required. ${data.risk_note ?? ''}`
+      }
       setRec(data)
       if (data.id) setLastSignalId(data.id)
       const color = DIR_COLOR[data.direction] || 'var(--color-wait)'
