@@ -38,10 +38,10 @@ const TF_KEY: Record<string, string> = {
   '1H': 'H1', '4H': 'H4', 'Daily': 'D1', 'Weekly': 'W1',
 }
 
-// How stale (ms) we allow EA price/candle data to be before falling through
-const PRICE_TTL   = 5 * 60_000   // 5 minutes (EA syncs every 30s; give generous buffer for failed syncs)
-const CANDLE_TTL  = 10 * 60_000  // 10 minutes (2 × M5 bar × 2 for safety)
-const BALANCE_TTL = 5 * 60_000   // 5 minutes — return 0 if EA hasn't synced recently
+// How stale (ms) we allow EA price/candle data to be before falling through to OANDA/Capital
+const PRICE_TTL   = 2 * 60_000   // 2 minutes — EA syncs every 30s; if 2 min stale, EA is likely down
+const CANDLE_TTL  = 4 * 60_000   // 4 minutes — M5 bar is 5 min; reject data older than one bar
+const BALANCE_TTL = 5 * 60_000   // 5 minutes — less critical for risk guards
 
 export class Mt5DirectBroker implements IBroker {
   name = 'MT5 Direct'

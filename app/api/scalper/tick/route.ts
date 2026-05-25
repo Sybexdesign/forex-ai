@@ -1,4 +1,6 @@
 // app/api/scalper/tick/route.ts
+export const dynamic = 'force-dynamic'  // live price data — must never be cached
+
 import { NextRequest, NextResponse } from 'next/server'
 import { getMarketCandles } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'

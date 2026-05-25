@@ -1,4 +1,6 @@
 // app/api/advanced/route.ts
+export const dynamic = 'force-dynamic'  // live candle data — must never be cached
+
 import { NextRequest, NextResponse } from 'next/server'
 import { getMarketCandles } from '@/lib/marketdata'
 import { runAdvancedAnalysis } from '@/lib/advanced-indicators'

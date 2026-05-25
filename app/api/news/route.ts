@@ -2,6 +2,8 @@
 // Checks for upcoming high-impact forex news events
 // Uses ForexFactory calendar (public JSON) or falls back to simulation
 
+export const dynamic = 'force-dynamic'  // never cache — stale news = trading into events
+
 import { NextResponse } from 'next/server'
 
 export interface NewsEvent {
@@ -25,7 +27,7 @@ export async function GET() {
     try {
       const res = await fetch(
         `https://nfs.faireconomy.media/ff_calendar_thisweek.json`,
-        { next: { revalidate: 300 } } // cache 5 mins
+        { cache: 'no-store' }  // always fetch fresh — stale news check = trading into NFP/FOMC
       )
       if (res.ok) {
         const data = await res.json()
