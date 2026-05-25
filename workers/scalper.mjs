@@ -71,7 +71,7 @@ function getStrategy(pair, session) {
 // Avoids calling Claude unless the market shows a genuine setup.
 
 function hasSignalCondition(tick, strategy) {
-  const { rsi14, adx, bbWidth, bbUpper, bbLower, bbMiddle, macdHistogram, price, buyPressure } = tick
+  const { rsi14, adx, bbWidth, bbUpper, bbLower, bbMiddle, macdHistogram, price, buyPressure, tickVolume, volSMA20 } = tick
   const relBbWidth = price > 0 ? bbWidth / price : bbWidth
   switch (strategy) {
     case 'Momentum':      return (rsi14 < 42 || rsi14 > 58) && adx > 18
@@ -79,6 +79,8 @@ function hasSignalCondition(tick, strategy) {
     case 'Breakout': {
       if (relBbWidth >= 0.004) return false  // no squeeze — skip
       if (adx <= 20) return false            // weak trend = false breakout
+      // Fix 2: require at least 80% of average volume — zero/thin-volume breakouts are false
+      if (volSMA20 > 0 && tickVolume < volSMA20 * 0.8) return false
       const mid = bbMiddle || (bbUpper + bbLower) / 2
       const buySetup  = price > mid && macdHistogram > 0  // price above midline + bullish MACD
       const sellSetup = price < mid && macdHistogram < 0  // price below midline + bearish MACD
@@ -90,12 +92,23 @@ function hasSignalCondition(tick, strategy) {
 
 // ── Direction Inference ───────────────────────────────────────────────────────
 // Infers the likely signal direction from 5m tick — same logic as the pre-filter.
-// Used to pass direction into the HTF alignment check before calling AI.
+// Used to confirm 5m aligns with the HTF direction (never used as primary authority).
 
 function inferDirection(tick) {
   const mid = tick.bbMiddle || (tick.bbUpper + tick.bbLower) / 2
   if (tick.price > mid && tick.macdHistogram > 0) return 'BUY'
   if (tick.price < mid && tick.macdHistogram < 0) return 'SELL'
+  return null
+}
+
+// Fix 3: Top-down HTF direction — 15m is the authority, 5m must confirm.
+// Returns 'BUY', 'SELL', or null (no clear 15m trend).
+function inferHTFDirection(htfTick) {
+  if (!htfTick || htfTick.simulated) return null
+  const htfBullish = htfTick.emaCrossSignal === 'BULLISH' && htfTick.macdHistogram > 0 && htfTick.rsi14 > 45
+  const htfBearish = htfTick.emaCrossSignal !== 'BULLISH' && htfTick.macdHistogram < 0 && htfTick.rsi14 < 55
+  if (htfBullish) return 'BUY'
+  if (htfBearish) return 'SELL'
   return null
 }
 
@@ -587,8 +600,8 @@ async function runSweep() {
   // Check if any tracked signals have resolved
   await checkPendingOutcomes(ticksByPair)
 
-  // Phase 2: pre-filter — build signal candidate queue
-  const queue = []
+  // Phase 2a: fast sync pre-filter — no I/O, builds candidate list
+  const candidates = []
   for (const r of tickResults) {
     if (r.status !== 'fulfilled') { stats.errors++; continue }
     const { pair, tick } = r.value
@@ -612,8 +625,43 @@ async function runSweep() {
     }
 
     if (!hasSignalCondition(tick, strategy)) continue
-    const direction = inferDirection(tick)  // inferred from same BB-midline + MACD logic as pre-filter
-    queue.push({ pair, tick, strategy, direction })
+    candidates.push({ pair, tick, strategy })
+  }
+
+  // Phase 2b: Fix 3 — top-down HTF filter (15m is the authority, 5m must confirm)
+  // Fetch HTF for all candidates concurrently; cache means this is near-zero cost on repeat sweeps.
+  const queue = []
+  if (candidates.length) {
+    const htfFetches = await Promise.allSettled(
+      candidates.map(c =>
+        fetchHTFTick(c.pair)
+          .then(h => ({ pair: c.pair, htf: h }))
+          .catch(() => ({ pair: c.pair, htf: null }))
+      )
+    )
+    const htfByPair = {}
+    for (const r of htfFetches) {
+      if (r.status === 'fulfilled') htfByPair[r.value.pair] = r.value.htf
+    }
+
+    for (const cand of candidates) {
+      const htfTick = htfByPair[cand.pair]
+      const htfDir  = inferHTFDirection(htfTick)  // 15m primary direction
+      const dir5m   = inferDirection(cand.tick)   // 5m confirming direction
+
+      if (htfDir && dir5m !== htfDir) {
+        // 5m setup contradicts the 15m trend — skip to avoid trading against the trend
+        console.log(`[prefilter] ${cand.pair} skip — 5m ${dir5m} contradicts 15m ${htfDir}`)
+        wlog('info', `HTF prefilter skip: ${cand.pair} 5m=${dir5m} vs 15m=${htfDir}`, {
+          pair: cand.pair, session, metadata: { dir5m, htfDir, reason: 'htf_prefilter' },
+        })
+        continue
+      }
+
+      const direction = htfDir ?? dir5m  // use 15m direction; fall back to 5m if 15m is unclear
+      if (!direction) continue
+      queue.push({ ...cand, direction })
+    }
   }
 
   if (queue.length)

@@ -31,6 +31,14 @@ function dp(pair: string): number {
   return 5
 }
 
+// Fix 1: Cap SL distance (in price units) to prevent ATR spikes blowing risk limits
+function maxSlDistance(pair: string): number {
+  if (pair.startsWith('XAU')) return 80  * 0.1      // 80 pips × 0.1  = 8.0  price units
+  if (pair.startsWith('XAG')) return 60  * 0.01     // 60 pips × 0.01 = 0.60 price units
+  if (pair.includes('JPY'))   return 50  * 0.01     // 50 pips
+  return                              40  * 0.0001   // 40 pips for FX
+}
+
 const STRATEGY_PROMPTS: Record<Strategy, string> = {
   'Momentum': `You are a scalping signal generator using MOMENTUM strategy.
 Signal BUY: RSI(14) < 38, EMA9 above EMA21, MACD histogram turning positive, ADX > 20.
@@ -68,8 +76,9 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
 } {
   let score = 50
   const reasons: string[] = []
-  const slPips = t.atr * 1.5
-  const tpPips = t.atr * 2.5
+  const maxSl  = maxSlDistance(pair)
+  const slPips = Math.min(t.atr * 1.5, maxSl)
+  const tpPips = slPips * (5 / 3)
 
   if (strategy === 'Momentum') {
     if (t.rsi14 < 38) { score += 15; reasons.push(`RSI(14) oversold (${t.rsi14.toFixed(0)})`) }
@@ -194,8 +203,9 @@ export async function POST(req: NextRequest) {
 
     const decimals = dp(pair)
     const pip      = pipSize(pair)
-    const slPips   = t.atr * 1.5
-    const tpPips   = t.atr * 2.5
+    const maxSl    = maxSlDistance(pair)
+    const slPips   = Math.min(t.atr * 1.5, maxSl)
+    const tpPips   = slPips * (5 / 3)
 
     let result: any
     let fallback = false
@@ -259,6 +269,25 @@ Return JSON only:
 
     // Query ML service in parallel with signal result (non-blocking)
     mlData = await queryMlService(body, pair, result.direction as Direction, result.confidence)
+
+    // Fix 5: ML win-probability now influences confidence (not just displayed)
+    if (mlData && typeof mlData.win_probability === 'number' && result.direction !== 'HOLD') {
+      const winProb = mlData.win_probability
+      if (winProb < 0.40) {
+        // ML says likely loser — penalise up to -20 at 0% win probability
+        const penalty = Math.round((0.40 - winProb) * 50)
+        result.confidence = Math.max(0, result.confidence - penalty)
+        result.reasons = [...(result.reasons || []), `⚠ ML win probability ${(winProb * 100).toFixed(0)}% — confidence reduced`]
+        if (result.confidence < 60) {
+          result.direction = 'HOLD'
+          result.risk_note = (result.risk_note || '') + ` | ML override: low win probability (${(winProb * 100).toFixed(0)}%)`
+        }
+      } else if (winProb > 0.65) {
+        // ML says likely winner — modest boost, max +7 at 100%
+        const boost = Math.round((winProb - 0.65) * 20)
+        result.confidence = Math.min(98, result.confidence + boost)
+      }
+    }
 
     // Ensure SL/TP are present
     if (!result.entry) result.entry = t.price

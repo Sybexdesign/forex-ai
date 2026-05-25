@@ -58,6 +58,12 @@ export async function GET(req: NextRequest) {
   const buyPressure  = +(bullishCount / 20).toFixed(3)
   const tickVolume   = candles[candles.length - 1]?.volume || 0
 
+  // Volume SMA20 — used by worker pre-filter to reject below-average-volume breakouts
+  const volumes  = last20.map((c: any) => c.volume || 0)
+  const volSMA20 = volumes.length > 0
+    ? +(volumes.reduce((a: number, b: number) => a + b, 0) / volumes.length).toFixed(1)
+    : 0
+
   const pip        = pipSize(pair)
   const spread     = defaultSpread(pair)
   const spreadPips = +(spread / pip).toFixed(1)
@@ -86,6 +92,7 @@ export async function GET(req: NextRequest) {
     spreadPips,
     buyPressure,
     tickVolume,
+    volSMA20,
     stochRsiK,
     stochRsiD,
     broker:         brokerName,
