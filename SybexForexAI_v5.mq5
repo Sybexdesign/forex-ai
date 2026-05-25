@@ -277,7 +277,7 @@ bool PlaceOrder(string symbol, string direction, double lots,
          return true;
       }
 
-      if(res.retcode != 10015) // 10015 = invalid filling -- only retcode worth retrying
+      if(res.retcode != 10015 && res.retcode != 10030) // 10015=invalid price/fill, 10030=invalid fill type -- retry with next mode
       {
          Print("SybexForexAI v5: order FAILED ", symbol, " ", direction,
                " retcode=", res.retcode, " fill=", EnumToString(modes[f]));
