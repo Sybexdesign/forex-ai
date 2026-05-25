@@ -285,8 +285,8 @@ bool PlaceOrder(string symbol, string direction, double lots,
          return true;
       }
 
-      // Only retry on filling-mode errors
-      if (res.retcode != TRADE_RETCODE_INVALID_FILLING) {
+      // Only retry on filling-mode errors (retcode 10015 = invalid filling)
+      if (res.retcode != 10015) {
          Print("SybexForexAI v5: order failed — ", symbol, " ", direction,
                " retcode=", res.retcode, " (fill=", EnumToString(fillModes[f]), ")");
          return false;
@@ -352,7 +352,8 @@ string ExecuteOrders(string response) {
                req.magic        = MagicNumber;
                req.position     = ticket;
                req.type_filling = FillMode;
-               OrderSend(req, res2);
+               bool closeSent = OrderSend(req, res2);
+               if (!closeSent) Print("SybexForexAI v5: close send error — ticket=", ticket, " retcode=", res2.retcode);
             }
             completed += "{\"id\":\"" + orderId + "\",\"success\":true,\"type\":\"close\"}";
             Print("SybexForexAI v5: close queued for ", symbol);
