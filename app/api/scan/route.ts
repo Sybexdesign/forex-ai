@@ -139,6 +139,16 @@ async function scanPair(
 ): Promise<ScanSignal | null> {
   if (!isIndexInSession(pair)) return null
 
+  // Metals session gate: London/NY sessions (05:00–18:59 UTC) have 0% win rate on XAU/USD
+  // from 213 live signals. Best window: 19:00–04:00 UTC (Asian session / NY close).
+  if (isMetals(pair)) {
+    const utcHour = new Date().getUTCHours()
+    if (utcHour >= 5 && utcHour < 19) {
+      console.log(`[scan] ${pair}/${timeframe}: London/NY session (${utcHour}:xx UTC) — metals blocked (historical 0% win rate this window)`)
+      return null
+    }
+  }
+
   // 1. Fetch candles — reject simulation outright
   const { candles, simulated } = await getCandles(authToken, pair, timeframe, 200)
   if (simulated) {
@@ -149,6 +159,12 @@ async function scanPair(
   // 2. Indicators
   const indicators = calculateIndicators(candles)
 
+  // Metals ADX floor: ADX 20–24 has 6% win rate (91 losses). Require ADX ≥ 25.
+  if (isMetals(pair) && indicators.adx < 25) {
+    console.log(`[scan] ${pair}/${timeframe}: ADX ${indicators.adx.toFixed(1)} < 25 — metals need stronger trend`)
+    return null
+  }
+
   // 3. Direction resolution (EMA+MACD primary; RSI momentum fallback for metals)
   const { direction: resolvedDir, method: dirMethod } = resolveDirection(indicators, pair)
   if (!resolvedDir) return null
@@ -158,6 +174,19 @@ async function scanPair(
   // 4. RSI extreme guard (metals use wider thresholds — they trend at high RSI)
   if (direction === 'BUY'  && indicators.rsi > cfg.rsiExtremeBuy)  return null
   if (direction === 'SELL' && indicators.rsi < cfg.rsiExtremeSell) return null
+
+  // Metals RSI momentum gate: RSI 50–69 on BUY has 0% win rate (93 losses).
+  // Only enter BUY on oversold momentum (RSI < 45), SELL on overbought (RSI > 55).
+  if (isMetals(pair)) {
+    if (direction === 'BUY'  && indicators.rsi > 45) {
+      console.log(`[scan] ${pair}/${timeframe}: RSI ${indicators.rsi.toFixed(1)} > 45 on BUY — mid-range RSI has 0% win rate on metals`)
+      return null
+    }
+    if (direction === 'SELL' && indicators.rsi < 55) {
+      console.log(`[scan] ${pair}/${timeframe}: RSI ${indicators.rsi.toFixed(1)} < 55 on SELL — mid-range RSI blocked`)
+      return null
+    }
+  }
 
   // 5. ATR guard
   const atrResult = calcATRIndicator(candles, pair)
@@ -262,24 +291,8 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
       // fall through to rule-based fallback below
     }
 
-    // If AI says WAIT on first pass, try a fallback prompt focused on best current setup
-    if (!aiUnavailable && (!rec || rec.direction === 'WAIT') && isMetals(pair)) {
-      try {
-        const fallbackPrompt = buildIndicatorPrompt(pair, timeframe, indicators, checklist, direction) +
-          `\n\nFallback analysis request: The pre-filter passed. Even if the setup is not perfect, identify the BEST directional bias right now. If there is ANY measurable momentum or trend, report it with honest confidence (may be 55–65%). Do not return WAIT unless the market is genuinely flat with no discernible direction.`
-        const msg2 = await anthropic.messages.create({
-          model:      'claude-sonnet-4-6',
-          max_tokens: 600,
-          system:     systemPrompt,
-          messages:   [{ role: 'user', content: fallbackPrompt }],
-        })
-        const text2 = msg2.content.find(b => b.type === 'text')?.text || '{}'
-        const fallbackRec = JSON.parse(text2.replace(/```json|```/g, '').trim())
-        if (fallbackRec.direction !== 'WAIT' && (fallbackRec.confidence ?? 0) >= 65) {
-          rec = fallbackRec
-        }
-      } catch { /* ignore */ }
-    }
+    // Fallback prompt removed: forcing WAIT → signal on metals generates conf 65–79 trades
+    // with 0–4% historical win rate. If AI says WAIT, trust it and skip.
   }
 
   // Rule-based confidence fallback: used when AI key missing or API unavailable (credits/rate limit)
