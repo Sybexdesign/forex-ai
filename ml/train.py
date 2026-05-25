@@ -55,12 +55,54 @@ while True:
 
 print(f"✓ Total rows with WIN/LOSS outcome: {len(all_rows)}")
 
+# ─── Apply the same filters used in scan/route.ts ────────────────────────────
+# Training on bad signals teaches the model to approve them.
+# Mirror the three data-driven gates added after win-rate analysis.
+
+from datetime import datetime, timezone
+
+def passes_scan_filters(row: dict) -> bool:
+    pair      = row.get('pair', '')
+    direction = row.get('direction', '')
+    snap      = row.get('indicator_snapshot') or {}
+    is_metals = pair.startswith('XA')
+
+    if not is_metals:
+        return True  # FX pairs: no session/RSI gate yet
+
+    # Session gate: 05:00–18:59 UTC had 0% win rate on metals
+    try:
+        dt   = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
+        hour = dt.astimezone(timezone.utc).hour
+        if 5 <= hour < 19:
+            return False
+    except Exception:
+        pass
+
+    # ADX floor: ADX 20–24 had 6% win rate (91 losses)
+    adx = float(snap.get('adx') or 0)
+    if adx > 0 and adx < 25:
+        return False
+
+    # RSI gate: RSI 50–69 on BUY had 0% win rate (93 losses)
+    rsi = float(snap.get('rsi') or snap.get('rsi14') or 50)
+    if direction == 'BUY'  and rsi > 45:
+        return False
+    if direction == 'SELL' and rsi < 55:
+        return False
+
+    return True
+
+before = len(all_rows)
+all_rows = [r for r in all_rows if passes_scan_filters(r)]
+print(f"✓ After scan filters: {len(all_rows)} rows kept, {before - len(all_rows)} removed")
+
 MIN_ROWS = 20
 if len(all_rows) < MIN_ROWS:
-    print(f"❌ Need at least {MIN_ROWS} completed signals to train. Run the scanner longer.")
+    print(f"❌ Need at least {MIN_ROWS} filtered signals to train.")
     exit(1)
 if len(all_rows) < 100:
-    print(f"⚠  Only {len(all_rows)} labeled signals — model will be weak. Aim for 500+ for production quality.")
+    print(f"⚠  Only {len(all_rows)} filtered signals — model will be weak. Aim for 200+ for production quality.")
 
 df = pd.DataFrame(all_rows)
 
