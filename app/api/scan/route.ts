@@ -17,6 +17,31 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 // Only these two pairs are permitted
 const METALS_ONLY = ['XAU/USD', 'XAG/USD']
 
+const ML_URL = process.env.ML_SERVICE_URL || 'http://localhost:8100'
+
+async function queryML(indicators: any, pair: string, direction: string, confidence: number) {
+  try {
+    const ctrl  = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 3000)
+    const resp  = await fetch(`${ML_URL}/predict`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal:  ctrl.signal,
+      body:    JSON.stringify({
+        pair, direction, confidence,
+        indicators,
+        scalperIndicators: indicators.scalper ?? {},
+        timestamp: new Date().toISOString(),
+      }),
+    })
+    clearTimeout(timer)
+    if (!resp.ok) return null
+    return await resp.json() as { win_probability: number; should_trade: boolean; ml_confidence: number }
+  } catch {
+    return null
+  }
+}
+
 export interface ScanSignal {
   id: string
   pair: string
@@ -33,6 +58,7 @@ export interface ScanSignal {
   indicators: any
   simulated?: boolean
   htfConfirmed?: boolean
+  mlScore?: { win_probability: number; should_trade: boolean; ml_confidence: number } | null
 }
 
 const TF_EXPIRY_MS: Record<string, number> = {
@@ -345,6 +371,18 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
   const slPrice  = +(indicators.currentPrice - strategy.slPips * pip * sign).toFixed(dp)
   const expiryMs = TF_EXPIRY_MS[timeframe] ?? 15 * 60_000
 
+  // ML gate: query XGBoost service, block if win probability < 40%
+  const mlScore = await queryML(indicators, pair, rec.direction, finalConfidence)
+  if (mlScore && mlScore.win_probability < 0.40) {
+    console.log(`[scan] ${pair}/${timeframe}: ML win_prob ${(mlScore.win_probability * 100).toFixed(0)}% < 40% — signal blocked`)
+    return null
+  }
+  if (mlScore && mlScore.win_probability < 0.55) {
+    const penalty = Math.round((0.55 - mlScore.win_probability) * 40)
+    finalConfidence = Math.max(0, finalConfidence - penalty)
+    console.log(`[scan] ${pair}/${timeframe}: ML win_prob ${(mlScore.win_probability * 100).toFixed(0)}% — confidence reduced by ${penalty}`)
+  }
+
   const signal: ScanSignal = {
     id:            `scan-${pair.replace('/', '')}-${now.getTime()}`,
     pair,
@@ -361,6 +399,7 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
     indicators,
     simulated:     false,
     htfConfirmed,
+    mlScore,
   }
 
   await alertNewSignal({
