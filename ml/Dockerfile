@@ -16,4 +16,4 @@ COPY model/ ./model/ 2>/dev/null || true
 
 EXPOSE 8100
 
-CMD ["python", "serve.py"]
+CMD ["python", "-u", "serve.py"]

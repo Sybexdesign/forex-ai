@@ -1,0 +1,9 @@
+[build]
+dockerfilePath = "ml/Dockerfile"
+dockerContext  = "ml"
+
+[deploy]
+startCommand   = "python serve.py"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
