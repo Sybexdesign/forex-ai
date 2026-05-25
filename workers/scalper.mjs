@@ -78,7 +78,7 @@ function hasSignalCondition(tick, strategy) {
     case 'Mean Reversion': return rsi14 < 38 || rsi14 > 62
     case 'Breakout': {
       if (relBbWidth >= 0.004) return false  // no squeeze — skip
-      if (adx <= 25) return false            // weak trend = false breakout
+      if (adx <= 20) return false            // weak trend = false breakout
       const mid = bbMiddle || (bbUpper + bbLower) / 2
       const buySetup  = price > mid && macdHistogram > 0  // price above midline + bullish MACD
       const sellSetup = price < mid && macdHistogram < 0  // price below midline + bearish MACD

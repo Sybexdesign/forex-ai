@@ -46,13 +46,13 @@ Return HOLD if no extreme reading is present.
 Respond ONLY with valid JSON — no markdown, no prose.`,
   'Breakout': `You are a scalping signal generator using BREAKOUT strategy.
 BB squeeze is defined as normalised width (BB Width / Price) < 0.4% — applies to all instruments including XAU/USD, XAG/USD, and FX pairs.
-Signal BUY: squeeze present AND price is ABOVE BB midline AND price is at or near BB upper band, MACD histogram positive, ADX > 25.
-Signal SELL: squeeze present AND price is BELOW BB midline AND price is at or near BB lower band, MACD histogram negative, ADX > 25.
+Signal BUY: squeeze present AND price is ABOVE BB midline AND price is at or near BB upper band, MACD histogram positive, ADX > 20.
+Signal SELL: squeeze present AND price is BELOW BB midline AND price is at or near BB lower band, MACD histogram negative, ADX > 20.
 CRITICAL: Do NOT signal BUY if price is below BB midline — that is a breakdown, not a breakout.
 CRITICAL: Do NOT signal SELL if price is above BB midline — that is a breakout, not a breakdown.
-ADX must exceed 25 — ADX 20-24 is a weak trend where breakouts fail at high rates.
+ADX 20–24 is a developing trend — valid for breakout entries but cap confidence at 70. ADX ≥ 25 is confirmed trend — full confidence range applies.
 Use the "BB Width / Price %" and "BB Midline" values provided. Volume confirmation increases confidence.
-Return HOLD if: no squeeze, ADX ≤ 25, price on the wrong side of BB midline, or direction is ambiguous.
+Return HOLD if: no squeeze, ADX ≤ 20, price on the wrong side of BB midline, or direction is ambiguous.
 Respond ONLY with valid JSON — no markdown, no prose.`,
   'Order Flow': `You are a scalping signal generator using ORDER FLOW strategy.
 Signal BUY: buy pressure > 62%, RSI(14) below 45 (bullish divergence), high tick volume.
@@ -91,8 +91,8 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
     const relWidth = t.price > 0 ? t.bbWidth / t.price : 1
     const squeeze  = relWidth < 0.004
     if (!squeeze)    { reasons.push('No BB squeeze — breakout condition not met') }
-    if (t.adx <= 25) { reasons.push(`ADX ${t.adx.toFixed(1)} ≤ 25 — trend too weak for breakout`) }
-    if (squeeze && t.adx > 25) {
+    if (t.adx <= 20) { reasons.push(`ADX ${t.adx.toFixed(1)} ≤ 20 — trend too weak for breakout`) }
+    if (squeeze && t.adx > 20) {
       if (t.price > bbMid) {
         score += 20; reasons.push('BB squeeze above midline (bullish breakout setup)')
         if (t.price >= t.bbUpper) { score  += 8; reasons.push('Price at BB upper — breakout confirmed') }
