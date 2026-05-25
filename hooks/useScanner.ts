@@ -19,19 +19,20 @@ export interface ScannerState {
   error: string | null
 }
 
-// Adaptive scan interval — faster for metals which move quickly
+// Adaptive scan interval — match worker's 10s polling cadence closely
+// Claude is only called when checklist passes, so frequent scans ≠ frequent API costs
 function getScanInterval(tf: string): number {
   const MAP: Record<string, number> = {
-    '1m':    45,   // 45 s — metals can set up within a single candle
-    '3m':    75,
-    '5m':    60,   // 60 s — frequent enough to catch metal breakouts
-    '15m':  120,   // 2 min
-    '30m':  180,   // 3 min
-    '1H':   180,   // 3 min
-    '4H':   300,   // 5 min
-    'Daily': 900,
+    '1m':    12,   // near real-time — 1m candles close every 60s
+    '3m':    15,
+    '5m':    12,   // close to worker's 10s tick poll
+    '15m':   25,
+    '30m':   45,
+    '1H':    45,
+    '4H':    90,
+    'Daily': 240,
   }
-  return MAP[tf] ?? 180
+  return MAP[tf] ?? 45
 }
 
 export function useScanner(
