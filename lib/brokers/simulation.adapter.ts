@@ -8,22 +8,22 @@ import { isIndex, getPairDecimalPlaces } from '@/lib/instruments'
 
 const BASE_PRICES: Record<string, number> = {
   // Majors
-  'EUR/USD': 1.0842,  'GBP/USD': 1.2714,  'USD/JPY': 149.82,
-  'AUD/USD': 0.6523,  'NZD/USD': 0.6120,  'USD/CAD': 1.3641,
-  'USD/CHF': 0.9030,  'XAU/USD': 2318.40,
+  'EUR/USD': 1.1350,  'GBP/USD': 1.3450,  'USD/JPY': 145.50,
+  'AUD/USD': 0.6450,  'NZD/USD': 0.5950,  'USD/CAD': 1.3750,
+  'USD/CHF': 0.8900,  'XAU/USD': 4568.00,
   // Crosses
-  'EUR/JPY': 161.50,  'GBP/JPY': 188.20,  'EUR/AUD': 1.6640,
-  'EUR/CAD': 1.4740,  'EUR/NZD': 1.7680,  'EUR/GBP': 0.8560,
-  'GBP/AUD': 1.9440,  'GBP/CAD': 1.7160,  'GBP/NZD': 2.0620,
-  'AUD/JPY': 97.40,   'AUD/NZD': 1.0870,  'CAD/JPY': 110.30,
-  'NZD/JPY': 89.60,   'CHF/JPY': 165.80,
+  'EUR/JPY': 165.20,  'GBP/JPY': 196.10,  'EUR/AUD': 1.7600,
+  'EUR/CAD': 1.5600,  'EUR/NZD': 1.9050,  'EUR/GBP': 0.8430,
+  'GBP/AUD': 2.0860,  'GBP/CAD': 1.8500,  'GBP/NZD': 2.2610,
+  'AUD/JPY': 93.90,   'AUD/NZD': 1.0840,  'CAD/JPY': 105.80,
+  'NZD/JPY': 86.60,   'CHF/JPY': 163.50,
   // Commodities
-  'XAG/USD': 28.45,   'XAG_USD': 28.45,   'BCO/USD': 82.30,
+  'XAG/USD': 78.25,   'XAG_USD': 78.25,   'BCO/USD': 65.40,
   // Indices
-  'SPX500': 5240.0,   'NAS100': 18350.0,
-  'UK100': 8180.0,    'GER40': 18420.0,    'JP225': 38900.0,
+  'SPX500': 5900.0,   'NAS100': 21500.0,
+  'UK100': 8650.0,    'GER40': 23200.0,    'JP225': 37500.0,
   // Crypto
-  'BTC/USD': 62450.00, 'ETH/USD': 3218.50,
+  'BTC/USD': 108000.00, 'ETH/USD': 2500.00,
 }
 
 const _prices = { ...BASE_PRICES }
