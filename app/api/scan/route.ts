@@ -59,7 +59,7 @@ function tfConfig(timeframe: string, pair: string) {
   const isMicro  = ['1m', '3m'].includes(timeframe)
   const metals   = isMetals(pair)
   return {
-    minChecklistPass: metals ? 4 : (isShort ? 5 : 6),
+    minChecklistPass: metals ? 5 : (isShort ? 5 : 6),
     skipAtrGuard:     metals,                           // metals ATR dwarfs FX slPips baseline
     atrGuardMult:     isShort ? 3 : 2,
     minConfidence:    metals ? 65 : (isMicro ? 55 : 60),
@@ -85,15 +85,17 @@ async function confirmHTF(
 ): Promise<{ confirmed: boolean; boost: boolean }> {
   try {
     const { candles, simulated } = await getCandles(authToken, pair, htfFrame, 60)
-    if (simulated) return { confirmed: true, boost: false }  // no penalty for unavailable HTF
+    // Simulated HTF data is not a confirmation — treat as unconfirmed (reduces confidence by 8%)
+    if (simulated) return { confirmed: false, boost: false }
     const ind = calculateIndicators(candles)
-    const htfBullish = ind.emaCrossed && ind.macdHistogram > 0 && ind.rsi > 45
-    const htfBearish = !ind.emaCrossed && ind.macdHistogram < 0 && ind.rsi < 55
+    // Use RSI > 50 (clear momentum) not > 45 (near-neutral) to confirm bullish HTF
+    const htfBullish = ind.emaCrossed && ind.macdHistogram > 0 && ind.rsi > 50
+    const htfBearish = !ind.emaCrossed && ind.macdHistogram < 0 && ind.rsi < 50
     const confirmed = direction === 'BUY' ? htfBullish : htfBearish
-    const boost     = confirmed && (direction === 'BUY' ? ind.adx > 25 : ind.adx > 25)
+    const boost     = confirmed && ind.adx > 25
     return { confirmed, boost }
   } catch {
-    return { confirmed: true, boost: false }
+    return { confirmed: false, boost: false }
   }
 }
 

@@ -54,13 +54,14 @@ Return HOLD if no extreme reading is present.
 Respond ONLY with valid JSON — no markdown, no prose.`,
   'Breakout': `You are a scalping signal generator using BREAKOUT strategy.
 BB squeeze is defined as normalised width (BB Width / Price) < 0.4% — applies to all instruments including XAU/USD, XAG/USD, and FX pairs.
-Signal BUY: squeeze present AND price is ABOVE BB midline AND price is at or near BB upper band, MACD histogram positive, ADX > 20.
-Signal SELL: squeeze present AND price is BELOW BB midline AND price is at or near BB lower band, MACD histogram negative, ADX > 20.
-CRITICAL: Do NOT signal BUY if price is below BB midline — that is a breakdown, not a breakout.
-CRITICAL: Do NOT signal SELL if price is above BB midline — that is a breakout, not a breakdown.
-ADX 20–24 is a developing trend — valid for breakout entries but cap confidence at 70. ADX ≥ 25 is confirmed trend — full confidence range applies.
-Use the "BB Width / Price %" and "BB Midline" values provided. Volume confirmation increases confidence.
-Return HOLD if: no squeeze, ADX ≤ 20, price on the wrong side of BB midline, or direction is ambiguous.
+Signal BUY: squeeze present AND price is in the UPPER 30% of the BB range (pressing against the upper band), MACD histogram positive and NOT decelerating, ADX > 20.
+Signal SELL: squeeze present AND price is in the LOWER 30% of the BB range (pressing against the lower band), MACD histogram negative and NOT decelerating, ADX > 20.
+CRITICAL: "Above midline" alone is NOT a BUY — price must be pressing toward the UPPER BAND (outer 30% of band width). Midline vicinity is consolidation, not breakout.
+CRITICAL: "Below midline" alone is NOT a SELL — price must be pressing toward the LOWER BAND (outer 30% of band width).
+CRITICAL: If MACD histogram is positive but shrinking vs the prior bar (momentum decelerating), reduce confidence or return HOLD — the move may be exhausting.
+ADX 20–24: developing trend — valid entry but cap confidence at 70. ADX ≥ 25: confirmed trend, full confidence range.
+Volume confirmation increases confidence. Low volume breakouts are suspect.
+Return HOLD if: no squeeze, ADX ≤ 20, price in the middle 40% of the band, momentum decelerating, or direction ambiguous.
 Respond ONLY with valid JSON — no markdown, no prose.`,
   'Order Flow': `You are a scalping signal generator using ORDER FLOW strategy.
 Signal BUY: buy pressure > 62%, RSI(14) below 45 (bullish divergence), high tick volume.
@@ -96,20 +97,23 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
     if (t.rsi7  < 25) { score  += 8; reasons.push(`RSI(7) extreme low (${t.rsi7.toFixed(0)})`) }
     if (t.rsi7  > 75) { score  -= 8; reasons.push(`RSI(7) extreme high (${t.rsi7.toFixed(0)})`) }
   } else if (strategy === 'Breakout') {
-    const bbMid    = (t.bbUpper + t.bbLower) / 2
-    const relWidth = t.price > 0 ? t.bbWidth / t.price : 1
-    const squeeze  = relWidth < 0.004
+    const relWidth    = t.price > 0 ? t.bbWidth / t.price : 1
+    const squeeze     = relWidth < 0.004
+    const buyZoneMin  = t.bbLower + t.bbWidth * 0.70  // top 30% of band
+    const sellZoneMax = t.bbLower + t.bbWidth * 0.30  // bottom 30% of band
     if (!squeeze)    { reasons.push('No BB squeeze — breakout condition not met') }
     if (t.adx <= 20) { reasons.push(`ADX ${t.adx.toFixed(1)} ≤ 20 — trend too weak for breakout`) }
     if (squeeze && t.adx > 20) {
-      if (t.price > bbMid) {
-        score += 20; reasons.push('BB squeeze above midline (bullish breakout setup)')
-        if (t.price >= t.bbUpper) { score  += 8; reasons.push('Price at BB upper — breakout confirmed') }
+      if (t.price >= buyZoneMin) {
+        score += 20; reasons.push('BB squeeze: price pressing upper band (bullish breakout)')
+        if (t.price >= t.bbUpper) { score  += 8; reasons.push('Price at/above BB upper — confirmed') }
         if (t.macdHistogram > 0)  { score  += 8; reasons.push('MACD positive — bullish momentum') }
-      } else {
-        score -= 20; reasons.push('BB squeeze below midline (bearish breakout setup)')
-        if (t.price <= t.bbLower) { score  -= 8; reasons.push('Price at BB lower — breakdown confirmed') }
+      } else if (t.price <= sellZoneMax) {
+        score -= 20; reasons.push('BB squeeze: price pressing lower band (bearish breakout)')
+        if (t.price <= t.bbLower) { score  -= 8; reasons.push('Price at/below BB lower — confirmed') }
         if (t.macdHistogram < 0)  { score  -= 8; reasons.push('MACD negative — bearish momentum') }
+      } else {
+        reasons.push('Price in mid-band consolidation zone — not a breakout yet')
       }
     }
   } else {

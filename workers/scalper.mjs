@@ -79,11 +79,14 @@ function hasSignalCondition(tick, strategy) {
     case 'Breakout': {
       if (relBbWidth >= 0.004) return false  // no squeeze — skip
       if (adx <= 20) return false            // weak trend = false breakout
-      // Fix 2: require at least 80% of average volume — zero/thin-volume breakouts are false
-      if (volSMA20 > 0 && tickVolume < volSMA20 * 0.8) return false
-      const mid = bbMiddle || (bbUpper + bbLower) / 2
-      const buySetup  = price > mid && macdHistogram > 0  // price above midline + bullish MACD
-      const sellSetup = price < mid && macdHistogram < 0  // price below midline + bearish MACD
+      if (volSMA20 > 0 && tickVolume < volSMA20 * 0.8) return false  // thin-volume breakouts are false
+      // Price must be pressing toward the band edge (outer 30% of band width), not just above/below midline.
+      // A price barely above mid in a squeeze is still in the consolidation zone — not a breakout.
+      const bbWidthVal  = bbUpper - bbLower
+      const buyZoneMin  = bbLower + bbWidthVal * 0.70  // top 30% of band
+      const sellZoneMax = bbLower + bbWidthVal * 0.30  // bottom 30% of band
+      const buySetup  = price >= buyZoneMin  && macdHistogram > 0
+      const sellSetup = price <= sellZoneMax && macdHistogram < 0
       return buySetup || sellSetup
     }
     default:              return buyPressure < 0.38 || buyPressure > 0.62
@@ -101,12 +104,15 @@ function inferDirection(tick) {
   return null
 }
 
-// Fix 3: Top-down HTF direction — 15m is the authority, 5m must confirm.
-// Returns 'BUY', 'SELL', or null (no clear 15m trend).
+// Top-down HTF direction — 15m is the authority, 5m must confirm.
+// Returns 'BUY', 'SELL', or null (ambiguous — no trade allowed when null).
+// Uses persistent EMA relationship (ema20 > ema50), not emaCrossSignal which only
+// fires on the one candle where EMA crosses — missing the entire steady trend thereafter.
 function inferHTFDirection(htfTick) {
   if (!htfTick || htfTick.simulated) return null
-  const htfBullish = htfTick.emaCrossSignal === 'BULLISH' && htfTick.macdHistogram > 0 && htfTick.rsi14 > 45
-  const htfBearish = htfTick.emaCrossSignal !== 'BULLISH' && htfTick.macdHistogram < 0 && htfTick.rsi14 < 55
+  const ema20AboveEma50 = htfTick.ema20 > htfTick.ema50
+  const htfBullish = ema20AboveEma50  && htfTick.macdHistogram > 0 && htfTick.rsi14 > 50
+  const htfBearish = !ema20AboveEma50 && htfTick.macdHistogram < 0 && htfTick.rsi14 < 50
   if (htfBullish) return 'BUY'
   if (htfBearish) return 'SELL'
   return null
@@ -119,7 +125,7 @@ const alertCooldowns = new Map()   // `${pair}:${direction}` → ms timestamp
 const stalePriceTrack = new Map()  // pair → { price: number, count: number }
 const htfCache        = new Map()  // `${pair}:${tf}` → { tick, at }
 const STALE_SKIP_COUNT = 12        // skip signal after N identical consecutive prices (~2 min at 10s sweeps)
-const HTF_CACHE_MS    = 90_000     // cache HTF tick for 90s — 15m candle barely changes in 1 min
+const HTF_CACHE_MS    = 30_000     // 30s — prevents serving a candle that closed on the previous bar
 let   cachedRisk     = null
 let   riskCachedAt   = 0
 let   tradingHalted  = false
@@ -375,11 +381,13 @@ async function isHTFAligned(pair, direction) {
   try {
     const htf = await fetchHTFTick(pair)
     if (htf.simulated) return true  // HTF feed unavailable — don't block on missing data
-    // Mirror the scan route's confirmHTF logic exactly
-    const htfBullish = htf.emaCrossSignal === 'BULLISH' && htf.macdHistogram > 0 && htf.rsi14 > 45
-    const htfBearish = htf.emaCrossSignal !== 'BULLISH' && htf.macdHistogram < 0 && htf.rsi14 < 55
+    // Use persistent EMA state (ema20 > ema50), not emaCrossSignal which only fires on the cross candle.
+    // In a steady trend emaCrossSignal = 'FLAT', so checking it misses the whole trend.
+    const ema20AboveEma50 = htf.ema20 > htf.ema50
+    const htfBullish = ema20AboveEma50  && htf.macdHistogram > 0 && htf.rsi14 > 50
+    const htfBearish = !ema20AboveEma50 && htf.macdHistogram < 0 && htf.rsi14 < 50
     const aligned    = direction === 'BUY' ? htfBullish : htfBearish
-    console.log(`[htf] ${pair} 15m: ema=${htf.emaCrossSignal} macd=${htf.macdHistogram?.toFixed(4)} rsi=${htf.rsi14} → ${aligned ? '✅ aligned' : '❌ misaligned'} for ${direction}`)
+    console.log(`[htf] ${pair} 15m: ema20${ema20AboveEma50 ? '>' : '<'}ema50 macd=${htf.macdHistogram?.toFixed(4)} rsi=${htf.rsi14} → ${aligned ? '✅ aligned' : '❌ misaligned'} for ${direction}`)
     return aligned
   } catch (e) {
     console.warn(`[htf] ${pair} fetch failed: ${e.message} — allowing through`)
@@ -649,8 +657,14 @@ async function runSweep() {
       const htfDir  = inferHTFDirection(htfTick)  // 15m primary direction
       const dir5m   = inferDirection(cand.tick)   // 5m confirming direction
 
-      if (htfDir && dir5m !== htfDir) {
-        // 5m setup contradicts the 15m trend — skip to avoid trading against the trend
+      if (!htfDir) {
+        // 15m trend is ambiguous — no fallback to 5m; no macro bias = no trade
+        console.log(`[prefilter] ${cand.pair} skip — 15m trend ambiguous (EMA/MACD/RSI not aligned)`)
+        continue
+      }
+
+      if (dir5m !== htfDir) {
+        // 5m setup contradicts the confirmed 15m trend — trading against the macro bias
         console.log(`[prefilter] ${cand.pair} skip — 5m ${dir5m} contradicts 15m ${htfDir}`)
         wlog('info', `HTF prefilter skip: ${cand.pair} 5m=${dir5m} vs 15m=${htfDir}`, {
           pair: cand.pair, session, metadata: { dir5m, htfDir, reason: 'htf_prefilter' },
@@ -658,9 +672,7 @@ async function runSweep() {
         continue
       }
 
-      const direction = htfDir ?? dir5m  // use 15m direction; fall back to 5m if 15m is unclear
-      if (!direction) continue
-      queue.push({ ...cand, direction })
+      queue.push({ ...cand, direction: htfDir })
     }
   }
 
