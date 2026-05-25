@@ -3,7 +3,7 @@
  * SybexForexAI — 24/7 Background Scalper Worker
  *
  * - 10-second polling across XAU/USD and XAG/USD (concurrent tick fetch + pre-filter)
- * - Session-aware strategy rotation: Momentum during London/NY, Mean Reversion Asian
+ * - Breakout strategy 24/7 for metals — pre-filter (ADX>25 + BB squeeze) guards quality
  * - Two-stage scan: fast indicator pre-filter → Claude signal only when needed
  * - Risk guards: 1% max risk, 3% daily loss limit, max 3 concurrent trades
  * - WORKER_MODE=paper  → Telegram alerts + Supabase log (no real orders)
@@ -594,7 +594,6 @@ async function runSweep() {
     const { pair, tick } = r.value
     const strategy       = getStrategy(pair, session)
     if (Date.now() - (lastSigFetch.get(pair) || 0) < SIG_COOLDOWN_MS) continue
-    if (session === 'Asian' && strategy === 'Breakout') continue  // false breakouts in low-vol Asian session
 
     // Stale data guard: skip if MT5 EA is sending identical prices repeatedly
     const stale = stalePriceTrack.get(pair)
