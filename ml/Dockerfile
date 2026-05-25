@@ -12,7 +12,7 @@ COPY retrain.sh .
 
 # Copy model if it exists (optional — container starts without it and
 # waits for the model to be mounted or trained in place)
-COPY model/ ./model/ 2>/dev/null || true
+RUN mkdir -p ./model/
 
 EXPOSE 8100
 
