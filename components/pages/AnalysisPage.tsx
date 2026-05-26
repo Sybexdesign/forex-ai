@@ -274,11 +274,18 @@ export default function AnalysisPage({
           onClick={() => setEvalDir('SELL')}
           style={{ padding: '5px 20px' }}
         >▼ SELL</button>
-        {indicators && (
-          <span className="mono" style={{ marginLeft: 8, fontSize: 12, color: 'var(--text-muted)' }}>
-            Price: <span style={{ color: 'var(--color-accent-dim)' }}>{indicators.currentPrice.toFixed(5)}</span>
-          </span>
-        )}
+        {indicators && (() => {
+          const liveBid = prices[pair]?.bid
+          const liveAsk = prices[pair]?.ask
+          const dp = pair.startsWith('XA') ? 2 : pair.includes('JPY') ? 3 : 5
+          return (
+            <span className="mono" style={{ marginLeft: 8, fontSize: 12, color: 'var(--text-muted)' }}>
+              Bid: <span style={{ color: 'var(--color-sell)' }}>{(liveBid || indicators.currentPrice).toFixed(dp)}</span>
+              {' / '}
+              Ask: <span style={{ color: 'var(--color-buy)' }}>{(liveAsk || indicators.currentPrice).toFixed(dp)}</span>
+            </span>
+          )
+        })()}
       </div>
 
       {/* Main grid */}
@@ -294,7 +301,10 @@ export default function AnalysisPage({
               {indError && (
                 <div style={{ padding: 12, color: 'var(--color-sell)', fontSize: 12 }}>⚠ {indError}</div>
               )}
-              {indicators && !indLoading && (
+              {indicators && !indLoading && (() => {
+                const priceDp = pair.startsWith('XA') ? 2 : pair.includes('JPY') ? 3 : 5
+                const fmt = (v: number) => typeof v === 'number' ? v.toFixed(priceDp) : v
+                return (
                 <>
                   {/* EMA */}
                   <div style={{ padding: '10px 0 6px', borderBottom: '1px solid var(--border)' }}>
@@ -304,13 +314,13 @@ export default function AnalysisPage({
                     <div className="ind-row">
                       <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>EMA 20</span>
                       <span className="mono" style={{ fontSize: 13, color: indicators.emaCrossed ? 'var(--color-buy)' : 'var(--color-sell)' }}>
-                        {indicators.ema20}
+                        {fmt(indicators.ema20)}
                       </span>
                     </div>
                     <div className="ind-row">
                       <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>EMA 50</span>
                       <span className="mono" style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
-                        {indicators.ema50}
+                        {fmt(indicators.ema50)}
                       </span>
                     </div>
                     <div className="ind-row">
@@ -363,13 +373,14 @@ export default function AnalysisPage({
                       <div key={label} className="ind-row">
                         <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>{label}</span>
                         <span className="mono" style={{ fontSize: 12, color }}>
-                          {typeof val === 'number' ? val.toFixed(6) : val}
+                          {typeof val === 'number' ? fmt(val) : val}
                         </span>
                       </div>
                     ))}
                   </div>
                 </>
-              )}
+                )
+              })()}
             </div>
           </Panel>
         </div>
@@ -482,7 +493,9 @@ export default function AnalysisPage({
                 const riskAmt = (accountSize * strategy.riskPct / 100).toFixed(2)
                 const sign = rec.direction === 'BUY' ? 1 : -1
                 const dp = pair.includes('JPY') ? 3 : pair.startsWith('XA') ? 2 : 5
-                const entryPrice = prices[pair]?.bid || indicators.currentPrice
+                const entryPrice = rec.direction === 'BUY'
+                  ? (prices[pair]?.ask || prices[pair]?.bid || indicators.currentPrice)
+                  : (prices[pair]?.bid || indicators.currentPrice)
                 const tpPrice = (entryPrice + strategy.tpPips * pip * sign).toFixed(dp)
                 const slPrice = (entryPrice - strategy.slPips * pip * sign).toFixed(dp)
                 return (
