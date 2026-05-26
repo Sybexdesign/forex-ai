@@ -278,11 +278,17 @@ export default function AnalysisPage({
           const liveBid = prices[pair]?.bid
           const liveAsk = prices[pair]?.ask
           const dp = pair.startsWith('XA') ? 2 : pair.includes('JPY') ? 3 : 5
+          // Only trust the price feed if it's within 2% of the candle-based price —
+          // Capital.com GOLD can diverge significantly from the MT5 spot price.
+          const base = indicators.currentPrice
+          const isTrusted = liveBid && Math.abs(liveBid - base) / base < 0.02
+          const displayBid = isTrusted ? liveBid! : base
+          const displayAsk = isTrusted ? (liveAsk || liveBid!) : base
           return (
             <span className="mono" style={{ marginLeft: 8, fontSize: 12, color: 'var(--text-muted)' }}>
-              Bid: <span style={{ color: 'var(--color-sell)' }}>{(liveBid || indicators.currentPrice).toFixed(dp)}</span>
-              {' / '}
-              Ask: <span style={{ color: 'var(--color-buy)' }}>{(liveAsk || indicators.currentPrice).toFixed(dp)}</span>
+              {isTrusted ? 'Bid' : 'Price'}:
+              {' '}<span style={{ color: isTrusted ? 'var(--color-sell)' : 'var(--color-accent-dim)' }}>{displayBid.toFixed(dp)}</span>
+              {isTrusted && <>{' / '}Ask: <span style={{ color: 'var(--color-buy)' }}>{displayAsk.toFixed(dp)}</span></>}
             </span>
           )
         })()}
@@ -493,9 +499,12 @@ export default function AnalysisPage({
                 const riskAmt = (accountSize * strategy.riskPct / 100).toFixed(2)
                 const sign = rec.direction === 'BUY' ? 1 : -1
                 const dp = pair.includes('JPY') ? 3 : pair.startsWith('XA') ? 2 : 5
-                const entryPrice = rec.direction === 'BUY'
-                  ? (prices[pair]?.ask || prices[pair]?.bid || indicators.currentPrice)
-                  : (prices[pair]?.bid || indicators.currentPrice)
+                const feedBid = prices[pair]?.bid
+                const feedAsk = prices[pair]?.ask
+                const feedTrusted = feedBid && Math.abs(feedBid - indicators.currentPrice) / indicators.currentPrice < 0.02
+                const entryPrice = feedTrusted
+                  ? (rec.direction === 'BUY' ? (feedAsk || feedBid!) : feedBid!)
+                  : indicators.currentPrice
                 const tpPrice = (entryPrice + strategy.tpPips * pip * sign).toFixed(dp)
                 const slPrice = (entryPrice - strategy.slPips * pip * sign).toFixed(dp)
                 return (
