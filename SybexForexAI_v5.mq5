@@ -10,6 +10,7 @@
 input string WebhookToken     = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
 input int    SyncEverySeconds = 30;
 input int    CandleBars       = 200;
+input int    CandleBarsHTF    = 100;
 input int    MagicNumber      = 20260001;
 input int    SlippagePoints   = 10;
 input ENUM_ORDER_TYPE_FILLING FillMode = ORDER_FILLING_RETURN;
@@ -173,10 +174,10 @@ string BuildPricesJSON()
 }
 
 //+------------------------------------------------------------------+
-string BuildCandleArray(string symbol, int bars)
+string BuildCandleArray(string symbol, ENUM_TIMEFRAMES period, int bars)
 {
    MqlRates rates[];
-   int copied = CopyRates(symbol, PERIOD_M5, 0, bars, rates);
+   int copied = CopyRates(symbol, period, 0, bars, rates);
    if(copied <= 0) return "[]";
    int dp = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    string out = "[";
@@ -193,20 +194,30 @@ string BuildCandleArray(string symbol, int bars)
    return out + "]";
 }
 
-//+------------------------------------------------------------------+
-string BuildCandlesJSON()
+string BuildCandlesForTF(ENUM_TIMEFRAMES period, int bars)
 {
-   string data = "{";
+   string out = "{";
    bool first = true;
    for(int i = 0; i < g_totalSymbols; i++)
    {
-      string arr = BuildCandleArray(SYMBOLS[i], CandleBars);
+      string arr = BuildCandleArray(SYMBOLS[i], period, bars);
       if(arr == "[]") continue;
-      if(!first) data += ",";
-      data += "\"" + SYMBOLS[i] + "\":" + arr;
+      if(!first) out += ",";
+      out += "\"" + SYMBOLS[i] + "\":" + arr;
       first = false;
    }
-   return "{\"timeframe\":\"M5\",\"data\":" + data + "}}";
+   return out + "}";
+}
+
+//+------------------------------------------------------------------+
+string BuildCandlesJSON()
+{
+   return "{"
+      + "\"M5\":"   + BuildCandlesForTF(PERIOD_M5,  CandleBars)
+      + ",\"M15\":" + BuildCandlesForTF(PERIOD_M15, CandleBarsHTF)
+      + ",\"H1\":"  + BuildCandlesForTF(PERIOD_H1,  CandleBarsHTF)
+      + ",\"H4\":"  + BuildCandlesForTF(PERIOD_H4,  50)
+      + "}";
 }
 
 //+------------------------------------------------------------------+
