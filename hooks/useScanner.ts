@@ -9,6 +9,11 @@ import { getSupabase } from '@/lib/supabase'
 
 export type { ScanSignal }
 
+export interface ScanDiagnostic {
+  pair: string
+  blockedBy: string
+}
+
 export interface ScannerState {
   enabled: boolean
   scanning: boolean
@@ -16,6 +21,7 @@ export interface ScannerState {
   nextScanIn: number
   pendingSignals: ScanSignal[]
   rejectedIds: Set<string>
+  diagnostics: ScanDiagnostic[]
   error: string | null
 }
 
@@ -46,6 +52,7 @@ export function useScanner(
   const [lastScan, setLastScan] = useState<Date | null>(null)
   const [countdown, setCountdown] = useState(0)
   const [pendingSignals, setPendingSignals] = useState<ScanSignal[]>([])
+  const [diagnostics, setDiagnostics] = useState<ScanDiagnostic[]>([])
   const [error, setError] = useState<string | null>(null)
 
   const nextScanRef  = useRef<number>(0)
@@ -96,6 +103,7 @@ export function useScanner(
         return [...kept, ...newSignals]
       })
 
+      setDiagnostics(data.diagnostics || [])
       setLastScan(new Date())
       nextScanRef.current = scanInterval
     } catch (e: any) {
@@ -158,7 +166,7 @@ export function useScanner(
   return {
     enabled, setEnabled,
     scanning, lastScan, countdown,
-    pendingSignals, error,
+    pendingSignals, diagnostics, error,
     runScan, rejectSignal, clearAll,
     rejectedIds,
   }

@@ -155,6 +155,8 @@ function resolveDirection(
   return { direction: null, method: 'ema_macd' }
 }
 
+type ScanResult = { signal: ScanSignal; blockedBy: null } | { signal: null; blockedBy: string }
+
 async function scanPair(
   pair: string,
   timeframe: string,
@@ -162,8 +164,10 @@ async function scanPair(
   strategy: StrategySettings,
   context: { newsInWindow: boolean; openPositions: number; todayPL: number; accountBalance: number },
   cfg: ReturnType<typeof tfConfig>,
-): Promise<ScanSignal | null> {
-  if (!isIndexInSession(pair)) return null
+): Promise<ScanResult> {
+  const block = (reason: string): ScanResult => ({ signal: null, blockedBy: reason })
+
+  if (!isIndexInSession(pair)) return block('Market closed')
 
   // Metals session gate: London/NY sessions (05:00–18:59 UTC) have 0% win rate on XAU/USD
   // from 213 live signals. Best window: 19:00–04:00 UTC (Asian session / NY close).
@@ -171,7 +175,7 @@ async function scanPair(
     const utcHour = new Date().getUTCHours()
     if (utcHour >= 5 && utcHour < 19) {
       console.log(`[scan] ${pair}/${timeframe}: London/NY session (${utcHour}:xx UTC) — metals blocked (historical 0% win rate this window)`)
-      return null
+      return block(`London/NY session (${utcHour}:xx UTC) — best window 19:00–04:00 UTC`)
     }
   }
 
@@ -179,7 +183,7 @@ async function scanPair(
   const { candles, simulated } = await getCandles(authToken, pair, timeframe, 200)
   if (simulated) {
     console.log(`[scan] ${pair}/${timeframe}: simulated data — live feed required, skipping`)
-    return null
+    return block('No live data — MT5 EA offline')
   }
 
   // 2. Indicators
@@ -188,43 +192,43 @@ async function scanPair(
   // Metals ADX floor: ADX 20–24 has 6% win rate (91 losses). Require ADX ≥ 25.
   if (isMetals(pair) && indicators.adx < 25) {
     console.log(`[scan] ${pair}/${timeframe}: ADX ${indicators.adx.toFixed(1)} < 25 — metals need stronger trend`)
-    return null
+    return block(`ADX ${indicators.adx.toFixed(1)} < 25 — trend too weak`)
   }
 
   // 3. Direction resolution (EMA+MACD primary; RSI momentum fallback for metals)
   const { direction: resolvedDir, method: dirMethod } = resolveDirection(indicators, pair)
-  if (!resolvedDir) return null
+  if (!resolvedDir) return block('EMA/MACD conflict — no clear direction')
 
   const direction = resolvedDir
 
   // 4. RSI extreme guard (metals use wider thresholds — they trend at high RSI)
-  if (direction === 'BUY'  && indicators.rsi > cfg.rsiExtremeBuy)  return null
-  if (direction === 'SELL' && indicators.rsi < cfg.rsiExtremeSell) return null
+  if (direction === 'BUY'  && indicators.rsi > cfg.rsiExtremeBuy)  return block(`RSI ${indicators.rsi.toFixed(1)} overbought`)
+  if (direction === 'SELL' && indicators.rsi < cfg.rsiExtremeSell) return block(`RSI ${indicators.rsi.toFixed(1)} oversold`)
 
   // Metals RSI momentum gate: RSI 50–69 on BUY has 0% win rate (93 losses).
   // Only enter BUY on oversold momentum (RSI < 45), SELL on overbought (RSI > 55).
   if (isMetals(pair)) {
     if (direction === 'BUY'  && indicators.rsi > 45) {
       console.log(`[scan] ${pair}/${timeframe}: RSI ${indicators.rsi.toFixed(1)} > 45 on BUY — mid-range RSI has 0% win rate on metals`)
-      return null
+      return block(`RSI ${indicators.rsi.toFixed(1)} — BUY needs RSI < 45 (mid-range = 0% win rate)`)
     }
     if (direction === 'SELL' && indicators.rsi < 55) {
       console.log(`[scan] ${pair}/${timeframe}: RSI ${indicators.rsi.toFixed(1)} < 55 on SELL — mid-range RSI blocked`)
-      return null
+      return block(`RSI ${indicators.rsi.toFixed(1)} — SELL needs RSI > 55`)
     }
   }
 
   // 5. ATR guard
   const atrResult = calcATRIndicator(candles, pair)
   if (!cfg.skipAtrGuard) {
-    if (atrResult.suggestedSL > strategy.slPips * cfg.atrGuardMult) return null
+    if (atrResult.suggestedSL > strategy.slPips * cfg.atrGuardMult) return block('ATR too high for SL setting')
   } else if (isMetals(pair)) {
     // Metals ATR dwarfs FX pip baselines, but a SL inside 1x ATR gets stopped by noise alone.
     // suggestedSL = ATR_pips * 1.5, so ATR_pips = suggestedSL / 1.5
     const atrPips = atrResult.suggestedSL / 1.5
     if (strategy.slPips < atrPips) {
       console.log(`[scan] ${pair}/${timeframe}: SL ${strategy.slPips}p < ATR ${atrPips.toFixed(0)}p — blocked (widen SL to trade ${pair})`)
-      return null
+      return block(`SL ${strategy.slPips}p < ATR ${atrPips.toFixed(0)}p — widen SL`)
     }
   }
 
@@ -239,7 +243,7 @@ async function scanPair(
       htfConfirmed = htf.confirmed
     } else {
       // For non-metals: hard filter (not used since only metals are scanned, kept for safety)
-      if (!htf.confirmed) return null
+      if (!htf.confirmed) return block('HTF trend not confirmed')
       htfConfirmed = true
     }
   }
@@ -256,7 +260,7 @@ async function scanPair(
     maxLossPct:     strategy.maxLoss,
   })
   // Use our own per-config minimum, not the hardcoded canTrade threshold (which always requires 6)
-  if (checklist.passCount < cfg.minChecklistPass) return null
+  if (checklist.passCount < cfg.minChecklistPass) return block(`Checklist ${checklist.passCount}/${cfg.minChecklistPass} — need ${cfg.minChecklistPass} passes`)
 
   // 8. S/R room check — skipped for metals.
   // Metals are momentum/breakout assets; historical S/R is continuously broken in trending moves.
@@ -267,11 +271,11 @@ async function scanPair(
     const srResult = detectSupportResistance(candles, pair)
     if (direction === 'BUY' && srResult.nearestResistance) {
       const roomPips = (srResult.nearestResistance.price - indicators.currentPrice) / pip
-      if (roomPips < strategy.tpPips * 0.70) return null
+      if (roomPips < strategy.tpPips * 0.70) return block(`Resistance too close (${roomPips.toFixed(0)}p room, need ${(strategy.tpPips * 0.70).toFixed(0)}p)`)
     }
     if (direction === 'SELL' && srResult.nearestSupport) {
       const roomPips = (indicators.currentPrice - srResult.nearestSupport.price) / pip
-      if (roomPips < strategy.tpPips * 0.70) return null
+      if (roomPips < strategy.tpPips * 0.70) return block(`Support too close (${roomPips.toFixed(0)}p room, need ${(strategy.tpPips * 0.70).toFixed(0)}p)`)
     }
   }
 
@@ -352,7 +356,10 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
     }
   }
 
-  if (!rec || rec.direction === 'WAIT' || (rec.confidence ?? 0) < cfg.minConfidence) return null
+  if (!rec || rec.direction === 'WAIT' || (rec.confidence ?? 0) < cfg.minConfidence) {
+    const reason = !rec ? 'AI returned no signal' : rec.direction === 'WAIT' ? `AI says WAIT: ${rec.risk_note?.slice(0, 80) || 'no setup'}` : `Confidence ${rec.confidence}% < min ${cfg.minConfidence}%`
+    return block(reason)
+  }
 
   // Confidence adjustment: HTF boost/penalty
   let finalConfidence = rec.confidence as number
@@ -360,7 +367,7 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
   if (!htfConfirmed) finalConfidence = Math.max(cfg.minConfidence, finalConfidence - 8)
   if (dirMethod === 'rsi_momentum') finalConfidence = Math.max(cfg.minConfidence, finalConfidence - 5)
 
-  if (finalConfidence < cfg.minConfidence) return null
+  if (finalConfidence < cfg.minConfidence) return block(`Confidence ${finalConfidence}% < min ${cfg.minConfidence}% after adjustments`)
 
   // 10. Build signal
   const now      = new Date()
@@ -375,7 +382,7 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
   const mlScore = await queryML(indicators, pair, rec.direction, finalConfidence)
   if (mlScore && mlScore.win_probability < 0.40) {
     console.log(`[scan] ${pair}/${timeframe}: ML win_prob ${(mlScore.win_probability * 100).toFixed(0)}% < 40% — signal blocked`)
-    return null
+    return block(`ML model: ${(mlScore.win_probability * 100).toFixed(0)}% win probability < 40% threshold`)
   }
   if (mlScore && mlScore.win_probability < 0.55) {
     const penalty = Math.round((0.55 - mlScore.win_probability) * 40)
@@ -411,7 +418,7 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
     reasons: rec.reasons || [],
   })
 
-  return signal
+  return { signal, blockedBy: null }
 }
 
 export async function POST(req: NextRequest) {
@@ -438,14 +445,18 @@ export async function POST(req: NextRequest) {
     const settled = await Promise.allSettled(
       pairs.map(pair =>
         scanPair(pair, timeframe, authToken, strategy, context, tfConfig(timeframe, pair))
-          .catch(e => { console.error(`[scan] ${pair}:`, e?.message); return null })
+          .catch(e => { console.error(`[scan] ${pair}:`, e?.message); return { signal: null, blockedBy: `Error: ${e?.message}` } as ScanResult })
       )
     )
 
     const results: ScanSignal[] = []
-    for (const r of settled) {
-      if (r.status === 'fulfilled' && r.value) results.push(r.value)
-    }
+    const diagnostics: { pair: string; blockedBy: string }[] = []
+    settled.forEach((r, i) => {
+      if (r.status === 'fulfilled') {
+        if (r.value.signal) results.push(r.value.signal)
+        else if (r.value.blockedBy) diagnostics.push({ pair: pairs[i], blockedBy: r.value.blockedBy })
+      }
+    })
 
     if (results.length > 0) {
       await alertScanComplete({
@@ -457,6 +468,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       signals: results,
+      diagnostics,
       scannedAt: new Date().toISOString(),
       pairsScanned: pairs.length,
     })

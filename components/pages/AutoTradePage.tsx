@@ -6,7 +6,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { Panel, LoadingDots, CopyValue } from '../ui'
 import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { authFetch } from '@/lib/api'
-import type { ScanSignal } from '@/hooks/useScanner'
+import type { ScanSignal, ScanDiagnostic } from '@/hooks/useScanner'
 import type { StrategySettings } from '@/lib/supabase'
 
 const TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1H', '4H']
@@ -42,6 +42,7 @@ interface AutoTradePageProps {
     lastScan: Date | null
     countdown: number
     pendingSignals: ScanSignal[]
+    diagnostics?: ScanDiagnostic[]
     error: string | null
     runScan: () => void
     rejectSignal: (s: ScanSignal) => void
@@ -67,7 +68,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
 
   const accountBalance = account?.balance || 10000
 
-  const { enabled, setEnabled, scanning, lastScan, countdown, pendingSignals, error, runScan, rejectSignal, clearAll } = scanner
+  const { enabled, setEnabled, scanning, lastScan, countdown, pendingSignals, diagnostics = [], error, runScan, rejectSignal, clearAll } = scanner
 
   const loadOpenTrades = useCallback(async () => {
     if (!userId) return
@@ -435,15 +436,43 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
 
       {/* Empty state when enabled but no signals yet */}
       {enabled && !scanning && pendingSignals.length === 0 && lastScan && (
-        <div style={{
-          textAlign: 'center', padding: '40px 20px',
-          color: 'var(--text-muted)', fontSize: 13,
-        }}>
-          <div style={{ fontSize: 28, marginBottom: 12 }}>◎</div>
-          <div>No actionable signals found in this scan.</div>
-          <div style={{ fontSize: 12, marginTop: 6, color: 'var(--text-dim)' }}>
-            Next scan in <span className="mono" style={{ color: 'var(--color-accent)' }}>{fmtCountdown(countdown)}</span> — or hit ⟳ SCAN NOW
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+          <div style={{
+            textAlign: 'center', padding: '28px 20px 20px',
+            color: 'var(--text-muted)', fontSize: 13,
+          }}>
+            <div style={{ fontSize: 28, marginBottom: 10 }}>◎</div>
+            <div>No actionable signals — {diagnostics.length > 0 ? `${diagnostics.length} pair${diagnostics.length > 1 ? 's' : ''} scanned, all filtered` : 'no qualifying setups found'}.</div>
+            <div style={{ fontSize: 12, marginTop: 6, color: 'var(--text-dim)' }}>
+              Next scan in <span className="mono" style={{ color: 'var(--color-accent)' }}>{fmtCountdown(countdown)}</span> — or hit ⟳ SCAN NOW
+            </div>
           </div>
+
+          {diagnostics.length > 0 && (
+            <div style={{
+              margin: '0 0 4px', padding: '12px 16px',
+              background: 'rgba(0,0,0,0.15)', border: '1px solid rgba(255,255,255,0.07)',
+              borderRadius: 4,
+            }}>
+              <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 8, fontWeight: 700 }}>
+                SCAN FILTER LOG
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                {diagnostics.map((d, i) => (
+                  <div key={i} style={{
+                    display: 'flex', alignItems: 'baseline', gap: 10,
+                    fontSize: 12, lineHeight: 1.5,
+                  }}>
+                    <span style={{
+                      fontFamily: 'JetBrains Mono', fontSize: 11, fontWeight: 700,
+                      color: 'var(--color-accent-dim)', flexShrink: 0, minWidth: 70,
+                    }}>{d.pair}</span>
+                    <span style={{ color: 'var(--text-muted)' }}>{d.blockedBy}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
