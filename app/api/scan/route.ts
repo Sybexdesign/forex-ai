@@ -378,17 +378,10 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
   const slPrice  = +(indicators.currentPrice - strategy.slPips * pip * sign).toFixed(dp)
   const expiryMs = TF_EXPIRY_MS[timeframe] ?? 15 * 60_000
 
-  // ML gate: query XGBoost service, block if win probability < 40%
+  // ML score: advisory only until model accumulates sufficient WIN samples with
+  // complete indicator snapshots. Hard block disabled — score is attached to signal
+  // for display and will be re-enabled once model ROC-AUC > 0.70 on clean data.
   const mlScore = await queryML(indicators, pair, rec.direction, finalConfidence)
-  if (mlScore && mlScore.win_probability < 0.40) {
-    console.log(`[scan] ${pair}/${timeframe}: ML win_prob ${(mlScore.win_probability * 100).toFixed(0)}% < 40% — signal blocked`)
-    return block(`ML model: ${(mlScore.win_probability * 100).toFixed(0)}% win probability < 40% threshold`)
-  }
-  if (mlScore && mlScore.win_probability < 0.55) {
-    const penalty = Math.round((0.55 - mlScore.win_probability) * 40)
-    finalConfidence = Math.max(0, finalConfidence - penalty)
-    console.log(`[scan] ${pair}/${timeframe}: ML win_prob ${(mlScore.win_probability * 100).toFixed(0)}% — confidence reduced by ${penalty}`)
-  }
 
   const signal: ScanSignal = {
     id:            `scan-${pair.replace('/', '')}-${now.getTime()}`,
