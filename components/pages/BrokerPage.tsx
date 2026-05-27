@@ -280,8 +280,8 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                 <div style={{ marginBottom: 14 }}>
                   {/* Setup instructions */}
                   <div style={{ padding: '12px 14px', background: 'rgba(0,255,135,0.04)', border: '1px solid rgba(0,255,135,0.2)', borderRadius: 3, fontSize: 12, color: '#80d0a0', marginBottom: 12 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 8, color: '#00ff87' }}>EA v4 setup — direct Supabase sync (stable, no Vercel edge issues):</div>
-                    <div style={{ marginBottom: 5 }}>1. Save this broker config, then download <strong>SybexForexAI_EA_v4.mq5</strong> below</div>
+                    <div style={{ fontWeight: 700, marginBottom: 8, color: '#00ff87' }}>EA v5 setup — direct Supabase sync, multi-timeframe data:</div>
+                    <div style={{ marginBottom: 5 }}>1. Save this broker config, then download <strong>SybexForexAI_v5.mq5</strong> below</div>
                     <div style={{ marginBottom: 5 }}>2. In MT5: <strong>Tools → Options → Expert Advisors → Allow WebRequest</strong> → add the Supabase URL below</div>
                     <div style={{ marginBottom: 5 }}>3. Compile the EA in MetaEditor and attach to any chart</div>
                     <div>4. In EA Inputs, paste your <strong>Webhook Token</strong> — copy it below</div>
@@ -298,7 +298,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                   </div>
 
                   {/* Webhook token */}
-                  <label style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, display: 'block', marginBottom: 6 }}>WEBHOOK TOKEN (paste into EA v4 Inputs → WebhookToken)</label>
+                  <label style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, display: 'block', marginBottom: 6 }}>WEBHOOK TOKEN (paste into EA v5 Inputs → WebhookToken)</label>
                   <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
                     <input readOnly value={token} style={{ ...inputSt, flex: 1, fontSize: 13, color: '#00e5b4', letterSpacing: 1, fontFamily: 'monospace' }} />
                     <button
@@ -307,10 +307,10 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                     >Copy</button>
                   </div>
 
-                  {/* Download EA v4 */}
+                  {/* Download EA v5 */}
                   <a
-                    href="/SybexForexAI_EA_v4.mq5"
-                    download="SybexForexAI_EA_v4.mq5"
+                    href="/SybexForexAI_v5.mq5"
+                    download="SybexForexAI_v5.mq5"
                     style={{
                       display: 'inline-flex', alignItems: 'center', gap: 8,
                       background: 'rgba(0,229,180,0.12)', color: '#00e5b4',
@@ -319,10 +319,10 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                       textDecoration: 'none', letterSpacing: 0.3,
                     }}
                   >
-                    ↓ Download SybexForexAI_EA_v4.mq5
+                    ↓ Download SybexForexAI_v5.mq5
                   </a>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
-                    v4 posts directly to Supabase — bypasses Vercel edge, fixes the intermittent 403 issue
+                    v5 posts M5, M15, H1 &amp; H4 candles directly to Supabase — full multi-timeframe HTF confirmation
                   </div>
                 </div>
               )
