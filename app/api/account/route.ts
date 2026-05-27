@@ -37,7 +37,9 @@ export async function GET(req: NextRequest) {
 async function syncClosedTrades(token: string, brokerPositions: any[]) {
   try {
     // Decode user ID from JWT (sub claim) — no library needed
-    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString())
+    const parts = token.split('.')
+    if (parts.length < 3) return
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString())
     const userId = payload?.sub
     if (!userId) return
 

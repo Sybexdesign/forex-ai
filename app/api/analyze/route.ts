@@ -172,7 +172,11 @@ JSON format:
       })
       const text = message.content.find(b => b.type === 'text')?.text || '{}'
       const clean = text.replace(/```json|```/g, '').trim()
-      recommendation = JSON.parse(clean)
+      try {
+        recommendation = JSON.parse(clean)
+      } catch {
+        recommendation = generateDemoRecommendation(indicators, checklist, direction, pair, strategy)
+      }
     }
 
     // Save signal to Supabase
