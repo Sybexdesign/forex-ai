@@ -172,10 +172,16 @@ def main():
         tp = (price + atr * 2.5) if direction == 'BUY' else (price - atr * 2.5)
 
         try:
-            dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+            # Strip timezone offset and sub-second precision — Py 3.9 fromisoformat
+            # rejects +00:00 offsets and non-6-digit microseconds.
+            import re as _re
+            ts = _re.sub(r'\.\d+', '', created)   # remove fractional seconds
+            ts = _re.sub(r'[+-]\d{2}:\d{2}$', '', ts)  # remove tz offset
+            ts = ts.replace('Z', '').strip()
+            dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
             after_epoch = int(dt.timestamp())
-        except ValueError:
-            print(f'{prefix} skipped — bad timestamp')
+        except (ValueError, TypeError):
+            print(f'{prefix} skipped — bad timestamp ({created!r})')
             skipped += 1
             continue
 
