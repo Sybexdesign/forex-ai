@@ -30,6 +30,33 @@ START_DATE  = '2010-01-01'
 TRAIN_RATIO = 0.80
 MAX_FFILL   = 3   # max consecutive days to forward-fill (weekends / holidays)
 
+DATA_DIR    = os.path.join(os.path.dirname(__file__), 'data')
+CACHE_TTL_H = 24  # hours before re-downloading from yfinance
+
+
+def _cache_path(metal: str) -> str:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    return os.path.join(DATA_DIR, f'{metal}_raw.csv')
+
+
+def _cache_valid(metal: str) -> bool:
+    import time as _time
+    path = _cache_path(metal)
+    if not os.path.exists(path):
+        return False
+    age_h = (_time.time() - os.path.getmtime(path)) / 3600
+    return age_h < CACHE_TTL_H
+
+
+def _save_cache(metal: str, df: pd.DataFrame) -> None:
+    df.to_csv(_cache_path(metal))
+
+
+def _load_cache(metal: str) -> pd.DataFrame:
+    df = pd.read_csv(_cache_path(metal), index_col='Date', parse_dates=True)
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    return df
+
 
 # ─── 1. yfinance download ─────────────────────────────────────────────────────
 
@@ -41,6 +68,11 @@ def _fetch_yfinance(start: str) -> dict:
 
     import time
 
+    # Return cached data if it's fresh enough
+    if _cache_valid('gold') and _cache_valid('silver'):
+        print("  ✓  Loading from local cache (< 24h old)")
+        return {'gold': _load_cache('gold'), 'silver': _load_cache('silver')}
+
     ALL_SYMS    = ['GC=F', 'SI=F', 'GLD', 'SLV']
     SYM_META    = {
         'GC=F': ('gold',   'futures'),
@@ -48,8 +80,8 @@ def _fetch_yfinance(start: str) -> dict:
         'GLD':  ('gold',   'etf'),
         'SLV':  ('silver', 'etf'),
     }
-    MAX_RETRIES = 3
-    RETRY_WAIT  = 15   # seconds between retries on rate-limit
+    MAX_RETRIES = 5
+    RETRY_WAIT  = 30   # seconds between retries on rate-limit
 
     # Download all four tickers in a single batch request (fewer round-trips)
     print(f"  yfinance ▸ batch download: {', '.join(ALL_SYMS)}")
@@ -68,12 +100,12 @@ def _fetch_yfinance(start: str) -> dict:
             print(f"    ⚠  Rate-limited or empty — waiting {RETRY_WAIT}s (attempt {attempt}/{MAX_RETRIES})")
             time.sleep(RETRY_WAIT)
     else:
-        print("    ✗  yfinance batch failed after retries — returning empty")
-        return {'gold': pd.DataFrame(), 'silver': pd.DataFrame()}
+        print("    ✗  yfinance batch failed after retries — will try FRED fallback")
+        raw_all = None
 
     buckets: dict = {'gold': {}, 'silver': {}}
 
-    for sym in ALL_SYMS:
+    for sym in (ALL_SYMS if raw_all is not None else []):
         metal, kind = SYM_META[sym]
         try:
             if sym in raw_all.columns.get_level_values(0):
@@ -110,7 +142,83 @@ def _fetch_yfinance(start: str) -> dict:
                 primary.update(etf.reindex(missing))
         result[metal] = primary
 
+    # Persist to cache so re-runs skip the download while rate-limit is active
+    for metal, df in result.items():
+        if not df.empty:
+            _save_cache(metal, df)
+            print(f"  ✓  {metal} cached → ml/data/{metal}_raw.csv")
+
+    # If yfinance failed entirely, fall back to FRED (no API key, no rate limit)
+    if result['gold'].empty or result['silver'].empty:
+        print("  ℹ  yfinance unavailable — falling back to FRED spot prices")
+        fred = _fetch_fred(start)
+        for metal in ('gold', 'silver'):
+            if result[metal].empty and not fred.get(metal, pd.DataFrame()).empty:
+                result[metal] = fred[metal]
+                _save_cache(metal, result[metal])
+                print(f"  ✓  {metal} seeded from FRED → ml/data/{metal}_raw.csv")
+
     return result   # {'gold': df, 'silver': df}
+
+
+def _fetch_fred(start: str) -> dict:
+    """
+    Pull gold & silver futures from Stooq (no API key, no rate limit).
+    GC.F = Gold futures, SI.F = Silver futures.
+    Falls back to FRED spot prices (London PM fix) if Stooq fails.
+    """
+    try:
+        from pandas_datareader import data as pdr
+    except ImportError:
+        print("    pip install pandas-datareader  to enable fallback")
+        return {}
+
+    result = {}
+
+    # ── Try Stooq first (OHLCV futures, no auth required)
+    STOOQ_MAP = {'gold': 'GC.F', 'silver': 'SI.F'}
+    for metal, sym in STOOQ_MAP.items():
+        try:
+            print(f"  Stooq ▸ {sym}  ({metal} futures)")
+            df = pdr.DataReader(sym, 'stooq', start=start)
+            df.sort_index(inplace=True)
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            df.index.name = 'Date'
+            df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+            df = df.dropna(how='all')
+            if df.empty:
+                raise ValueError("empty result")
+            print(f"    ✓  {len(df):,} rows  ({df.index[0].date()} → {df.index[-1].date()})")
+            result[metal] = df
+        except Exception as exc:
+            print(f"    ⚠  Stooq {sym} failed: {str(exc)[:80]}")
+
+    # ── FRED CSV fallback for any metals Stooq missed
+    FRED_CSV = {
+        'gold':   'https://fred.stlouisfed.org/graph/fredgraph.csv?id=GOLDAMGBD228NLBM',
+        'silver': 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=SLVPRUSD',
+    }
+    for metal, url in FRED_CSV.items():
+        if metal in result:
+            continue
+        try:
+            import requests as _req
+            print(f"  FRED CSV ▸ {metal} spot price")
+            resp = _req.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+            resp.raise_for_status()
+            from io import StringIO
+            s = pd.read_csv(StringIO(resp.text), index_col=0, parse_dates=True).squeeze()
+            s = pd.to_numeric(s, errors='coerce').dropna()
+            s = s[s.index >= pd.Timestamp(start)]
+            df = pd.DataFrame({'Open': s, 'High': s, 'Low': s, 'Close': s, 'Volume': 0.0})
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            df.index.name = 'Date'
+            print(f"    ✓  {len(df):,} rows  ({df.index[0].date()} → {df.index[-1].date()})")
+            result[metal] = df
+        except Exception as exc:
+            print(f"    ⚠  FRED CSV {metal} failed: {str(exc)[:80]}")
+
+    return result
 
 
 # ─── 2. Alpha Vantage download ────────────────────────────────────────────────
@@ -120,6 +228,8 @@ def _fetch_alpha_vantage(av_key: str) -> dict:
         from alpha_vantage.timeseries import TimeSeries
     except ImportError:
         raise ImportError("Missing dependency — run:  pip install alpha_vantage")
+
+    import time
 
     AV_COL_MAP = {
         '1. open':   'Open',
@@ -133,16 +243,29 @@ def _fetch_alpha_vantage(av_key: str) -> dict:
     result: dict = {}
 
     for metal, symbol in (('gold', 'GLD'), ('silver', 'SLV')):
-        print(f"  alpha_vantage ▸ {symbol}  ({metal} ETF, full history)")
-        try:
-            df, _ = ts.get_daily(symbol=symbol, outputsize='full')
-            df = df.rename(columns=AV_COL_MAP)[list(AV_COL_MAP.values())].astype(float)
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-            df.index.name = 'Date'
-            df.sort_index(inplace=True)
-            result[metal] = df
-        except Exception as exc:
-            print(f"    ⚠  Alpha Vantage {symbol} failed: {exc}")
+        # Free tier: outputsize='full' is premium-only — use compact (100 days)
+        # and fall back to compact if full is rejected
+        for outputsize in ('full', 'compact'):
+            label = 'full history' if outputsize == 'full' else 'last 100 days (free tier)'
+            print(f"  alpha_vantage ▸ {symbol}  ({metal} ETF, {label})")
+            try:
+                df, _ = ts.get_daily(symbol=symbol, outputsize=outputsize)
+                df = df.rename(columns=AV_COL_MAP)[list(AV_COL_MAP.values())].astype(float)
+                df.index = pd.to_datetime(df.index).tz_localize(None)
+                df.index.name = 'Date'
+                df.sort_index(inplace=True)
+                print(f"    ✓  {len(df)} rows  ({df.index[0].date()} → {df.index[-1].date()})")
+                result[metal] = df
+                break
+            except Exception as exc:
+                msg = str(exc)
+                if 'premium' in msg.lower() and outputsize == 'full':
+                    print(f"    ℹ  full history is premium — retrying with compact")
+                    time.sleep(12)   # free tier: 5 req/min → 1 per 12s
+                    continue
+                print(f"    ⚠  {symbol} ({outputsize}) failed: {msg[:120]}")
+                break
+        time.sleep(12)   # stay within free-tier rate limit between symbols
 
     return result   # {'gold': df, 'silver': df}  (partial if some failed)
 
@@ -329,6 +452,13 @@ def build_splits(
     combined.dropna(inplace=True)
     print(f"  Dropped {before_drop - len(combined):,} NaN rows from rolling/lag periods "
           f"→ {len(combined):,} usable rows")
+
+    # Need at least 205 rows per asset (200-day SMA + 5-day lag) before any are usable
+    if len(combined) < 10:
+        print("\n  ✗  Insufficient data after rolling/lag NaN removal.")
+        print("     yfinance may be rate-limited — data is cached once a successful")
+        print("     download completes.  Re-run in a few minutes to retry.\n")
+        sys.exit(1)
 
     feature_cols = [c for c in combined.columns
                     if c not in _EXCLUDE and not c.startswith('_')]
