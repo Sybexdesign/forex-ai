@@ -107,6 +107,7 @@ def extract_features(req: PredictRequest) -> dict:
         'price_vs_ema20':     (price - (ind.get('ema20', price) or price)) / price if price > 0 else 0,
         'confidence':         req.confidence or 50,
         'direction_buy':      1 if req.direction == 'BUY' else 0,
+        'in_session':         1 if (hour < 5 or hour >= 19) else 0,
     }
 
     # One-hot pair encoding — same fixed set as train.py

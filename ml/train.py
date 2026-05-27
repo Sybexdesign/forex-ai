@@ -11,6 +11,7 @@ from sklearn.metrics import classification_report, roc_auc_score, accuracy_score
 from supabase import create_client
 from dotenv import load_dotenv
 
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env.local'))
 load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -55,47 +56,26 @@ while True:
 
 print(f"✓ Total rows with WIN/LOSS outcome: {len(all_rows)}")
 
-# ─── Apply the same filters used in scan/route.ts ────────────────────────────
-# Training on bad signals teaches the model to approve them.
-# Mirror the three data-driven gates added after win-rate analysis.
-
+# Train on all historical WIN/LOSS data — the scan route's pre-filters (session
+# gate, ADX floor, RSI gate) already stop bad signals reaching the model at
+# inference time. Training on the full dataset gives the model enough samples
+# to learn what WIN vs LOSS looks like across all conditions.
 from datetime import datetime, timezone
 
-def passes_scan_filters(row: dict) -> bool:
-    pair      = row.get('pair', '')
-    direction = row.get('direction', '')
-    snap      = row.get('indicator_snapshot') or {}
-    is_metals = pair.startswith('XA')
-
-    if not is_metals:
-        return True  # FX pairs: no session/RSI gate yet
-
-    # Session gate: 05:00–18:59 UTC had 0% win rate on metals
+def add_session_feature(row: dict) -> dict:
+    """Add hour_utc and is_session_active features derived from created_at."""
     try:
         dt   = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
         hour = dt.astimezone(timezone.utc).hour
-        if 5 <= hour < 19:
-            return False
+        row['_hour']   = hour
+        row['_in_session'] = 1 if (hour < 5 or hour >= 19) else 0  # active = 19-04 UTC
     except Exception:
-        pass
+        row['_hour']   = 12
+        row['_in_session'] = 0
+    return row
 
-    # ADX floor: ADX 20–24 had 6% win rate (91 losses)
-    adx = float(snap.get('adx') or 0)
-    if adx > 0 and adx < 25:
-        return False
-
-    # RSI gate: RSI 50–69 on BUY had 0% win rate (93 losses)
-    rsi = float(snap.get('rsi') or snap.get('rsi14') or 50)
-    if direction == 'BUY'  and rsi > 45:
-        return False
-    if direction == 'SELL' and rsi < 55:
-        return False
-
-    return True
-
-before = len(all_rows)
-all_rows = [r for r in all_rows if passes_scan_filters(r)]
-print(f"✓ After scan filters: {len(all_rows)} rows kept, {before - len(all_rows)} removed")
+all_rows = [add_session_feature(r) for r in all_rows]
+print(f"✓ Using all {len(all_rows)} rows for training (no pre-filtering)")
 
 MIN_ROWS = 20
 if len(all_rows) < MIN_ROWS:
@@ -167,6 +147,7 @@ def extract_features(row):
         'price_vs_ema20':     (price - (snap.get('ema20', price) or price)) / price if price > 0 else 0,
         'confidence':         row.get('confidence', 50) or 50,
         'direction_buy':      1 if row.get('direction') == 'BUY' else 0,
+        'in_session':         row.get('_in_session', 0),
     }
 
 
@@ -197,14 +178,24 @@ y          = y[mask.values]
 feature_names = list(feature_df.columns)
 X = feature_df.values
 
+n_wins  = int(y.sum())
+n_loss  = int(len(y) - n_wins)
+spw     = max(1.0, n_loss / n_wins) if n_wins > 0 else 1.0
+
 print(f"✓ Features: {len(feature_names)} columns, {len(X)} samples")
-print(f"  Win rate in data: {y.mean():.1%}")
+print(f"  WIN: {n_wins}  LOSS: {n_loss}  win_rate={y.mean():.1%}  scale_pos_weight={spw:.1f}")
 
 # ─── Train / test split ───────────────────────────────────────────────────────
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=42
-)
+# With small WIN counts, put all WINs in train to avoid empty test class
+if n_wins < 10:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.15, stratify=y, random_state=42
+    )
+else:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
 print(f"\n📊 Train: {len(X_train)} | Test: {len(X_test)}")
 
 # ─── Train XGBoost ────────────────────────────────────────────────────────────
@@ -212,13 +203,14 @@ print(f"\n📊 Train: {len(X_train)} | Test: {len(X_test)}")
 print("\n🧠 Training XGBoost...")
 
 model = xgb.XGBClassifier(
-    n_estimators=200,
-    max_depth=5,
-    learning_rate=0.08,
+    n_estimators=300,
+    max_depth=4,
+    learning_rate=0.05,
     subsample=0.8,
     colsample_bytree=0.8,
-    min_child_weight=3,
-    eval_metric='logloss',
+    min_child_weight=2,
+    scale_pos_weight=spw,   # compensates for WIN/LOSS imbalance
+    eval_metric='aucpr',    # area under precision-recall — better for imbalanced data
     random_state=42,
 )
 
