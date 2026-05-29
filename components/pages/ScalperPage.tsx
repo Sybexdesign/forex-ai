@@ -27,8 +27,11 @@ interface TickData {
 
 interface Signal {
   direction: TradeDirection; confidence: number; reasons: string[]
-  entry: number; sl: number; tp: number; risk_note?: string; fallback?: boolean
-  strategy: string; timestamp: number
+  entry: number; sl: number; tp: number
+  tp1?: number; tp2?: number; tp3?: number
+  slDist?: number  // price distance used for trailing calc
+  risk_note?: string; fallback?: boolean
+  strategy: string; timestamp: number; expiresAt?: number
 }
 
 interface MlData {
@@ -46,9 +49,12 @@ interface RiskCheck {
 interface ScalperTrade {
   id: string; pair: string; direction: TradeDirection
   entry: number; sl: number; tp: number
+  tp1?: number; tp2?: number; tp3?: number
+  slDist?: number  // original SL distance, used for trailing
+  partialsClosed?: 0 | 1 | 2  // 0=none, 1=TP1 hit, 2=TP2 hit
   confidence: number; strategy: string; openTime: string
   closeTime?: string; closePrice?: number; pnl: number
-  result?: 'TP' | 'SL'; mode: Mode
+  result?: 'TP1' | 'TP2' | 'TP3' | 'SL' | 'REV'; mode: Mode
 }
 
 interface LogEntry {
@@ -97,8 +103,15 @@ const SCALPER_PAIRS = ['XAU/USD', 'XAG/USD']
 const TIMEFRAMES    = ['1m', '3m', '5m', '15m']
 const STRATEGIES    = ['Momentum', 'Mean Reversion', 'Breakout', 'Order Flow']
 const TICK_INTERVAL   = 10_000
-const SIGNAL_EVERY    = 3
+const SIGNAL_EVERY    = 3          // signal cadence when a trade is open
 const DAILY_INTERVAL  = 60_000
+const ATR_HISTORY_LEN = 100        // ATR readings kept for volatility percentile
+
+const TIMEFRAME_MS: Record<string, number> = {
+  '1m': 60_000, '3m': 180_000, '5m': 300_000, '15m': 900_000,
+}
+
+const REVERSAL_CONF_BONUS = 15     // confidence above dynamic threshold required to reverse
 
 const C = {
   green: '#00ff87', greenDim: 'rgba(0,255,135,0.12)', greenBorder: 'rgba(0,255,135,0.3)',
@@ -111,16 +124,74 @@ const C = {
 function dp(pair: string) { return pair.includes('JPY') ? 3 : pair.startsWith('XA') ? 2 : 5 }
 function pipSize(pair: string) { return pair.includes('JPY') ? 0.01 : pair.startsWith('XAU') ? 0.1 : pair.startsWith('XAG') ? 0.01 : 0.0001 }
 
+// Max SL price-distance cap to prevent ATR spikes blowing risk limits
+function maxSlDist(pair: string): number {
+  if (pair.startsWith('XAU')) return 80 * 0.1
+  if (pair.startsWith('XAG')) return 60 * 0.01
+  if (pair.includes('JPY'))   return 50 * 0.01
+  return 40 * 0.0001
+}
+
+// Classify ATR percentile rank against rolling history
+function calcVolatilityRegime(atr: number, history: number[]): 'LOW' | 'MEDIUM' | 'HIGH' {
+  if (history.length < 5) return 'MEDIUM'
+  const sorted = [...history].sort((a, b) => a - b)
+  const rank   = sorted.filter(v => v <= atr).length / sorted.length
+  return rank < 0.33 ? 'LOW' : rank < 0.67 ? 'MEDIUM' : 'HIGH'
+}
+
+// SL multiplier driven entirely by current volatility regime
+function slMultiplier(regime: 'LOW' | 'MEDIUM' | 'HIGH'): number {
+  return regime === 'LOW' ? 1.2 : regime === 'MEDIUM' ? 1.5 : 2.0
+}
+
+// Dynamic RR ratios: TP2 scales with confidence, TP3 extends further
+function rrRatios(confidence: number): [number, number, number] {
+  const rr1 = 1.0
+  const rr2 = Math.max(1.2, 1 + (confidence / 100 - 0.5) * 4)
+  const rr3 = Math.max(rr2 * 1.5, 3.0)
+  return [rr1, rr2, rr3]
+}
+
+// Compute all levels from live ATR + volatility regime + confidence
+interface DynamicLevels { sl: number; tp: number; tp1: number; tp2: number; tp3: number; slDist: number }
+function calcDynamicLevels(
+  direction: TradeDirection, entry: number, atr: number,
+  confidence: number, pair: string, regime: 'LOW' | 'MEDIUM' | 'HIGH',
+): DynamicLevels {
+  const slDist  = Math.min(atr * slMultiplier(regime), maxSlDist(pair))
+  const [r1, r2, r3] = rrRatios(confidence)
+  const sign = direction === 'BUY' ? 1 : -1
+  return {
+    slDist,
+    sl:  entry - sign * slDist,
+    tp1: entry + sign * slDist * r1,
+    tp2: entry + sign * slDist * r2,
+    tp3: entry + sign * slDist * r3,
+    tp:  entry + sign * slDist * r3,  // tp = TP3 (full target)
+  }
+}
+
+// Dynamic min confidence from rolling win rate
+function dynamicMinConf(wins: number, total: number): number {
+  if (total < 5) return 60
+  const wr = wins / total
+  if (wr > 0.60) return 55
+  if (wr < 0.35) return 80
+  if (wr < 0.45) return 70
+  return 60
+}
+
 // ─── Risk gate ────────────────────────────────────────────────────────────────
 
-const RISK_CFG = { maxRiskPct: 1, maxDailyLossPct: 3, maxOpenTrades: 3, minConfidence: 70, slMult: 1.5, tpMult: 2.5 }
+const RISK_CFG = { maxRiskPct: 1, maxDailyLossPct: 3, maxOpenTrades: 3 }
 
-function checkRisk(sig: Signal | null, balance: number, dailyPnL: number, openCount: number): RiskCheck {
+function checkRisk(sig: Signal | null, balance: number, dailyPnL: number, openCount: number, minConf: number): RiskCheck {
   const checks: { label: string; ok: boolean }[] = []
   let passed = true
 
   const riskAmt = balance * RISK_CFG.maxRiskPct / 100
-  const riskOk  = balance > 0  // balance 0 = can't size a trade
+  const riskOk  = balance > 0
   if (!riskOk) passed = false
   checks.push({ label: `Risk ≤ ${RISK_CFG.maxRiskPct}% ($${riskAmt.toFixed(0)})`, ok: riskOk })
 
@@ -132,9 +203,9 @@ function checkRisk(sig: Signal | null, balance: number, dailyPnL: number, openCo
   else checks.push({ label: `${openCount}/${RISK_CFG.maxOpenTrades} open`, ok: true })
 
   if (!sig || sig.direction === 'HOLD') { checks.push({ label: 'No signal (HOLD)', ok: false }); passed = false }
-  else if (sig.confidence < RISK_CFG.minConfidence) {
-    checks.push({ label: `Confidence ${sig.confidence}% < ${RISK_CFG.minConfidence}%`, ok: false }); passed = false
-  } else checks.push({ label: `Confidence: ${sig.confidence}%`, ok: true })
+  else if (sig.confidence < minConf) {
+    checks.push({ label: `Confidence ${sig.confidence}% < ${minConf}% (dynamic)`, ok: false }); passed = false
+  } else checks.push({ label: `Confidence ${sig.confidence}% ≥ ${minConf}%`, ok: true })
 
   return { passed, checks }
 }
@@ -176,8 +247,10 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
   const [retraining, setRetraining]           = useState(false)
   const dailyIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  const [priceHistory, setPriceHistory] = useState<number[]>([])
-  const [rsiHistory, setRsiHistory]     = useState<number[]>([])
+  const [priceHistory, setPriceHistory]         = useState<number[]>([])
+  const [rsiHistory, setRsiHistory]             = useState<number[]>([])
+  const [atrHistory, setAtrHistory]             = useState<number[]>([])
+  const [volatilityRegime, setVolatilityRegime] = useState<'LOW'|'MEDIUM'|'HIGH'>('MEDIUM')
 
   const [openTrades, setOpenTrades]   = useState<ScalperTrade[]>([])
   const [closedTrades, setClosedTrades] = useState<ScalperTrade[]>([])
@@ -194,24 +267,32 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
   const latestTickRef = useRef<() => Promise<void>>(async () => {})
 
   // Refs for volatile state — avoids stale closures in tick/fetchSignal
-  const signalRef     = useRef<Signal | null>(null)
-  const balanceRef    = useRef(balance)
-  const dailyPnLRef   = useRef(dailyPnL)
-  const openTradesRef = useRef<ScalperTrade[]>([])
-  const modeRef       = useRef<Mode>('PAPER')
-  const pairRef       = useRef(pair)
-  const strategyRef   = useRef(activeStrategy)
-  const decimalsRef   = useRef(dp(pair))
+  const signalRef          = useRef<Signal | null>(null)
+  const balanceRef         = useRef(balance)
+  const dailyPnLRef        = useRef(dailyPnL)
+  const openTradesRef      = useRef<ScalperTrade[]>([])
+  const modeRef            = useRef<Mode>('PAPER')
+  const pairRef            = useRef(pair)
+  const strategyRef        = useRef(activeStrategy)
+  const decimalsRef        = useRef(dp(pair))
+  const atrHistoryRef      = useRef<number[]>([])
+  const volatilityRef      = useRef<'LOW'|'MEDIUM'|'HIGH'>('MEDIUM')
+  const winCountRef        = useRef(winCount)
+  const tradeCountRef      = useRef(tradeCount)
 
   useEffect(() => { signalRef.current     = signal },      [signal])
   useEffect(() => { balanceRef.current    = balance },     [balance])
   useEffect(() => { dailyPnLRef.current   = dailyPnL },   [dailyPnL])
   useEffect(() => { openTradesRef.current = openTrades },  [openTrades])
-  useEffect(() => { modeRef.current       = mode },                          [mode])
+  useEffect(() => { modeRef.current       = mode },        [mode])
   useEffect(() => { pairRef.current       = pair; decimalsRef.current = dp(pair) }, [pair])
-  useEffect(() => { strategyRef.current   = activeStrategy },               [activeStrategy])
+  useEffect(() => { strategyRef.current   = activeStrategy },            [activeStrategy])
+  useEffect(() => { atrHistoryRef.current = atrHistory },  [atrHistory])
+  useEffect(() => { volatilityRef.current = volatilityRegime }, [volatilityRegime])
+  useEffect(() => { winCountRef.current   = winCount },    [winCount])
+  useEffect(() => { tradeCountRef.current = tradeCount },  [tradeCount])
   const timeframeRef = useRef(timeframe)
-  useEffect(() => { timeframeRef.current  = timeframe },                    [timeframe])
+  useEffect(() => { timeframeRef.current  = timeframe },   [timeframe])
 
   const decimals = dp(pair)
 
@@ -267,34 +348,71 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
   // ── Reset on pair change ──────────────────────────────────────────────────
   useEffect(() => {
     setTickData(null); setSignal(null); setRiskResult(null)
-    setPriceHistory([]); setRsiHistory([])
+    setPriceHistory([]); setRsiHistory([]); setAtrHistory([]); setVolatilityRegime('MEDIUM')
+    atrHistoryRef.current = []; volatilityRef.current = 'MEDIUM'
     setOpenTrades([]); setBrokerConn('idle'); setAiConn('idle')
     tickCountRef.current = 0; setTickCount(0); setIsFetching(false)
     addLog(`Switched to ${pair}`, 'system')
   }, [pair]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Monitor paper trades for SL/TP on each tick ──────────────────────────
+  // ── Monitor paper trades — multi-TP partial close + trailing stop ─────────
   const monitorTrades = useCallback((price: number) => {
+    const pnlPerPriceUnit = pair.startsWith('XAU') ? 100 : pair.includes('JPY') ? 1000 : 100000
+    const logTime = () => new Date().toLocaleTimeString('en', { hour12: false })
+
     setOpenTrades(prev => {
       const stillOpen: ScalperTrade[] = []
       const nowClosed: ScalperTrade[] = []
 
       prev.forEach(t => {
-        let hit: 'SL' | 'TP' | null = null
-        if (t.direction === 'BUY')  { if (price <= t.sl) hit = 'SL'; else if (price >= t.tp) hit = 'TP' }
-        else                        { if (price >= t.sl) hit = 'SL'; else if (price <= t.tp) hit = 'TP' }
+        const isBuy = t.direction === 'BUY'
 
-        if (hit) {
-          const rawPnl = t.direction === 'BUY' ? price - t.entry : t.entry - price
-          const pnlUsd = pair.startsWith('XAU') ? rawPnl * 100 : pair.includes('JPY') ? rawPnl * 1000 : rawPnl * 100000
-          const closed = { ...t, closePrice: price, closeTime: new Date().toLocaleTimeString('en', { hour12: false }), pnl: pnlUsd, result: hit }
+        // SL hit (hard close — all remaining units)
+        if ((isBuy && price <= t.sl) || (!isBuy && price >= t.sl)) {
+          const rawPnl = (isBuy ? price - t.entry : t.entry - price) * pnlPerPriceUnit
+          const partial = t.partialsClosed ?? 0
+          const portion = partial === 0 ? 1 : partial === 1 ? 0.67 : 0.34
+          const pnlUsd  = rawPnl * portion
+          const closed  = { ...t, closePrice: price, closeTime: logTime(), pnl: pnlUsd, result: 'SL' as const }
           nowClosed.push(closed)
-          addLog(`Closed ${t.pair} ${t.direction} → ${hit} | P&L: $${pnlUsd.toFixed(2)}`, pnlUsd >= 0 ? 'win' : 'loss')
-          setDailyPnL(d => d + pnlUsd)
-          setTradeCount(c => c + 1)
+          addLog(`SL hit ${t.pair} ${t.direction} @ ${price} | P&L: $${pnlUsd.toFixed(2)}`, pnlUsd >= 0 ? 'win' : 'loss')
+          setDailyPnL(d => d + pnlUsd); setTradeCount(c => c + 1)
           if (pnlUsd > 0) setWinCount(w => w + 1)
           setBalance(b => b + pnlUsd)
-        } else stillOpen.push(t)
+          return
+        }
+
+        // TP3 (full close of remaining 34%)
+        if (t.tp3 !== undefined && ((isBuy && price >= t.tp3) || (!isBuy && price <= t.tp3))) {
+          const rawPnl = (isBuy ? t.tp3 - t.entry : t.entry - t.tp3) * pnlPerPriceUnit * 0.34
+          nowClosed.push({ ...t, closePrice: t.tp3, closeTime: logTime(), pnl: rawPnl, result: 'TP3' as const })
+          addLog(`TP3 ${t.pair} ${t.direction} | P&L: $${rawPnl.toFixed(2)}`, 'win')
+          setDailyPnL(d => d + rawPnl); setTradeCount(c => c + 1); setWinCount(w => w + 1); setBalance(b => b + rawPnl)
+          return
+        }
+
+        // TP2 hit (partial — close 33%, trail SL to TP1)
+        if (t.tp2 !== undefined && (t.partialsClosed ?? 0) < 2 && (t.partialsClosed ?? 0) >= 1
+          && ((isBuy && price >= t.tp2) || (!isBuy && price <= t.tp2))) {
+          const rawPnl = (isBuy ? t.tp2 - t.entry : t.entry - t.tp2) * pnlPerPriceUnit * 0.33
+          addLog(`TP2 partial ${t.pair} | +$${rawPnl.toFixed(2)} — trailing SL to TP1`, 'win')
+          setDailyPnL(d => d + rawPnl); setBalance(b => b + rawPnl)
+          const newSl = t.tp1 ?? t.entry  // trail SL to TP1 level
+          stillOpen.push({ ...t, partialsClosed: 2, sl: newSl })
+          return
+        }
+
+        // TP1 hit (partial — close 33%, move SL to breakeven)
+        if (t.tp1 !== undefined && (t.partialsClosed ?? 0) < 1
+          && ((isBuy && price >= t.tp1) || (!isBuy && price <= t.tp1))) {
+          const rawPnl = (isBuy ? t.tp1 - t.entry : t.entry - t.tp1) * pnlPerPriceUnit * 0.33
+          addLog(`TP1 partial ${t.pair} | +$${rawPnl.toFixed(2)} — SL moved to breakeven`, 'win')
+          setDailyPnL(d => d + rawPnl); setBalance(b => b + rawPnl)
+          stillOpen.push({ ...t, partialsClosed: 1, sl: t.entry })
+          return
+        }
+
+        stillOpen.push(t)
       })
 
       if (nowClosed.length) setClosedTrades(p => [...nowClosed, ...p].slice(0, 50))
@@ -302,12 +420,14 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
     })
   }, [pair, addLog])
 
-  // ── Fetch signal from API ────────────────────────────────────────────────
-  // Note: reads volatile state from refs to avoid stale closures
+  // ── Fetch signal — dynamic levels, expiry, instant reversal ─────────────
   const fetchSignal = useCallback(async (tick: TickData) => {
     const currentPair     = pairRef.current
     const currentStrategy = strategyRef.current
     const currentDecimals = decimalsRef.current
+    const currentTF       = timeframeRef.current
+    const regime          = volatilityRef.current
+    const minConf         = dynamicMinConf(winCountRef.current, tradeCountRef.current)
 
     try {
       const data = await authJson<any>('/api/scalper/signal', {
@@ -315,39 +435,89 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
         body: JSON.stringify({ ...tick, pair: currentPair, strategy: currentStrategy, userId }),
       })
 
+      if (data.direction === 'HOLD' || !data.entry) {
+        const holdSig: Signal = {
+          direction: 'HOLD', confidence: data.confidence ?? 0, reasons: data.reasons || [],
+          entry: tick.price, sl: 0, tp: 0, risk_note: data.risk_note,
+          fallback: data.fallback, strategy: currentStrategy, timestamp: Date.now(),
+        }
+        setSignal(holdSig); signalRef.current = holdSig
+        if (data.ml) setMlData(data.ml)
+        setAiConn(data.fallback ? 'fallback' : 'live')
+        setRiskResult(checkRisk(holdSig, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length, minConf))
+        return
+      }
+
+      // Apply dynamic levels on top of API signal (overrides server-computed SL/TP)
+      const levels = calcDynamicLevels(data.direction, data.entry, tick.atr, data.confidence, currentPair, regime)
+      const expiresAt = Date.now() + (TIMEFRAME_MS[currentTF] ?? TIMEFRAME_MS['5m'])
+
       const sig: Signal = {
         direction:  data.direction,
         confidence: data.confidence,
         reasons:    data.reasons || [],
         entry:      data.entry,
-        sl:         data.sl,
-        tp:         data.tp,
+        ...levels,
         risk_note:  data.risk_note,
         fallback:   data.fallback,
         strategy:   currentStrategy,
         timestamp:  Date.now(),
+        expiresAt,
       }
       setSignal(sig)
       signalRef.current = sig
       if (data.ml) setMlData(data.ml)
       setAiConn(data.fallback ? 'fallback' : 'live')
 
-      // Evaluate risk with the FRESH signal (not the stale previous one)
-      const freshRisk = checkRisk(sig, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length)
+      const freshRisk = checkRisk(sig, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length, minConf)
       setRiskResult(freshRisk)
 
-      if (sig.direction !== 'HOLD' && freshRisk.passed) {
+      // ── Instant reversal: opposite direction with sufficient confidence ───
+      const opposites = openTradesRef.current.filter(
+        t => t.mode === 'PAPER' && t.direction !== sig.direction && t.pair === currentPair
+      )
+      if (opposites.length > 0 && sig.confidence >= minConf + REVERSAL_CONF_BONUS) {
+        const pnlPerUnit = currentPair.startsWith('XAU') ? 100 : currentPair.includes('JPY') ? 1000 : 100000
+        setOpenTrades(prev => {
+          const reversed: ScalperTrade[] = []
+          prev.forEach(t => {
+            if (t.mode === 'PAPER' && t.direction !== sig.direction && t.pair === currentPair) {
+              const rawPnl = (t.direction === 'BUY' ? tick.price - t.entry : t.entry - tick.price) * pnlPerUnit
+              setDailyPnL(d => d + rawPnl); setBalance(b => b + rawPnl)
+              setClosedTrades(p => [{
+                ...t, closePrice: tick.price,
+                closeTime: new Date().toLocaleTimeString('en', { hour12: false }),
+                pnl: rawPnl, result: 'REV' as const,
+              }, ...p].slice(0, 50))
+              addLog(`[REV] Closed ${t.direction} → reversed to ${sig.direction} @ ${tick.price.toFixed(currentDecimals)} (conf ${sig.confidence}%)`, 'trade')
+            } else {
+              reversed.push(t)
+            }
+          })
+          return reversed
+        })
+      }
+
+      // ── Open new trade if risk gate passes (no existing same-direction trade) ─
+      const alreadyOpen = openTradesRef.current.some(t => t.direction === sig.direction && t.pair === currentPair)
+      if (!alreadyOpen && freshRisk.passed) {
         if (modeRef.current === 'PAPER') {
           const trade: ScalperTrade = {
             id: Date.now().toString(), pair: currentPair, direction: sig.direction,
             entry: sig.entry, sl: sig.sl, tp: sig.tp,
+            tp1: sig.tp1, tp2: sig.tp2, tp3: sig.tp3, slDist: sig.slDist,
+            partialsClosed: 0,
             confidence: sig.confidence, strategy: currentStrategy,
             openTime: new Date().toLocaleTimeString('en', { hour12: false }),
             pnl: 0, mode: 'PAPER',
           }
           setOpenTrades(prev => {
             if (prev.length < RISK_CFG.maxOpenTrades) {
-              addLog(`[PAPER] ${sig.direction} ${currentPair} @ ${sig.entry.toFixed(currentDecimals)} | SL ${sig.sl.toFixed(currentDecimals)} TP ${sig.tp.toFixed(currentDecimals)} | ${sig.confidence}%`, 'trade')
+              addLog(
+                `[PAPER] ${sig.direction} ${currentPair} @ ${sig.entry.toFixed(currentDecimals)} | ` +
+                `SL ${sig.sl.toFixed(currentDecimals)} TP1 ${sig.tp1?.toFixed(currentDecimals)} | ${sig.confidence}% [${regime}]`,
+                'trade',
+              )
               onToast(`Paper: ${sig.direction} ${currentPair} @ ${sig.entry.toFixed(currentDecimals)}`, sig.direction === 'BUY' ? C.green : C.red)
               return [...prev, trade]
             }
@@ -371,13 +541,14 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                 id: order.tradeId || Date.now().toString(),
                 pair: currentPair, direction: sig.direction,
                 entry: tick.price, sl: sig.sl, tp: sig.tp,
+                tp1: sig.tp1, tp2: sig.tp2, tp3: sig.tp3, slDist: sig.slDist,
+                partialsClosed: 0,
                 confidence: sig.confidence, strategy: currentStrategy,
                 openTime: new Date().toLocaleTimeString('en', { hour12: false }),
                 pnl: 0, mode: 'LIVE',
               }
               setOpenTrades(prev => prev.length < RISK_CFG.maxOpenTrades ? [...prev, liveTrade] : prev)
-              onRefreshAccount?.()
-              onRefreshTrades?.()
+              onRefreshAccount?.(); onRefreshTrades?.()
             } else {
               addLog(`[LIVE] Order blocked: ${order.reasons?.[0] || order.reason || 'unknown'}`, 'risk')
             }
@@ -404,6 +575,14 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
       setBrokerConn(data.simulated ? 'simulated' : 'live')
       setPriceHistory(p => [...p, data.price].slice(-60))
       setRsiHistory(p => [...p, data.rsi14].slice(-60))
+
+      // Update rolling ATR history and derive volatility regime
+      const newAtrHistory = [...atrHistoryRef.current, data.atr].slice(-ATR_HISTORY_LEN)
+      setAtrHistory(newAtrHistory)
+      atrHistoryRef.current = newAtrHistory
+      const regime = calcVolatilityRegime(data.atr, newAtrHistory)
+      setVolatilityRegime(regime)
+      volatilityRef.current = regime
 
       tickCountRef.current++
       setTickCount(tickCountRef.current)
@@ -437,7 +616,7 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                   ...pt,
                   closeTime: new Date().toLocaleTimeString('en', { hour12: false }),
                   closePrice: data.price,
-                  result: (pt.pnl >= 0 ? 'TP' : 'SL') as 'TP' | 'SL',
+                  result: (pt.pnl >= 0 ? 'TP3' : 'SL') as 'TP3' | 'SL',
                 }, ...p].slice(0, 50))
                 setTradeCount(c => c + 1)
                 if (pt.pnl > 0) setWinCount(w => w + 1)
@@ -448,10 +627,22 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
         } catch { /* non-critical */ }
       }
 
-      if (tickCountRef.current % SIGNAL_EVERY === 0) {
+      // Always-scan: fetch signal every tick when no trades open; every SIGNAL_EVERY ticks otherwise
+      // Also re-scan immediately if the current signal has expired
+      const sigExpired = signalRef.current?.expiresAt ? Date.now() > signalRef.current.expiresAt : false
+      const shouldFetch = openTradesRef.current.length === 0
+        || sigExpired
+        || tickCountRef.current % SIGNAL_EVERY === 0
+
+      if (shouldFetch) {
+        if (sigExpired && signalRef.current?.direction !== 'HOLD') {
+          setSignal(null); signalRef.current = null
+          addLog('Signal expired — re-scanning', 'system')
+        }
         await fetchSignal(data)
       } else {
-        const risk = checkRisk(signalRef.current, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length)
+        const minConf = dynamicMinConf(winCountRef.current, tradeCountRef.current)
+        const risk = checkRisk(signalRef.current, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length, minConf)
         setRiskResult(risk)
       }
     } catch {
@@ -506,7 +697,7 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
             <div style={{ fontFamily: 'Rajdhani', fontSize: 18, fontWeight: 700, color: C.red, marginBottom: 10 }}>⚠ Switch to LIVE Mode?</div>
             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7, marginBottom: 20 }}>
               In LIVE mode the scalper will place <strong>real orders</strong> with your connected broker using your strategy risk settings.
-              Trades are executed automatically when signal confidence ≥ {RISK_CFG.minConfidence}% and all risk checks pass.
+              Trades are executed automatically when signal confidence ≥ dynamic threshold ({dynamicMinConf(winCount, tradeCount)}% now) and all risk checks pass.
               <br /><br />
               Make sure your broker is connected and risk limits are configured correctly before proceeding.
             </div>
@@ -632,7 +823,15 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
 
       {/* ── Layer 1 + 2 ── */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
-        <Panel title="LAYER 1 — MARKET DATA" badge={<LayerBadge label="REAL FEED" color={C.blue} />}>
+        <Panel title="LAYER 1 — MARKET DATA" badge={
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <LayerBadge label="REAL FEED" color={C.blue} />
+            <LayerBadge
+              label={`${volatilityRegime} VOL`}
+              color={volatilityRegime === 'LOW' ? C.teal : volatilityRegime === 'MEDIUM' ? C.amber : C.red}
+            />
+          </div>
+        }>
           <div style={{ padding: 14 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
               <span className="mono" style={{ fontSize: 24, fontWeight: 700 }}>
@@ -644,6 +843,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 10, fontSize: 11 }}>
               <Row label="Spread" value={tickData ? `${tickData.spreadPips.toFixed(1)} pips` : '—'} />
               <Row label="ATR"    value={tickData ? `${tickData.atrPips.toFixed(1)} pips`   : '—'} />
+              <Row label="Vol. regime" value={atrHistory.length >= 5 ? `${volatilityRegime} (p${Math.round(atrHistory.filter(v => v <= (tickData?.atr ?? 0)).length / atrHistory.length * 100)}%)` : 'Calibrating…'} />
+              <Row label="SL mult" value={`${slMultiplier(volatilityRegime).toFixed(1)}× ATR`} />
               <Row label="Volume" value={tickData ? String(tickData.tickVolume) : '—'} />
               <Row label="Broker" value={tickData?.broker || '—'} />
             </div>
@@ -772,7 +973,31 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                 Confidence: {signal?.confidence ?? 0}% · {activeStrategy}
               </div>
             </div>
-            <div style={{ marginTop: 10, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
+            {/* TP1/TP2/TP3 levels */}
+            {signal && signal.direction !== 'HOLD' && signal.tp1 && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4, margin: '8px 0', fontSize: 10 }}>
+                {[
+                  { label: 'SL',  val: signal.sl,  color: C.red },
+                  { label: 'TP1', val: signal.tp1, color: C.green },
+                  { label: 'TP2', val: signal.tp2, color: C.green },
+                  { label: 'TP3', val: signal.tp3, color: C.teal },
+                ].map(({ label, val, color }) => val !== undefined && (
+                  <div key={label} style={{ textAlign: 'center', padding: '4px 2px', borderRadius: 2, background: color + '14', border: `1px solid ${color}30` }}>
+                    <div style={{ color, fontWeight: 700 }}>{label}</div>
+                    <div className="mono" style={{ color, fontSize: 9 }}>
+                      <CopyValue value={val!.toFixed(decimals)}>{val!.toFixed(decimals)}</CopyValue>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {/* Expiry countdown */}
+            {signal?.expiresAt && signal.direction !== 'HOLD' && (
+              <div style={{ fontSize: 9, color: Date.now() > signal.expiresAt - 15000 ? C.red : C.amber, textAlign: 'center', marginBottom: 4 }}>
+                {Date.now() > signal.expiresAt ? '⚡ Expired — re-scanning' : `⏱ Expires in ~${Math.max(0, Math.round((signal.expiresAt - Date.now()) / 1000))}s`}
+              </div>
+            )}
+            <div style={{ marginTop: 6, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
               {signal?.reasons?.map((r, i) => (
                 <div key={i} style={{ fontSize: 11, color: 'var(--text-secondary)', padding: '2px 0' }}>
                   <span style={{ color: 'var(--text-muted)', marginRight: 6 }}>•</span>{r}
@@ -783,7 +1008,11 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                   {signal.risk_note}
                 </div>
               )}
-              {!signal?.reasons?.length && <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: 8 }}>Start engine — signal every {SIGNAL_EVERY * TICK_INTERVAL / 1000}s</div>}
+              {!signal?.reasons?.length && (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: 8 }}>
+                  Always-on — signals every tick (no trade) or every {SIGNAL_EVERY * TICK_INTERVAL / 1000}s
+                </div>
+              )}
             </div>
           </div>
         </Panel>
@@ -887,7 +1116,7 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
           {riskResult?.checks?.map((c, i) => <ChecklistItem key={i} label={c.label} pass={c.ok} />)}
           {!riskResult && <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Risk gate idle — start engine to activate</div>}
           <div style={{ width: '100%', borderTop: '1px solid var(--border)', marginTop: 6, paddingTop: 8, fontSize: 10, color: 'var(--text-muted)', letterSpacing: 0.5 }}>
-            {RISK_CFG.maxRiskPct}% max risk · {RISK_CFG.maxDailyLossPct}% daily limit · SL {RISK_CFG.slMult}× ATR · TP {RISK_CFG.tpMult}× ATR · Min confidence {RISK_CFG.minConfidence}%
+            {RISK_CFG.maxRiskPct}% max risk · {RISK_CFG.maxDailyLossPct}% daily limit · SL {slMultiplier(volatilityRegime).toFixed(1)}× ATR ({volatilityRegime} vol) · Min conf {dynamicMinConf(winCount, tradeCount)}% (dynamic, {tradeCount} trades)
           </div>
         </div>
       </Panel>
@@ -912,13 +1141,27 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                   </div>
                   <span className="mono" style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t.openTime}</span>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4, marginTop: 8, fontSize: 10 }}>
-                  <div><span style={{ color: 'var(--text-muted)' }}>Entry: </span><span className="mono"><CopyValue value={t.entry.toFixed(decimals)}>{t.entry.toFixed(decimals)}</CopyValue></span></div>
-                  <div><span style={{ color: C.red }}>SL: </span><span className="mono">{t.sl ? <CopyValue value={t.sl.toFixed(decimals)}>{t.sl.toFixed(decimals)}</CopyValue> : '—'}</span></div>
-                  <div><span style={{ color: C.green }}>TP: </span><span className="mono">{t.tp ? <CopyValue value={t.tp.toFixed(decimals)}>{t.tp.toFixed(decimals)}</CopyValue> : '—'}</span></div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 3, marginTop: 8, fontSize: 9 }}>
+                  {[
+                    { label: 'Entry', val: t.entry, color: 'var(--text-muted)' },
+                    { label: 'SL', val: t.sl, color: C.red },
+                    { label: 'TP1', val: t.tp1, color: t.partialsClosed! >= 1 ? 'var(--text-muted)' : C.green },
+                    { label: 'TP2', val: t.tp2, color: t.partialsClosed! >= 2 ? 'var(--text-muted)' : C.green },
+                    { label: 'TP3', val: t.tp3 ?? t.tp, color: C.teal },
+                  ].map(({ label, val, color }) => val !== undefined ? (
+                    <div key={label} style={{ textAlign: 'center', padding: '3px 2px', borderRadius: 2, background: color + '14', opacity: label.startsWith('TP') && t.partialsClosed !== undefined && t.partialsClosed >= parseInt(label[2]) ? 0.4 : 1 }}>
+                      <div style={{ color: 'var(--text-muted)', fontSize: 8 }}>{label}</div>
+                      <div className="mono" style={{ color, fontSize: 9 }}><CopyValue value={val.toFixed(decimals)}>{val.toFixed(decimals)}</CopyValue></div>
+                    </div>
+                  ) : null)}
                 </div>
+                {(t.partialsClosed ?? 0) > 0 && (
+                  <div style={{ fontSize: 9, color: C.green, marginTop: 4 }}>
+                    {t.partialsClosed === 1 ? '33% closed at TP1 · SL at breakeven' : '66% closed · trailing SL at TP1'}
+                  </div>
+                )}
                 {t.mode === 'LIVE' && (
-                  <div style={{ marginTop: 6, fontSize: 11, fontWeight: 700, color: t.pnl >= 0 ? C.green : C.red }}>
+                  <div style={{ marginTop: 5, fontSize: 11, fontWeight: 700, color: t.pnl >= 0 ? C.green : C.red }}>
                     P&L: {t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}
                   </div>
                 )}
@@ -937,8 +1180,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                   <span style={{ fontSize: 9, fontWeight: 800, padding: '1px 6px', borderRadius: 2, color: dirColor(t.direction), background: dirBg(t.direction) }}>{t.direction}</span>
                   <span className="mono" style={{ fontSize: 11 }}>{t.pair}</span>
                   <span style={{ fontSize: 9, fontWeight: 800, padding: '1px 6px', borderRadius: 2,
-                    color: t.result === 'TP' ? C.green : C.red,
-                    background: t.result === 'TP' ? 'rgba(0,255,135,0.12)' : 'rgba(255,48,86,0.1)' }}>{t.result}</span>
+                    color: t.result && t.result !== 'SL' ? C.green : C.red,
+                    background: t.result && t.result !== 'SL' ? 'rgba(0,255,135,0.12)' : 'rgba(255,48,86,0.1)' }}>{t.result}</span>
                   <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{t.mode}</span>
                 </div>
                 <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: t.pnl >= 0 ? C.green : C.red }}>
