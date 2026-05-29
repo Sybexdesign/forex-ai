@@ -305,32 +305,39 @@ def predict_daily_auto(pair: str = Query(..., description="XAU/USD or XAG/USD"))
         df.index = pd.to_datetime(df.index).tz_localize(None)
         return df
 
-    def _seed_yfinance() -> dict:
-        """Download 2 years of data (sufficient for 200-day SMA + lags) and cache to CSV."""
+    def _seed_yfinance() -> None:
+        """Download 2 years of daily data and cache to CSV. Raises on failure."""
         import yfinance as yf, time as _time
         os.makedirs(DATA_DIR, exist_ok=True)
-        result: dict = {'gold': pd.DataFrame(), 'silver': pd.DataFrame()}
         TICKER_MAP = {'gold': 'GC=F', 'silver': 'SI=F'}
         print("  yfinance ▸ seeding CSVs (period=2y)...")
         for metal, sym in TICKER_MAP.items():
+            last_err: str = 'unknown'
+            saved = False
             for attempt in range(1, 4):
                 try:
-                    df = yf.Ticker(sym).history(period='2y', auto_adjust=True)
+                    ticker = yf.Ticker(sym)
+                    df = ticker.history(period='2y', auto_adjust=True, timeout=30)
                     if df is not None and not df.empty:
                         df = df[['Open','High','Low','Close','Volume']].copy()
                         df.index = pd.to_datetime(df.index).tz_localize(None)
                         df.index.name = 'Date'
                         df.columns.name = None
-                        result[metal] = df
                         path = os.path.join(DATA_DIR, f'{metal}_raw.csv')
                         df.to_csv(path)
                         print(f"  ✓  {metal}: {len(df)} rows → {path}")
+                        saved = True
                         break
+                    else:
+                        last_err = f"empty DataFrame from {sym}"
+                        print(f"  ⚠  {sym} attempt {attempt}/3: empty data")
                 except Exception as e:
+                    last_err = str(e)
                     print(f"  ⚠  {sym} attempt {attempt}/3: {e}")
-                    if attempt < 3:
-                        _time.sleep(15)
-        return result
+                if attempt < 3:
+                    _time.sleep(5)
+            if not saved:
+                raise RuntimeError(f"seed failed for {metal} ({sym}): {last_err}")
 
     def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
