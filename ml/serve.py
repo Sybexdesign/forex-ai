@@ -67,37 +67,61 @@ _seed_error_msg = ''
 
 
 def _do_seed_yfinance() -> None:
-    """Download 2 years of daily data and write CSVs. Raises RuntimeError on failure."""
-    import yfinance as yf
+    """Download 2 years of daily OHLCV data. Tries yfinance then Stooq fallback."""
+    import datetime
     os.makedirs(DATA_DIR, exist_ok=True)
-    TICKER_MAP = {'gold': 'GC=F', 'silver': 'SI=F'}
-    print("  yfinance ▸ seeding CSVs (period=2y)...")
-    for metal, sym in TICKER_MAP.items():
-        last_err = 'unknown'
-        saved    = False
-        for attempt in range(1, 4):
+    METALS = {
+        'gold':   {'yf': 'GC=F',  'stooq': 'GC.F'},
+        'silver': {'yf': 'SI=F',  'stooq': 'SI.F'},
+    }
+    start_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime('%Y-%m-%d')
+    print("  ▸ seeding CSVs (yfinance → Stooq fallback)...")
+
+    for metal, syms in METALS.items():
+        df: Optional[pd.DataFrame] = None
+
+        # ── attempt 1-3: yfinance ────────────────────────────────────────────
+        try:
+            import yfinance as yf
+            for attempt in range(1, 4):
+                try:
+                    raw = yf.Ticker(syms['yf']).history(period='2y', auto_adjust=True, timeout=30)
+                    if raw is not None and not raw.empty:
+                        df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+                        print(f"  ✓  {metal} (yfinance): {len(df)} rows")
+                        break
+                    print(f"  ⚠  yf {syms['yf']} attempt {attempt}/3: empty")
+                except Exception as exc:
+                    print(f"  ⚠  yf {syms['yf']} attempt {attempt}/3: {exc}")
+                if attempt < 3:
+                    time.sleep(10 * attempt)   # 10s, 20s
+        except ImportError:
+            pass
+
+        # ── fallback: pandas_datareader Stooq ────────────────────────────────
+        if df is None or df.empty:
             try:
-                df = yf.Ticker(sym).history(period='2y', auto_adjust=True, timeout=30)
-                if df is not None and not df.empty:
-                    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-                    df.index = pd.to_datetime(df.index).tz_localize(None)
-                    df.index.name  = 'Date'
-                    df.columns.name = None
-                    path = os.path.join(DATA_DIR, f'{metal}_raw.csv')
-                    df.to_csv(path)
-                    print(f"  ✓  {metal}: {len(df)} rows → {path}")
-                    saved = True
-                    break
-                else:
-                    last_err = f"empty DataFrame from {sym}"
-                    print(f"  ⚠  {sym} attempt {attempt}/3: empty data")
+                from pandas_datareader import data as pdr
+                raw = pdr.get_data_stooq(syms['stooq'], start=start_date)
+                if raw is not None and not raw.empty:
+                    raw = raw.sort_index()   # Stooq returns newest-first
+                    cols = [c for c in ('Open', 'High', 'Low', 'Close', 'Volume') if c in raw.columns]
+                    df   = raw[cols].copy()
+                    if 'Volume' not in df.columns:
+                        df['Volume'] = 0
+                    print(f"  ✓  {metal} (Stooq): {len(df)} rows")
             except Exception as exc:
-                last_err = str(exc)
-                print(f"  ⚠  {sym} attempt {attempt}/3: {exc}")
-            if attempt < 3:
-                time.sleep(5)
-        if not saved:
-            raise RuntimeError(f"seed failed for {metal} ({sym}): {last_err}")
+                print(f"  ⚠  Stooq {syms['stooq']}: {exc}")
+
+        if df is None or df.empty:
+            raise RuntimeError(f"all data sources exhausted for {metal}")
+
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df.index.name   = 'Date'
+        df.columns.name = None
+        path = os.path.join(DATA_DIR, f'{metal}_raw.csv')
+        df.to_csv(path)
+        print(f"  ✓  saved {metal}: {len(df)} rows → {path}")
 
 
 def _start_seed_if_needed() -> None:
@@ -110,9 +134,11 @@ def _start_seed_if_needed() -> None:
             _seed_status = 'done'
         return
     with _seed_lock:
-        if _seed_status in ('running', 'done'):
+        if _seed_status == 'running' or _seed_status == 'done':
             return
-        _seed_status = 'running'
+        # reset so thread launches even after a previous error
+        _seed_status   = 'running'
+        _seed_error_msg = ''
 
     def _run():
         global _seed_status, _seed_error_msg
