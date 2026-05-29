@@ -294,48 +294,145 @@ def predict_daily_auto(pair: str = Query(..., description="XAU/USD or XAG/USD"))
     if cached and (time.time() - cached['ts']) < _AUTO_CACHE_TTL:
         return {**cached['result'], 'cached': True}
 
-    # Load CSVs — both required for gs_ratio computation
+    import pandas as pd
+    import warnings
+    warnings.filterwarnings('ignore')
+
+    # ── Inline helpers (no market_data.py dependency) ─────────────────────────
+
+    def _load_csv(path: str) -> pd.DataFrame:
+        df = pd.read_csv(path, index_col='Date', parse_dates=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        return df
+
+    def _seed_yfinance() -> dict:
+        """Download last 10 years from yfinance and cache to CSV."""
+        import yfinance as yf, time as _time
+        os.makedirs(DATA_DIR, exist_ok=True)
+        START = '2000-01-01'
+        SYMS  = {'GC=F': ('gold', 'futures'), 'SI=F': ('silver', 'futures'),
+                 'GLD':  ('gold', 'etf'),     'SLV':  ('silver', 'etf')}
+        result: dict = {'gold': pd.DataFrame(), 'silver': pd.DataFrame()}
+        buckets: dict = {'gold': {}, 'silver': {}}
+        print("  yfinance ▸ seeding CSVs...")
+        for attempt in range(1, 4):
+            raw = yf.download(list(SYMS.keys()), start=START, progress=False,
+                              auto_adjust=True, group_by='ticker')
+            if raw is not None and not raw.empty:
+                break
+            if attempt < 3:
+                print(f"    ⚠  rate-limit — retry {attempt}/3")
+                _time.sleep(20)
+        if raw is None or raw.empty:
+            # single-ticker fallback
+            for sym, (m, _) in list(SYMS.items())[:2]:
+                if not result[m].empty:
+                    continue
+                for att in range(1, 4):
+                    try:
+                        df = yf.Ticker(sym).history(start=START, auto_adjust=True)
+                        if not df.empty:
+                            df = df[['Open','High','Low','Close','Volume']].copy()
+                            df.index = pd.to_datetime(df.index).tz_localize(None)
+                            df.index.name = 'Date'
+                            result[m] = df
+                            break
+                    except Exception:
+                        if att < 3: _time.sleep(20)
+        else:
+            for sym, (m, kind) in SYMS.items():
+                try:
+                    lvl = raw.columns.get_level_values(0)
+                    df = raw[sym][['Open','High','Low','Close','Volume']].copy() if sym in lvl else pd.DataFrame()
+                    df = df.dropna(how='all')
+                    if not df.empty:
+                        df.index = pd.to_datetime(df.index).tz_localize(None)
+                        df.index.name = 'Date'
+                        df.columns.name = None
+                        buckets[m][kind] = df
+                except Exception:
+                    pass
+            for m in ('gold', 'silver'):
+                result[m] = buckets[m].get('futures') or buckets[m].get('etf') or pd.DataFrame()
+        for m, df in result.items():
+            if not df.empty:
+                df.to_csv(os.path.join(DATA_DIR, f'{m}_raw.csv'))
+                print(f"  ✓  {m}: {len(df)} rows cached")
+        return result
+
+    def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        for col in ('Open','High','Low','Close','Volume'):
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
+        df.dropna(subset=['Close'], how='all', inplace=True)
+        df.ffill(limit=3, inplace=True)
+        df.ffill(inplace=True)
+        return df
+
+    def _engineer_features(gold: pd.DataFrame, silver: pd.DataFrame):
+        common = gold.index.intersection(silver.index)
+        g = gold.reindex(common).copy()
+        s = silver.reindex(common).copy()
+        gs_ratio = g['Close'] / s['Close'].replace(0, np.nan)
+        for df in (g, s):
+            c = df['Close']
+            df['daily_return'] = c.pct_change()
+            df['return_5d']    = c.pct_change(5)
+            df['return_20d']   = c.pct_change(20)
+            for w in (10, 20, 50, 200):
+                df[f'SMA_{w}'] = c.rolling(w).mean()
+            for w in (10, 20):
+                df[f'vol_{w}d'] = df['daily_return'].rolling(w).std()
+            delta = c.diff()
+            gain  = delta.clip(lower=0).rolling(14).mean()
+            loss  = (-delta.clip(upper=0)).rolling(14).mean()
+            df['RSI_14'] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+            ema12 = c.ewm(span=12, adjust=False).mean()
+            ema26 = c.ewm(span=26, adjust=False).mean()
+            df['MACD_line']      = ema12 - ema26
+            df['MACD_signal']    = df['MACD_line'].ewm(span=9, adjust=False).mean()
+            df['MACD_histogram'] = df['MACD_line'] - df['MACD_signal']
+            sma20 = c.rolling(20).mean()
+            std20 = c.rolling(20).std()
+            df['BB_upper'] = sma20 + 2 * std20
+            df['BB_lower'] = sma20 - 2 * std20
+            df['BB_width'] = (df['BB_upper'] - df['BB_lower']) / sma20.replace(0, np.nan)
+            vol_sma = df['Volume'].rolling(20).mean()
+            df['vol_SMA_20'] = vol_sma
+            df['vol_ratio']  = df['Volume'] / vol_sma.replace(0, np.nan)
+            df['gs_ratio']   = gs_ratio
+            for lag in (1, 2, 3, 5):
+                df[f'close_lag{lag}']  = c.shift(lag)
+                df[f'return_lag{lag}'] = df['daily_return'].shift(lag)
+            df['target'] = (c.shift(-1) > c).astype(int)
+        return g, s
+
+    # ── Load or seed CSVs ─────────────────────────────────────────────────────
     gold_csv   = os.path.join(DATA_DIR, 'gold_raw.csv')
     silver_csv = os.path.join(DATA_DIR, 'silver_raw.csv')
+
     if not os.path.exists(gold_csv) or not os.path.exists(silver_csv):
-        # Auto-seed: download ~10 years of history so the endpoint works on cold starts
-        print("  ℹ  CSVs missing — seeding market data from yfinance (first-run auto-seed)...")
+        print("  ℹ  CSVs missing — running auto-seed from yfinance...")
         try:
-            from market_data import _fetch_yfinance, _save_cache, START_DATE
-            os.makedirs(DATA_DIR, exist_ok=True)
-            yf_data = _fetch_yfinance(START_DATE)
-            for m, df in yf_data.items():
-                if not df.empty:
-                    _save_cache(m, df)
-                    print(f"  ✓  {m} seeded: {len(df)} rows")
+            _seed_yfinance()
         except Exception as seed_err:
-            raise HTTPException(status_code=503, detail=f"Market data CSVs not found and auto-seed failed: {seed_err}")
-        if not os.path.exists(gold_csv) or not os.path.exists(silver_csv):
-            raise HTTPException(status_code=503, detail="Market data CSVs still missing after auto-seed attempt")
+            raise HTTPException(status_code=503, detail=f"Auto-seed failed: {seed_err}")
+
+    if not os.path.exists(gold_csv) or not os.path.exists(silver_csv):
+        raise HTTPException(status_code=503, detail="CSVs still missing after auto-seed")
 
     try:
-        import pandas as pd
-        from market_data import _clean, _engineer
+        gold_raw   = _load_csv(gold_csv)
+        silver_raw = _load_csv(silver_csv)
 
-        def _load(path):
-            df = pd.read_csv(path, index_col='Date', parse_dates=True)
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-            return df
-
-        gold_raw   = _load(gold_csv)
-        silver_raw = _load(silver_csv)
-
-        gold_clean   = _clean(gold_raw,   'gold')
-        silver_clean = _clean(silver_raw, 'silver')
-        gold_feat, silver_feat = _engineer(gold_clean, silver_clean)
+        gold_clean   = _clean_df(gold_raw)
+        silver_clean = _clean_df(silver_raw)
+        gold_feat, silver_feat = _engineer_features(gold_clean, silver_clean)
 
         gold_feat['is_silver']   = 0
         silver_feat['is_silver'] = 1
 
-        feat_df = gold_feat if metal == 'gold' else silver_feat
-
-        # Use the last fully-populated row
-        feat_df = feat_df.dropna()
+        feat_df = (gold_feat if metal == 'gold' else silver_feat).dropna()
         if feat_df.empty:
             raise HTTPException(status_code=503, detail="No complete feature rows available")
 
@@ -357,14 +454,14 @@ def predict_daily_auto(pair: str = Query(..., description="XAU/USD or XAG/USD"))
         }
 
         result = {
-            'pair':                 pair,
-            'metal':                metal,
-            'up_probability':       round(up_prob, 4),
-            'direction':            'UP' if up_prob >= 0.5 else 'DOWN',
-            'confidence':           int(up_prob * 100),
-            'feature_date':         str(last_row.name.date()),
+            'pair':                  pair,
+            'metal':                 metal,
+            'up_probability':        round(up_prob, 4),
+            'direction':             'UP' if up_prob >= 0.5 else 'DOWN',
+            'confidence':            int(up_prob * 100),
+            'feature_date':          str(last_row.name.date()),
             'feature_contributions': top_feats,
-            'cached':               False,
+            'cached':                False,
         }
 
         _auto_cache[metal] = {'result': result, 'ts': time.time()}
