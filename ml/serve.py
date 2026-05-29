@@ -3,14 +3,20 @@
 
 import os
 import json
+import subprocess
+import sys
+import threading
+import time
 import numpy as np
 import xgboost as xgb
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 
-MODEL_DIR = os.path.join(os.path.dirname(__file__), 'model')
+MODEL_DIR   = os.path.join(os.path.dirname(__file__), 'model')
+STATUS_PATH = os.path.join(MODEL_DIR, 'worker_status.json')
+DATA_DIR    = os.path.join(os.path.dirname(__file__), 'data')
 
 PIP_VALUES = {
     'EUR/USD': 0.0001, 'GBP/USD': 0.0001, 'AUD/USD': 0.0001,
@@ -36,6 +42,14 @@ with open(features_path) as f:
     FEATURE_NAMES = json.load(f)
 
 print(f"✓ Scalper model loaded: {len(FEATURE_NAMES)} features")
+
+# 1-hour cache for /predict_daily_auto results keyed by metal ('gold'|'silver')
+_auto_cache: dict = {}  # {'gold': {'result': {...}, 'ts': float}, ...}
+_AUTO_CACHE_TTL = 3600  # seconds
+
+# Background retrain state
+_retrain_lock   = threading.Lock()
+_retrain_thread: Optional[threading.Thread] = None
 
 # Load daily model — optional, graceful degradation if not yet trained
 daily_model_path    = os.path.join(MODEL_DIR, 'daily_model.json')
@@ -212,6 +226,134 @@ def health():
         'scalper_model': {'features': len(FEATURE_NAMES)},
         'daily_model':   {'features': len(DAILY_FEATURE_NAMES), 'loaded': daily_model is not None},
     }
+
+
+# ─── Worker endpoints ─────────────────────────────────────────────────────────
+
+@app.get('/worker/status')
+def worker_status():
+    if not os.path.exists(STATUS_PATH):
+        return {'worker_status': 'never_run'}
+    with open(STATUS_PATH) as f:
+        return json.load(f)
+
+
+@app.post('/worker/retrain')
+def worker_retrain():
+    global _retrain_thread
+    with _retrain_lock:
+        if _retrain_thread and _retrain_thread.is_alive():
+            return {'status': 'already_running'}
+
+        worker_script = os.path.join(os.path.dirname(__file__), 'worker_daily.py')
+
+        def _run():
+            try:
+                subprocess.run(
+                    [sys.executable, worker_script],
+                    cwd=os.path.dirname(__file__),
+                    timeout=600,
+                )
+                # Reload daily model after worker finishes
+                if os.path.exists(daily_model_path) and os.path.exists(daily_features_path):
+                    global daily_model, DAILY_FEATURE_NAMES, _auto_cache
+                    _m = xgb.XGBClassifier()
+                    _m.load_model(daily_model_path)
+                    with open(daily_features_path) as fh:
+                        _fn = json.load(fh)
+                    daily_model         = _m
+                    DAILY_FEATURE_NAMES = _fn
+                    _auto_cache         = {}   # invalidate auto cache
+                    print("✓ Daily model reloaded after worker run")
+            except Exception as e:
+                print(f"✗ worker_daily retrain error: {e}")
+
+        _retrain_thread = threading.Thread(target=_run, daemon=True)
+        _retrain_thread.start()
+    return {'status': 'started'}
+
+
+@app.get('/predict_daily_auto')
+def predict_daily_auto(pair: str = Query(..., description="XAU/USD or XAG/USD")):
+    if daily_model is None:
+        raise HTTPException(status_code=503, detail="Daily model not loaded. Run: python ml/train_daily.py")
+
+    metal = 'gold' if 'XAU' in pair.upper() else 'silver' if 'XAG' in pair.upper() else None
+    if metal is None:
+        raise HTTPException(status_code=400, detail="pair must be XAU/USD or XAG/USD")
+
+    # Return cached result if still fresh
+    cached = _auto_cache.get(metal)
+    if cached and (time.time() - cached['ts']) < _AUTO_CACHE_TTL:
+        return {**cached['result'], 'cached': True}
+
+    # Load CSVs — both required for gs_ratio computation
+    gold_csv   = os.path.join(DATA_DIR, 'gold_raw.csv')
+    silver_csv = os.path.join(DATA_DIR, 'silver_raw.csv')
+    if not os.path.exists(gold_csv) or not os.path.exists(silver_csv):
+        raise HTTPException(status_code=503, detail="Market data CSVs not found. Run: python worker_daily.py")
+
+    try:
+        import pandas as pd
+        from market_data import _clean, _engineer
+
+        def _load(path):
+            df = pd.read_csv(path, index_col='Date', parse_dates=True)
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            return df
+
+        gold_raw   = _load(gold_csv)
+        silver_raw = _load(silver_csv)
+
+        gold_clean   = _clean(gold_raw,   'gold')
+        silver_clean = _clean(silver_raw, 'silver')
+        gold_feat, silver_feat = _engineer(gold_clean, silver_clean)
+
+        gold_feat['is_silver']   = 0
+        silver_feat['is_silver'] = 1
+
+        feat_df = gold_feat if metal == 'gold' else silver_feat
+
+        # Use the last fully-populated row
+        feat_df = feat_df.dropna()
+        if feat_df.empty:
+            raise HTTPException(status_code=503, detail="No complete feature rows available")
+
+        last_row  = feat_df.iloc[-1]
+        feat_dict = last_row.to_dict()
+        X         = np.array([[feat_dict.get(f, 0.0) for f in DAILY_FEATURE_NAMES]])
+
+        proba   = daily_model.predict_proba(X)[0]
+        up_prob = float(proba[1])
+
+        importances = daily_model.feature_importances_
+        sorted_idx  = np.argsort(importances)[::-1][:5]
+        top_feats   = {
+            DAILY_FEATURE_NAMES[i]: {
+                'importance': round(float(importances[i]), 4),
+                'value':      round(float(feat_dict.get(DAILY_FEATURE_NAMES[i], 0)), 4),
+            }
+            for i in sorted_idx
+        }
+
+        result = {
+            'pair':                 pair,
+            'metal':                metal,
+            'up_probability':       round(up_prob, 4),
+            'direction':            'UP' if up_prob >= 0.5 else 'DOWN',
+            'confidence':           int(up_prob * 100),
+            'feature_date':         str(last_row.name.date()),
+            'feature_contributions': top_feats,
+            'cached':               False,
+        }
+
+        _auto_cache[metal] = {'result': result, 'ts': time.time()}
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == '__main__':

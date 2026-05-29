@@ -55,6 +55,32 @@ interface LogEntry {
   msg: string; type: 'info' | 'trade' | 'win' | 'loss' | 'system' | 'risk'; time: string
 }
 
+interface LayerCheck { name: string; confirmed: boolean; note: string }
+
+interface WorkerStatus {
+  worker_status: string; last_trained?: string; model_auc?: number
+  model_accuracy?: number; dataset_size?: number; model_version?: number
+  data_freshness?: string; rows_added?: number; top_features?: string[]
+}
+
+interface DailySignal {
+  pair: string; direction: TradeDirection; confidence: number; upProbability: number
+  entry: number | null; sl: number | null
+  tp1: number | null; tp2: number | null; tp3: number | null
+  atr: number | null; atrPips: number | null
+  slPips: number | null; tp1Pips: number | null; tp2Pips: number | null; tp3Pips: number | null
+  featureDate: string
+  featureContributions: Record<string, { importance: number; value: number }>
+  layers: LayerCheck[]; confirmedLayers: number; totalLayers: number
+  workerStatus: WorkerStatus | null; mlOnline: boolean; timestamp: number
+}
+
+interface DailyHistoryItem {
+  id: string; pair: string; direction: TradeDirection; confidence: number
+  entry: number | null; sl: number | null; tp1: number | null
+  timestamp: number
+}
+
 interface Props {
   prices: Record<string, PriceData>
   account: any
@@ -70,8 +96,9 @@ interface Props {
 const SCALPER_PAIRS = ['XAU/USD', 'XAG/USD']
 const TIMEFRAMES    = ['1m', '3m', '5m', '15m']
 const STRATEGIES    = ['Momentum', 'Mean Reversion', 'Breakout', 'Order Flow']
-const TICK_INTERVAL = 10_000
-const SIGNAL_EVERY  = 3
+const TICK_INTERVAL   = 10_000
+const SIGNAL_EVERY    = 3
+const DAILY_INTERVAL  = 60_000
 
 const C = {
   green: '#00ff87', greenDim: 'rgba(0,255,135,0.12)', greenBorder: 'rgba(0,255,135,0.3)',
@@ -143,6 +170,12 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
   const [brokerConn, setBrokerConn]   = useState<ConnStatus>('idle')
   const [aiConn, setAiConn]           = useState<ConnStatus>('idle')
 
+  const [dailySignal, setDailySignal]         = useState<DailySignal | null>(null)
+  const [dailySignalLoading, setDailyLoading] = useState(false)
+  const [dailyHistory, setDailyHistory]       = useState<DailyHistoryItem[]>([])
+  const [retraining, setRetraining]           = useState(false)
+  const dailyIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
   const [priceHistory, setPriceHistory] = useState<number[]>([])
   const [rsiHistory, setRsiHistory]     = useState<number[]>([])
 
@@ -185,6 +218,45 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
   const addLog = useCallback((msg: string, type: LogEntry['type'] = 'info') => {
     setLogs(prev => [{ msg, type, time: new Date().toLocaleTimeString('en', { hour12: false }) }, ...prev].slice(0, 80))
   }, [])
+
+  const fetchDailySignal = useCallback(async (currentPair: string) => {
+    setDailyLoading(true)
+    try {
+      const data: DailySignal = await authJson(`/api/scalper/daily-signal?pair=${encodeURIComponent(currentPair)}&timeframe=1H`)
+      setDailySignal(data)
+      if (data.direction !== 'HOLD' && data.confidence >= 60) {
+        setDailyHistory(prev => {
+          const existing = prev.find(h => h.id === String(data.timestamp))
+          if (existing) return prev
+          const item: DailyHistoryItem = {
+            id: String(data.timestamp), pair: currentPair,
+            direction: data.direction, confidence: data.confidence,
+            entry: data.entry, sl: data.sl, tp1: data.tp1,
+            timestamp: data.timestamp,
+          }
+          return [item, ...prev].slice(0, 20)
+        })
+      }
+    } catch { /* non-critical */ }
+    finally { setDailyLoading(false) }
+  }, [])
+
+  // Poll daily signal every 60s, also on pair change
+  useEffect(() => {
+    fetchDailySignal(pair)
+    if (dailyIntervalRef.current) clearInterval(dailyIntervalRef.current)
+    dailyIntervalRef.current = setInterval(() => fetchDailySignal(pair), DAILY_INTERVAL)
+    return () => { if (dailyIntervalRef.current) clearInterval(dailyIntervalRef.current) }
+  }, [pair, fetchDailySignal])
+
+  const triggerRetrain = useCallback(async () => {
+    setRetraining(true)
+    try {
+      await authJson('/api/scalper/retrain', { method: 'POST' })
+      addLog('Daily model retrain triggered', 'system')
+    } catch { addLog('Retrain request failed', 'risk') }
+    finally { setTimeout(() => setRetraining(false), 3000) }
+  }, [addLog])
 
   useEffect(() => { if (account?.balance)     setBalance(account.balance) },     [account?.balance])
   // In LIVE mode, sync daily P&L from broker's realizedPL (OANDA's session P&L)
@@ -509,6 +581,14 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
             tag=""
           />
         )}
+        {dailySignal?.workerStatus && (
+          <StatusPill
+            label="DAILY ML"
+            value={dailySignal.workerStatus.data_freshness ?? 'unknown'}
+            color={dailySignal.mlOnline ? C.purple : C.muted}
+            tag={`AUC ${dailySignal.workerStatus.model_auc?.toFixed(3) ?? '—'}`}
+          />
+        )}
         {isFetching && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '4px 10px', borderRadius: 3, border: `1px solid ${C.cyan}30`, background: `${C.cyan}08`, fontSize: 10, color: C.cyan }}>
             <span style={{ animation: 'spin 1s linear infinite', display: 'inline-block' }}>⟳</span>
@@ -594,8 +674,9 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
 
       {/* ── Layer 3 + 4 ── */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
-        <Panel title="LAYER 3 — AI PREDICTION" badge={<LayerBadge label="DUAL ENGINE" color={C.purple} />}>
-          <div style={{ padding: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <Panel title="LAYER 3 — AI PREDICTION" badge={<LayerBadge label="TRIPLE ENGINE" color={C.purple} />}>
+          <div style={{ padding: 14, display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            {/* Signal Engine */}
             <div style={{ padding: 10, borderRadius: 4, border: '1px solid var(--border)' }}>
               <div style={{ fontSize: 10, color: C.amber, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>SIGNAL ENGINE</div>
               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
@@ -611,9 +692,10 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                 {signal?.confidence ?? '—'}<span style={{ fontSize: 11 }}>%</span>
               </div>
             </div>
+            {/* Scalper ML Model */}
             <div style={{ padding: 10, borderRadius: 4, border: `1px solid ${mlData ? (mlData.should_trade ? 'rgba(0,255,135,0.3)' : 'rgba(255,48,86,0.25)') : 'var(--border)'}` }}>
               <div style={{ fontSize: 10, color: C.cyan, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>ML MODEL</div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>XGBoost · Win Probability</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>XGBoost · Win Prob</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
                 <span style={{ width: 5, height: 5, borderRadius: '50%', background: mlData ? C.green : 'var(--text-muted)', display: 'inline-block', flexShrink: 0 }} />
                 <span className="mono" style={{ fontSize: 9, color: mlData ? C.green : 'var(--text-muted)', letterSpacing: 0.5 }}>
@@ -634,7 +716,38 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                 </>
               ) : (
                 <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.5 }}>
-                  ML service offline<br />deploy ml/serve.py on VPS
+                  ML service offline<br />run ml/serve.py
+                </div>
+              )}
+            </div>
+            {/* Daily Direction Model */}
+            <div style={{ padding: 10, borderRadius: 4, border: `1px solid ${dailySignal ? (dailySignal.confidence >= 60 ? dirBorder(dailySignal.direction) : 'rgba(168,85,247,0.3)') : 'var(--border)'}` }}>
+              <div style={{ fontSize: 10, color: C.purple, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>DAILY DIRECTION</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>XGBoost · 26y OHLCV</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
+                <span style={{ width: 5, height: 5, borderRadius: '50%', background: dailySignal?.mlOnline ? C.green : 'var(--text-muted)', display: 'inline-block', flexShrink: 0 }} />
+                <span className="mono" style={{ fontSize: 9, color: dailySignal?.mlOnline ? C.green : 'var(--text-muted)', letterSpacing: 0.5 }}>
+                  {dailySignalLoading ? 'LOADING…' : dailySignal?.mlOnline ? 'ACTIVE' : 'OFFLINE'}
+                </span>
+              </div>
+              {dailySignal ? (
+                <>
+                  <div className="mono" style={{ fontSize: 22, fontWeight: 700, marginTop: 8, color: dailySignal.confidence >= 60 ? dirColor(dailySignal.direction) : C.amber }}>
+                    {dailySignal.confidence}<span style={{ fontSize: 11 }}>%</span>
+                  </div>
+                  <div style={{ fontSize: 10, fontWeight: 700, marginTop: 2, color: dailySignal.confidence >= 60 ? dirColor(dailySignal.direction) : C.amber }}>
+                    {dailySignal.confidence >= 60 ? dailySignal.direction : 'UNCERTAIN'}
+                  </div>
+                  <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 4 }}>
+                    {dailySignal.featureDate}
+                  </div>
+                  <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, marginTop: 5 }}>
+                    <div style={{ width: `${dailySignal.confidence}%`, height: '100%', background: dailySignal.confidence >= 60 ? dirColor(dailySignal.direction) : C.amber, borderRadius: 2, transition: 'width 0.5s ease' }} />
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.5 }}>
+                  {dailySignalLoading ? 'Fetching…' : 'No data — run worker_daily.py'}
                 </div>
               )}
             </div>
@@ -675,6 +788,95 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
           </div>
         </Panel>
       </div>
+
+      {/* ── Daily Signal Card ── */}
+      {dailySignal && dailySignal.confidence >= 60 && dailySignal.direction !== 'HOLD' && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 10, color: C.purple, fontWeight: 700, letterSpacing: 2, marginBottom: 6, textTransform: 'uppercase' }}>
+            ◆ DAILY ML SIGNAL — {pair}
+          </div>
+          <div style={{ borderRadius: 6, border: `1px solid ${dirBorder(dailySignal.direction)}`, background: dirBg(dailySignal.direction), padding: 16 }}>
+            {/* Header row */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{ fontFamily: 'Rajdhani', fontSize: 36, fontWeight: 900, color: dirColor(dailySignal.direction), letterSpacing: 2 }}>
+                  {dailySignal.direction}
+                </div>
+                <div>
+                  <div className="mono" style={{ fontSize: 20, fontWeight: 700, color: dirColor(dailySignal.direction) }}>
+                    {dailySignal.confidence}%
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                    {dailySignal.confirmedLayers}/{dailySignal.totalLayers} layers confirmed
+                  </div>
+                </div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 2 }}>Feature date</div>
+                <div className="mono" style={{ fontSize: 11 }}>{dailySignal.featureDate}</div>
+                <div style={{ fontSize: 9, color: C.purple, marginTop: 3 }}>XGBoost · 26y daily OHLCV</div>
+              </div>
+            </div>
+
+            {/* Price levels */}
+            {dailySignal.entry && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8, marginBottom: 14 }}>
+                <PriceLevel label="ENTRY" value={dailySignal.entry?.toFixed(dp(pair)) ?? '—'} color="var(--text-primary)" pips={null} />
+                <PriceLevel label="SL" value={dailySignal.sl?.toFixed(dp(pair)) ?? '—'} color={C.red} pips={dailySignal.slPips} />
+                <PriceLevel label="TP1" value={dailySignal.tp1?.toFixed(dp(pair)) ?? '—'} color={C.green} pips={dailySignal.tp1Pips} />
+                <PriceLevel label="TP2" value={dailySignal.tp2?.toFixed(dp(pair)) ?? '—'} color={C.green} pips={dailySignal.tp2Pips} />
+                <PriceLevel label="TP3" value={dailySignal.tp3?.toFixed(dp(pair)) ?? '—'} color={C.teal} pips={dailySignal.tp3Pips} />
+              </div>
+            )}
+
+            {/* Layer confirmations */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6, marginBottom: 14 }}>
+              {dailySignal.layers.map((l, i) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, padding: '6px 8px', borderRadius: 3, background: l.confirmed ? 'rgba(0,255,135,0.06)' : 'rgba(255,48,86,0.06)', border: `1px solid ${l.confirmed ? 'rgba(0,255,135,0.15)' : 'rgba(255,48,86,0.15)'}` }}>
+                  <span style={{ fontSize: 12, color: l.confirmed ? C.green : C.red, flexShrink: 0 }}>{l.confirmed ? '✓' : '✗'}</span>
+                  <div>
+                    <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.5, color: l.confirmed ? C.green : C.red }}>{l.name}</div>
+                    <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 1 }}>{l.note}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Top feature contributions */}
+            {Object.keys(dailySignal.featureContributions).length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 6 }}>TOP FEATURES</div>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {Object.entries(dailySignal.featureContributions).map(([k, v]) => (
+                    <div key={k} style={{ fontSize: 9, padding: '2px 8px', borderRadius: 2, background: 'rgba(168,85,247,0.1)', border: '1px solid rgba(168,85,247,0.2)', color: C.purple }}>
+                      {k}: {v.value.toFixed(3)} <span style={{ opacity: 0.6 }}>({(v.importance * 100).toFixed(1)}%)</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Actions */}
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              {dailySignal.entry && (
+                <CopyValue value={`${dailySignal.direction} ${pair} | Entry: ${dailySignal.entry?.toFixed(dp(pair))} | SL: ${dailySignal.sl?.toFixed(dp(pair))} | TP1: ${dailySignal.tp1?.toFixed(dp(pair))} | TP2: ${dailySignal.tp2?.toFixed(dp(pair))} | TP3: ${dailySignal.tp3?.toFixed(dp(pair))}`}>
+                  <button style={btnStyle(C.purple)}>⎘ COPY LEVELS</button>
+                </CopyValue>
+              )}
+              <button
+                onClick={() => { if (!retraining) triggerRetrain() }}
+                disabled={retraining}
+                style={{ ...btnStyle(C.muted), opacity: retraining ? 0.5 : 1 }}
+              >
+                {retraining ? '⟳ RETRAINING…' : '↻ RETRAIN MODEL'}
+              </button>
+              <div style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--text-muted)' }}>
+                Updated: {new Date(dailySignal.timestamp).toLocaleTimeString('en', { hour12: false })}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Layer 5: Risk ── */}
       <Panel title="LAYER 5 — RISK MANAGEMENT GATE" badge={
@@ -747,6 +949,65 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
           </div>
         </Panel>
       </div>
+
+      {/* ── Daily signal history + performance ── */}
+      {(dailyHistory.length > 0 || dailySignal?.workerStatus) && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 12 }}>
+          <Panel title="DAILY SIGNAL HISTORY" badge={<span className="mono" style={{ fontSize: 10, color: 'var(--text-muted)' }}>{dailyHistory.length} signals</span>}>
+            <div style={{ padding: 14, maxHeight: 220, overflowY: 'auto' }}>
+              {dailyHistory.length === 0 ? (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', padding: 16 }}>No signals yet — confidence ≥ 60% required</div>
+              ) : dailyHistory.map(h => (
+                <div key={h.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px solid var(--border)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ fontSize: 9, fontWeight: 800, padding: '1px 6px', borderRadius: 2, color: dirColor(h.direction), background: dirBg(h.direction) }}>{h.direction}</span>
+                    <span className="mono" style={{ fontSize: 11 }}>{h.pair}</span>
+                    {h.entry && <span className="mono" style={{ fontSize: 10, color: 'var(--text-muted)' }}>@ {h.entry.toFixed(dp(h.pair))}</span>}
+                  </div>
+                  <div style={{ textAlign: 'right' }}>
+                    <span className="mono" style={{ fontSize: 11, color: dirColor(h.direction) }}>{h.confidence}%</span>
+                    <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>{new Date(h.timestamp).toLocaleTimeString('en', { hour12: false })}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Panel>
+
+          <Panel title="DAILY MODEL PERFORMANCE" badge={<LayerBadge label="WORKER" color={C.purple} />}>
+            <div style={{ padding: 14 }}>
+              {dailySignal?.workerStatus ? (() => {
+                const ws = dailySignal.workerStatus!
+                return (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, fontSize: 11 }}>
+                    <Row label="Status"   value={ws.worker_status ?? '—'} />
+                    <Row label="Version"  value={ws.model_version ? `v${ws.model_version}` : '—'} />
+                    <Row label="AUC"      value={ws.model_auc?.toFixed(4) ?? '—'} />
+                    <Row label="Accuracy" value={ws.model_accuracy ? `${(ws.model_accuracy * 100).toFixed(1)}%` : '—'} />
+                    <Row label="Dataset"  value={ws.dataset_size ? `${ws.dataset_size.toLocaleString()} rows` : '—'} />
+                    <Row label="Freshness" value={ws.data_freshness ?? '—'} />
+                    {ws.rows_added !== undefined && <Row label="New rows" value={`+${ws.rows_added}`} />}
+                    {ws.last_trained && <Row label="Last trained" value={new Date(ws.last_trained).toLocaleDateString('en')} />}
+                    {ws.top_features && ws.top_features.length > 0 && (
+                      <div style={{ gridColumn: '1 / -1', marginTop: 6 }}>
+                        <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 4 }}>TOP FEATURES</div>
+                        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                          {ws.top_features.slice(0, 5).map(f => (
+                            <span key={f} style={{ fontSize: 9, padding: '1px 6px', borderRadius: 2, background: 'rgba(168,85,247,0.1)', border: '1px solid rgba(168,85,247,0.2)', color: C.purple }}>{f}</span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )
+              })() : (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: 8 }}>
+                  Run worker_daily.py to populate model status
+                </div>
+              )}
+            </div>
+          </Panel>
+        </div>
+      )}
 
       {/* ── Feedback loop ── */}
       <div style={{ marginTop: 12 }}>
@@ -822,3 +1083,15 @@ function pillStyle(active: boolean): React.CSSProperties {
 }
 
 const tagStyle: React.CSSProperties = { fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1.5, fontWeight: 700, alignSelf: 'center' }
+
+function PriceLevel({ label, value, color, pips }: { label: string; value: string; color: string; pips: number | null }) {
+  return (
+    <div style={{ padding: '8px 10px', borderRadius: 3, background: 'rgba(0,0,0,0.2)', border: '1px solid var(--border)', textAlign: 'center' }}>
+      <div style={{ fontSize: 9, color, fontWeight: 700, letterSpacing: 1, marginBottom: 3 }}>{label}</div>
+      <div className="mono" style={{ fontSize: 13, fontWeight: 700, color }}>
+        <CopyValue value={value}>{value}</CopyValue>
+      </div>
+      {pips !== null && <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 2 }}>{pips} pips</div>}
+    </div>
+  )
+}
