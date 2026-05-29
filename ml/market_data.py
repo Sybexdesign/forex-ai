@@ -477,8 +477,8 @@ def build_splits(
     gold_feat, silver_feat = _engineer(gold_clean, silver_clean)
 
     # Tag asset, combine, and sort chronologically
-    gold_feat['_asset']   = 0   # 0 = gold
-    silver_feat['_asset'] = 1   # 1 = silver
+    gold_feat['is_silver']   = 0
+    silver_feat['is_silver'] = 1
     combined = pd.concat([gold_feat, silver_feat]).sort_index()
 
     # Drop NaN rows produced by rolling windows and lag shifts (also drops last row)
@@ -494,8 +494,7 @@ def build_splits(
         print("     download completes.  Re-run in a few minutes to retry.\n")
         sys.exit(1)
 
-    feature_cols = [c for c in combined.columns
-                    if c not in _EXCLUDE and not c.startswith('_')]
+    feature_cols = [c for c in combined.columns if c not in _EXCLUDE]
 
     X      = combined[feature_cols].values.astype(float)
     y      = combined['target'].values.astype(int)
