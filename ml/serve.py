@@ -14,9 +14,16 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 
-MODEL_DIR   = os.path.join(os.path.dirname(__file__), 'model')
+# Ensure the directory containing this file is always on sys.path so that
+# market_data.py and worker_daily.py can be imported regardless of how
+# uvicorn/Railway resolves the working directory.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+MODEL_DIR   = os.path.join(_HERE, 'model')
 STATUS_PATH = os.path.join(MODEL_DIR, 'worker_status.json')
-DATA_DIR    = os.path.join(os.path.dirname(__file__), 'data')
+DATA_DIR    = os.path.join(_HERE, 'data')
 
 PIP_VALUES = {
     'EUR/USD': 0.0001, 'GBP/USD': 0.0001, 'AUD/USD': 0.0001,
@@ -245,7 +252,7 @@ def worker_retrain():
         if _retrain_thread and _retrain_thread.is_alive():
             return {'status': 'already_running'}
 
-        worker_script = os.path.join(os.path.dirname(__file__), 'worker_daily.py')
+        worker_script = os.path.join(_HERE, 'worker_daily.py')
 
         def _run():
             try:
