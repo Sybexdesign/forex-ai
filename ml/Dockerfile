@@ -6,8 +6,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY serve.py .
+COPY worker_daily.py .
+COPY market_data.py .
 COPY retrain.sh .
 COPY model/ ./model/
+
+RUN mkdir -p /app/data
 
 EXPOSE 8100
 

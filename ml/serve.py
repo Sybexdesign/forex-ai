@@ -291,7 +291,20 @@ def predict_daily_auto(pair: str = Query(..., description="XAU/USD or XAG/USD"))
     gold_csv   = os.path.join(DATA_DIR, 'gold_raw.csv')
     silver_csv = os.path.join(DATA_DIR, 'silver_raw.csv')
     if not os.path.exists(gold_csv) or not os.path.exists(silver_csv):
-        raise HTTPException(status_code=503, detail="Market data CSVs not found. Run: python worker_daily.py")
+        # Auto-seed: download ~10 years of history so the endpoint works on cold starts
+        print("  ℹ  CSVs missing — seeding market data from yfinance (first-run auto-seed)...")
+        try:
+            from market_data import _fetch_yfinance, _save_cache, START_DATE
+            os.makedirs(DATA_DIR, exist_ok=True)
+            yf_data = _fetch_yfinance(START_DATE)
+            for m, df in yf_data.items():
+                if not df.empty:
+                    _save_cache(m, df)
+                    print(f"  ✓  {m} seeded: {len(df)} rows")
+        except Exception as seed_err:
+            raise HTTPException(status_code=503, detail=f"Market data CSVs not found and auto-seed failed: {seed_err}")
+        if not os.path.exists(gold_csv) or not os.path.exists(silver_csv):
+            raise HTTPException(status_code=503, detail="Market data CSVs still missing after auto-seed attempt")
 
     try:
         import pandas as pd
