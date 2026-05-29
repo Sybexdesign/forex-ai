@@ -35,7 +35,23 @@ model.load_model(model_path)
 with open(features_path) as f:
     FEATURE_NAMES = json.load(f)
 
-print(f"✓ Model loaded: {len(FEATURE_NAMES)} features")
+print(f"✓ Scalper model loaded: {len(FEATURE_NAMES)} features")
+
+# Load daily model — optional, graceful degradation if not yet trained
+daily_model_path    = os.path.join(MODEL_DIR, 'daily_model.json')
+daily_features_path = os.path.join(MODEL_DIR, 'daily_features.json')
+
+daily_model: Optional[xgb.XGBClassifier] = None
+DAILY_FEATURE_NAMES: list = []
+
+if os.path.exists(daily_model_path) and os.path.exists(daily_features_path):
+    daily_model = xgb.XGBClassifier()
+    daily_model.load_model(daily_model_path)
+    with open(daily_features_path) as f:
+        DAILY_FEATURE_NAMES = json.load(f)
+    print(f"✓ Daily model loaded: {len(DAILY_FEATURE_NAMES)} features")
+else:
+    print("ℹ  Daily model not found — run: python ml/train_daily.py")
 
 app = FastAPI(title="ForexAI Scalper ML", version="1.0")
 
@@ -55,6 +71,18 @@ class PredictResponse(BaseModel):
     win_probability:      float
     should_trade:         bool
     ml_confidence:        int
+    feature_contributions: dict
+
+
+class DailyPredictRequest(BaseModel):
+    pair:     str            # 'XAU/USD' or 'XAG/USD'
+    features: dict           # pre-computed 28 daily features from market_data.py
+
+
+class DailyPredictResponse(BaseModel):
+    up_probability:        float
+    direction:             str   # 'UP' or 'DOWN'
+    confidence:            int
     feature_contributions: dict
 
 
@@ -148,12 +176,41 @@ def predict(req: PredictRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post('/predict_daily', response_model=DailyPredictResponse)
+def predict_daily(req: DailyPredictRequest):
+    if daily_model is None:
+        raise HTTPException(status_code=503, detail="Daily model not loaded. Run: python ml/train_daily.py")
+    try:
+        X      = np.array([[req.features.get(f, 0) for f in DAILY_FEATURE_NAMES]])
+        proba  = daily_model.predict_proba(X)[0]
+        up_prob = float(proba[1])
+
+        importances = daily_model.feature_importances_
+        sorted_idx  = np.argsort(importances)[::-1][:5]
+        top_feats   = {
+            DAILY_FEATURE_NAMES[i]: {
+                'importance': round(float(importances[i]), 4),
+                'value':      round(float(req.features.get(DAILY_FEATURE_NAMES[i], 0)), 4),
+            }
+            for i in sorted_idx
+        }
+
+        return DailyPredictResponse(
+            up_probability=round(up_prob, 4),
+            direction='UP' if up_prob >= 0.5 else 'DOWN',
+            confidence=int(up_prob * 100),
+            feature_contributions=top_feats,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get('/health')
 def health():
     return {
-        'status':   'ok',
-        'model':    'xgboost',
-        'features': len(FEATURE_NAMES),
+        'status':        'ok',
+        'scalper_model': {'features': len(FEATURE_NAMES)},
+        'daily_model':   {'features': len(DAILY_FEATURE_NAMES), 'loaded': daily_model is not None},
     }
 
 

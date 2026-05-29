@@ -1,0 +1,1 @@
+["daily_return", "return_5d", "return_20d", "SMA_10", "SMA_20", "SMA_50", "SMA_200", "vol_10d", "vol_20d", "RSI_14", "MACD_line", "MACD_signal", "MACD_histogram", "BB_upper", "BB_lower", "BB_width", "vol_SMA_20", "vol_ratio", "gs_ratio", "close_lag1", "return_lag1", "close_lag2", "return_lag2", "close_lag3", "return_lag3", "close_lag5", "return_lag5", "is_silver"]
