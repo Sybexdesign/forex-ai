@@ -306,58 +306,30 @@ def predict_daily_auto(pair: str = Query(..., description="XAU/USD or XAG/USD"))
         return df
 
     def _seed_yfinance() -> dict:
-        """Download last 10 years from yfinance and cache to CSV."""
+        """Download 2 years of data (sufficient for 200-day SMA + lags) and cache to CSV."""
         import yfinance as yf, time as _time
         os.makedirs(DATA_DIR, exist_ok=True)
-        START = '2000-01-01'
-        SYMS  = {'GC=F': ('gold', 'futures'), 'SI=F': ('silver', 'futures'),
-                 'GLD':  ('gold', 'etf'),     'SLV':  ('silver', 'etf')}
         result: dict = {'gold': pd.DataFrame(), 'silver': pd.DataFrame()}
-        buckets: dict = {'gold': {}, 'silver': {}}
-        print("  yfinance ▸ seeding CSVs...")
-        for attempt in range(1, 4):
-            raw = yf.download(list(SYMS.keys()), start=START, progress=False,
-                              auto_adjust=True, group_by='ticker')
-            if raw is not None and not raw.empty:
-                break
-            if attempt < 3:
-                print(f"    ⚠  rate-limit — retry {attempt}/3")
-                _time.sleep(20)
-        if raw is None or raw.empty:
-            # single-ticker fallback
-            for sym, (m, _) in list(SYMS.items())[:2]:
-                if not result[m].empty:
-                    continue
-                for att in range(1, 4):
-                    try:
-                        df = yf.Ticker(sym).history(start=START, auto_adjust=True)
-                        if not df.empty:
-                            df = df[['Open','High','Low','Close','Volume']].copy()
-                            df.index = pd.to_datetime(df.index).tz_localize(None)
-                            df.index.name = 'Date'
-                            result[m] = df
-                            break
-                    except Exception:
-                        if att < 3: _time.sleep(20)
-        else:
-            for sym, (m, kind) in SYMS.items():
+        TICKER_MAP = {'gold': 'GC=F', 'silver': 'SI=F'}
+        print("  yfinance ▸ seeding CSVs (period=2y)...")
+        for metal, sym in TICKER_MAP.items():
+            for attempt in range(1, 4):
                 try:
-                    lvl = raw.columns.get_level_values(0)
-                    df = raw[sym][['Open','High','Low','Close','Volume']].copy() if sym in lvl else pd.DataFrame()
-                    df = df.dropna(how='all')
-                    if not df.empty:
+                    df = yf.Ticker(sym).history(period='2y', auto_adjust=True)
+                    if df is not None and not df.empty:
+                        df = df[['Open','High','Low','Close','Volume']].copy()
                         df.index = pd.to_datetime(df.index).tz_localize(None)
                         df.index.name = 'Date'
                         df.columns.name = None
-                        buckets[m][kind] = df
-                except Exception:
-                    pass
-            for m in ('gold', 'silver'):
-                result[m] = buckets[m].get('futures') or buckets[m].get('etf') or pd.DataFrame()
-        for m, df in result.items():
-            if not df.empty:
-                df.to_csv(os.path.join(DATA_DIR, f'{m}_raw.csv'))
-                print(f"  ✓  {m}: {len(df)} rows cached")
+                        result[metal] = df
+                        path = os.path.join(DATA_DIR, f'{metal}_raw.csv')
+                        df.to_csv(path)
+                        print(f"  ✓  {metal}: {len(df)} rows → {path}")
+                        break
+                except Exception as e:
+                    print(f"  ⚠  {sym} attempt {attempt}/3: {e}")
+                    if attempt < 3:
+                        _time.sleep(15)
         return result
 
     def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
