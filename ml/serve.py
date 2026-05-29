@@ -7,7 +7,9 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 import numpy as np
+import pandas as pd
 import xgboost as xgb
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -57,6 +59,78 @@ _AUTO_CACHE_TTL = 3600  # seconds
 # Background retrain state
 _retrain_lock   = threading.Lock()
 _retrain_thread: Optional[threading.Thread] = None
+
+# ── Seed state (module-level so seed runs in background at startup) ───────────
+_seed_lock   = threading.Lock()
+_seed_status = 'idle'   # 'idle' | 'running' | 'done' | 'error'
+_seed_error_msg = ''
+
+
+def _do_seed_yfinance() -> None:
+    """Download 2 years of daily data and write CSVs. Raises RuntimeError on failure."""
+    import yfinance as yf
+    os.makedirs(DATA_DIR, exist_ok=True)
+    TICKER_MAP = {'gold': 'GC=F', 'silver': 'SI=F'}
+    print("  yfinance ▸ seeding CSVs (period=2y)...")
+    for metal, sym in TICKER_MAP.items():
+        last_err = 'unknown'
+        saved    = False
+        for attempt in range(1, 4):
+            try:
+                df = yf.Ticker(sym).history(period='2y', auto_adjust=True, timeout=30)
+                if df is not None and not df.empty:
+                    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+                    df.index = pd.to_datetime(df.index).tz_localize(None)
+                    df.index.name  = 'Date'
+                    df.columns.name = None
+                    path = os.path.join(DATA_DIR, f'{metal}_raw.csv')
+                    df.to_csv(path)
+                    print(f"  ✓  {metal}: {len(df)} rows → {path}")
+                    saved = True
+                    break
+                else:
+                    last_err = f"empty DataFrame from {sym}"
+                    print(f"  ⚠  {sym} attempt {attempt}/3: empty data")
+            except Exception as exc:
+                last_err = str(exc)
+                print(f"  ⚠  {sym} attempt {attempt}/3: {exc}")
+            if attempt < 3:
+                time.sleep(5)
+        if not saved:
+            raise RuntimeError(f"seed failed for {metal} ({sym}): {last_err}")
+
+
+def _start_seed_if_needed() -> None:
+    """Trigger background CSV seed if CSVs are absent and no seed is running."""
+    global _seed_status, _seed_error_msg
+    gold_csv   = os.path.join(DATA_DIR, 'gold_raw.csv')
+    silver_csv = os.path.join(DATA_DIR, 'silver_raw.csv')
+    if os.path.exists(gold_csv) and os.path.exists(silver_csv):
+        with _seed_lock:
+            _seed_status = 'done'
+        return
+    with _seed_lock:
+        if _seed_status in ('running', 'done'):
+            return
+        _seed_status = 'running'
+
+    def _run():
+        global _seed_status, _seed_error_msg
+        try:
+            _do_seed_yfinance()
+            with _seed_lock:
+                _seed_status = 'done'
+        except Exception as exc:
+            with _seed_lock:
+                _seed_status   = 'error'
+                _seed_error_msg = str(exc)
+            print(f"  ✗  Seed background thread failed: {exc}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# Kick off seed at module load so CSVs are ready before the first request
+_start_seed_if_needed()
 
 # Load daily model — optional, graceful degradation if not yet trained
 daily_model_path    = os.path.join(MODEL_DIR, 'daily_model.json')
@@ -239,10 +313,16 @@ def health():
 
 @app.get('/worker/status')
 def worker_status():
+    with _seed_lock:
+        seed_st  = _seed_status
+        seed_err = _seed_error_msg
+    base = {'seed_status': seed_st}
+    if seed_err:
+        base['seed_error'] = seed_err
     if not os.path.exists(STATUS_PATH):
-        return {'worker_status': 'never_run'}
+        return {**base, 'worker_status': 'never_run'}
     with open(STATUS_PATH) as f:
-        return json.load(f)
+        return {**base, **json.load(f)}
 
 
 @app.post('/worker/retrain')
@@ -280,6 +360,62 @@ def worker_retrain():
     return {'status': 'started'}
 
 
+def _load_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, index_col='Date', parse_dates=True)
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    return df
+
+
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in ('Open', 'High', 'Low', 'Close', 'Volume'):
+        df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
+    df.dropna(subset=['Close'], how='all', inplace=True)
+    df.ffill(limit=3, inplace=True)
+    df.ffill(inplace=True)
+    return df
+
+
+def _engineer_features(gold: pd.DataFrame, silver: pd.DataFrame):
+    warnings.filterwarnings('ignore')
+    common   = gold.index.intersection(silver.index)
+    g        = gold.reindex(common).copy()
+    s        = silver.reindex(common).copy()
+    gs_ratio = g['Close'] / s['Close'].replace(0, np.nan)
+    for df in (g, s):
+        c = df['Close']
+        df['daily_return'] = c.pct_change()
+        df['return_5d']    = c.pct_change(5)
+        df['return_20d']   = c.pct_change(20)
+        for w in (10, 20, 50, 200):
+            df[f'SMA_{w}'] = c.rolling(w).mean()
+        for w in (10, 20):
+            df[f'vol_{w}d'] = df['daily_return'].rolling(w).std()
+        delta = c.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        df['RSI_14'] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+        ema12 = c.ewm(span=12, adjust=False).mean()
+        ema26 = c.ewm(span=26, adjust=False).mean()
+        df['MACD_line']      = ema12 - ema26
+        df['MACD_signal']    = df['MACD_line'].ewm(span=9, adjust=False).mean()
+        df['MACD_histogram'] = df['MACD_line'] - df['MACD_signal']
+        sma20 = c.rolling(20).mean()
+        std20 = c.rolling(20).std()
+        df['BB_upper']   = sma20 + 2 * std20
+        df['BB_lower']   = sma20 - 2 * std20
+        df['BB_width']   = (df['BB_upper'] - df['BB_lower']) / sma20.replace(0, np.nan)
+        vol_sma = df['Volume'].rolling(20).mean()
+        df['vol_SMA_20'] = vol_sma
+        df['vol_ratio']  = df['Volume'] / vol_sma.replace(0, np.nan)
+        df['gs_ratio']   = gs_ratio
+        for lag in (1, 2, 3, 5):
+            df[f'close_lag{lag}']  = c.shift(lag)
+            df[f'return_lag{lag}'] = df['daily_return'].shift(lag)
+        df['target'] = (c.shift(-1) > c).astype(int)
+    return g, s
+
+
 @app.get('/predict_daily_auto')
 def predict_daily_auto(pair: str = Query(..., description="XAU/USD or XAG/USD")):
     if daily_model is None:
@@ -294,111 +430,24 @@ def predict_daily_auto(pair: str = Query(..., description="XAU/USD or XAG/USD"))
     if cached and (time.time() - cached['ts']) < _AUTO_CACHE_TTL:
         return {**cached['result'], 'cached': True}
 
-    import pandas as pd
-    import warnings
-    warnings.filterwarnings('ignore')
+    # Check background seed state — never block the request on a download
+    with _seed_lock:
+        status = _seed_status
+        err    = _seed_error_msg
+    if status == 'running':
+        raise HTTPException(status_code=503, detail="data warming up — seed in progress, retry in 30s")
+    if status == 'error':
+        _start_seed_if_needed()   # retry seed
+        raise HTTPException(status_code=503, detail=f"seed failed: {err} — retrying in background")
+    if status == 'idle':
+        _start_seed_if_needed()
+        raise HTTPException(status_code=503, detail="data seed started — retry in 30s")
 
-    # ── Inline helpers (no market_data.py dependency) ─────────────────────────
-
-    def _load_csv(path: str) -> pd.DataFrame:
-        df = pd.read_csv(path, index_col='Date', parse_dates=True)
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        return df
-
-    def _seed_yfinance() -> None:
-        """Download 2 years of daily data and cache to CSV. Raises on failure."""
-        import yfinance as yf, time as _time
-        os.makedirs(DATA_DIR, exist_ok=True)
-        TICKER_MAP = {'gold': 'GC=F', 'silver': 'SI=F'}
-        print("  yfinance ▸ seeding CSVs (period=2y)...")
-        for metal, sym in TICKER_MAP.items():
-            last_err: str = 'unknown'
-            saved = False
-            for attempt in range(1, 4):
-                try:
-                    ticker = yf.Ticker(sym)
-                    df = ticker.history(period='2y', auto_adjust=True, timeout=30)
-                    if df is not None and not df.empty:
-                        df = df[['Open','High','Low','Close','Volume']].copy()
-                        df.index = pd.to_datetime(df.index).tz_localize(None)
-                        df.index.name = 'Date'
-                        df.columns.name = None
-                        path = os.path.join(DATA_DIR, f'{metal}_raw.csv')
-                        df.to_csv(path)
-                        print(f"  ✓  {metal}: {len(df)} rows → {path}")
-                        saved = True
-                        break
-                    else:
-                        last_err = f"empty DataFrame from {sym}"
-                        print(f"  ⚠  {sym} attempt {attempt}/3: empty data")
-                except Exception as e:
-                    last_err = str(e)
-                    print(f"  ⚠  {sym} attempt {attempt}/3: {e}")
-                if attempt < 3:
-                    _time.sleep(5)
-            if not saved:
-                raise RuntimeError(f"seed failed for {metal} ({sym}): {last_err}")
-
-    def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        for col in ('Open','High','Low','Close','Volume'):
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
-        df.dropna(subset=['Close'], how='all', inplace=True)
-        df.ffill(limit=3, inplace=True)
-        df.ffill(inplace=True)
-        return df
-
-    def _engineer_features(gold: pd.DataFrame, silver: pd.DataFrame):
-        common = gold.index.intersection(silver.index)
-        g = gold.reindex(common).copy()
-        s = silver.reindex(common).copy()
-        gs_ratio = g['Close'] / s['Close'].replace(0, np.nan)
-        for df in (g, s):
-            c = df['Close']
-            df['daily_return'] = c.pct_change()
-            df['return_5d']    = c.pct_change(5)
-            df['return_20d']   = c.pct_change(20)
-            for w in (10, 20, 50, 200):
-                df[f'SMA_{w}'] = c.rolling(w).mean()
-            for w in (10, 20):
-                df[f'vol_{w}d'] = df['daily_return'].rolling(w).std()
-            delta = c.diff()
-            gain  = delta.clip(lower=0).rolling(14).mean()
-            loss  = (-delta.clip(upper=0)).rolling(14).mean()
-            df['RSI_14'] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-            ema12 = c.ewm(span=12, adjust=False).mean()
-            ema26 = c.ewm(span=26, adjust=False).mean()
-            df['MACD_line']      = ema12 - ema26
-            df['MACD_signal']    = df['MACD_line'].ewm(span=9, adjust=False).mean()
-            df['MACD_histogram'] = df['MACD_line'] - df['MACD_signal']
-            sma20 = c.rolling(20).mean()
-            std20 = c.rolling(20).std()
-            df['BB_upper'] = sma20 + 2 * std20
-            df['BB_lower'] = sma20 - 2 * std20
-            df['BB_width'] = (df['BB_upper'] - df['BB_lower']) / sma20.replace(0, np.nan)
-            vol_sma = df['Volume'].rolling(20).mean()
-            df['vol_SMA_20'] = vol_sma
-            df['vol_ratio']  = df['Volume'] / vol_sma.replace(0, np.nan)
-            df['gs_ratio']   = gs_ratio
-            for lag in (1, 2, 3, 5):
-                df[f'close_lag{lag}']  = c.shift(lag)
-                df[f'return_lag{lag}'] = df['daily_return'].shift(lag)
-            df['target'] = (c.shift(-1) > c).astype(int)
-        return g, s
-
-    # ── Load or seed CSVs ─────────────────────────────────────────────────────
     gold_csv   = os.path.join(DATA_DIR, 'gold_raw.csv')
     silver_csv = os.path.join(DATA_DIR, 'silver_raw.csv')
-
     if not os.path.exists(gold_csv) or not os.path.exists(silver_csv):
-        print("  ℹ  CSVs missing — running auto-seed from yfinance...")
-        try:
-            _seed_yfinance()
-        except Exception as seed_err:
-            raise HTTPException(status_code=503, detail=f"Auto-seed failed: {seed_err}")
-
-    if not os.path.exists(gold_csv) or not os.path.exists(silver_csv):
-        raise HTTPException(status_code=503, detail="CSVs still missing after auto-seed")
+        _start_seed_if_needed()
+        raise HTTPException(status_code=503, detail="CSVs not ready — retry in 30s")
 
     try:
         gold_raw   = _load_csv(gold_csv)
