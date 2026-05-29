@@ -23,10 +23,14 @@ import warnings
 from typing import Optional, Tuple, List
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env.local'))
+load_dotenv()
 
 warnings.filterwarnings('ignore')
 
-START_DATE  = '2010-01-01'
+START_DATE  = '2000-01-01'
 TRAIN_RATIO = 0.80
 MAX_FFILL   = 3   # max consecutive days to forward-fill (weekends / holidays)
 
@@ -147,6 +151,36 @@ def _fetch_yfinance(start: str) -> dict:
         if not df.empty:
             _save_cache(metal, df)
             print(f"  ✓  {metal} cached → ml/data/{metal}_raw.csv")
+
+    # Single-ticker fallback: Ticker.history() uses a different endpoint and is
+    # less aggressively rate-limited than yf.download() batch requests.
+    if result['gold'].empty or result['silver'].empty:
+        TICKER_MAP = {'gold': 'GC=F', 'silver': 'SI=F'}
+        for metal, sym in TICKER_MAP.items():
+            if not result[metal].empty:
+                continue
+            print(f"  yfinance Ticker ▸ {sym}  ({metal} futures, single-ticker fallback)")
+            for attempt in range(1, 4):
+                try:
+                    ticker = yf.Ticker(sym)
+                    df = ticker.history(start=start, auto_adjust=True)
+                    if df.empty:
+                        raise ValueError("empty result")
+                    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+                    df.index = pd.to_datetime(df.index).tz_localize(None)
+                    df.index.name = 'Date'
+                    df.columns.name = None
+                    print(f"    ✓  {len(df):,} rows  ({df.index[0].date()} → {df.index[-1].date()})")
+                    result[metal] = df
+                    _save_cache(metal, df)
+                    print(f"  ✓  {metal} cached → ml/data/{metal}_raw.csv")
+                    break
+                except Exception as exc:
+                    if attempt < 3:
+                        print(f"    ⚠  attempt {attempt}/3 failed: {str(exc)[:60]} — waiting 20s")
+                        time.sleep(20)
+                    else:
+                        print(f"    ✗  {sym} single-ticker failed: {str(exc)[:80]}")
 
     # If yfinance failed entirely, fall back to FRED (no API key, no rate limit)
     if result['gold'].empty or result['silver'].empty:
