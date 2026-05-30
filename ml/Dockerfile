@@ -10,8 +10,7 @@ COPY worker_daily.py .
 COPY market_data.py .
 COPY retrain.sh .
 COPY model/ ./model/
-
-RUN mkdir -p /app/data
+COPY data/ ./data/
 
 EXPOSE 8100
 
