@@ -12,7 +12,8 @@ export interface NewsEvent {
   impact: 'high' | 'medium' | 'low'
   time: string
   minutesAway: number
-  isInWindow: boolean
+  isInWindow: boolean  // within 30-min trading block window
+  isToday: boolean
 }
 
 export async function GET() {
@@ -43,11 +44,16 @@ export async function GET() {
 
     const inWindow = events.some(e => e.impact === 'high' && e.isInWindow)
 
+    const todayEvents  = events.filter(e => e.isToday)
+    const upcomingHigh = events.filter(e => e.impact === 'high' && e.minutesAway > 0)
+
     return NextResponse.json({
-      events: events.slice(0, 10),
+      events:               events.slice(0, 20),   // up to 20 events for the week
+      todayEvents:          todayEvents.slice(0, 10),
       hasHighImpactInWindow: inWindow,
-      windowMinutes: 30,
-      checkedAt: now.toISOString(),
+      nextHighImpact:       upcomingHigh[0] ?? null,
+      windowMinutes:        30,
+      checkedAt:            now.toISOString(),
       simulated,
     })
   } catch (error: any) {
@@ -60,21 +66,25 @@ export async function GET() {
 }
 
 function parseForexFactoryEvents(data: any[], now: Date): NewsEvent[] {
+  const todayStr = now.toISOString().split('T')[0]
   return data
-    .filter(e => e.impact === 'High')
+    .filter(e => e.impact === 'High' || e.impact === 'Medium')
     .map(e => {
       const eventTime = new Date(e.date)
       const minutesAway = Math.round((eventTime.getTime() - now.getTime()) / 60000)
+      const isToday = eventTime.toISOString().startsWith(todayStr)
       return {
-        title: e.title,
-        currency: e.country,
-        impact: 'high' as const,
-        time: eventTime.toISOString(),
+        title:     e.title,
+        currency:  e.country,
+        impact:    (e.impact === 'High' ? 'high' : 'medium') as 'high' | 'medium' | 'low',
+        time:      eventTime.toISOString(),
         minutesAway,
         isInWindow: minutesAway >= -5 && minutesAway <= 30,
+        isToday,
       }
     })
-    .filter(e => e.minutesAway > -60 && e.minutesAway < 240)
+    // Show: events within last hour, all future events up to end of week (10,080 min = 7 days)
+    .filter(e => e.minutesAway > -60 && e.minutesAway < 10080)
     .sort((a, b) => a.minutesAway - b.minutesAway)
 }
 
@@ -86,15 +96,17 @@ function generateSimulatedEvents(now: Date): NewsEvent[] {
     { title: 'GBP CPI y/y', currency: 'GBP', minutesOffset: -30 }, // past
     { title: 'USD Federal Reserve FOMC Meeting', currency: 'USD', minutesOffset: 180 },
   ]
+  const todayStr = now.toISOString().split('T')[0]
   return events.map(e => {
     const eventTime = new Date(now.getTime() + e.minutesOffset * 60000)
     return {
-      title: e.title,
-      currency: e.currency,
-      impact: 'high' as const,
-      time: eventTime.toISOString(),
+      title:      e.title,
+      currency:   e.currency,
+      impact:     'high' as const,
+      time:       eventTime.toISOString(),
       minutesAway: e.minutesOffset,
       isInWindow: e.minutesOffset >= -5 && e.minutesOffset <= 30,
+      isToday:    eventTime.toISOString().startsWith(todayStr),
     }
   })
 }
