@@ -299,9 +299,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
       {/* Live scalp signals — always-on direction panel for Gold and Silver */}
-      <div style={{
-        display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10,
-      }}>
+      <div className="scalp-signal-grid">
         {METALS_ONLY.map(pair => {
           const sig  = scalpSignals[pair]
           const name = pair === 'XAU/USD' ? 'Gold' : 'Silver'
@@ -312,7 +310,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           const actualMsLeft = sig ? Math.max(0, sig.expiresAt - Date.now()) : 0
           const mLeft = Math.floor(actualMsLeft / 60000)
           const sLeft = Math.floor((actualMsLeft % 60000) / 1000)
-          const dirColor = dir === 'BUY' ? 'var(--color-buy)' : dir === 'SELL' ? 'var(--color-sell)' : 'var(--text-muted)'
+          const dirColor    = dir === 'BUY' ? 'var(--color-buy)' : dir === 'SELL' ? 'var(--color-sell)' : 'var(--text-muted)'
           const borderColor = dir === 'BUY' ? 'rgba(0,200,83,0.3)' : dir === 'SELL' ? 'rgba(255,48,86,0.3)' : 'rgba(255,255,255,0.1)'
           const bgColor     = dir === 'BUY' ? 'rgba(0,200,83,0.05)' : dir === 'SELL' ? 'rgba(255,48,86,0.05)' : 'rgba(255,255,255,0.02)'
           const dp = pair.startsWith('XAU') ? 2 : 3
@@ -320,70 +318,80 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             <div key={pair} style={{
               padding: '14px 16px', borderRadius: 4,
               background: bgColor, border: `1px solid ${borderColor}`,
-              display: 'flex', flexDirection: 'column', gap: 6,
+              display: 'flex', flexDirection: 'column', gap: 8,
             }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div>
-                  <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, fontWeight: 700 }}>
+
+              {/* Header row: name + direction + confidence + expiry */}
+              <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, fontWeight: 700, marginBottom: 2 }}>
                     {name} SCALP · 1–5m
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
-                    <span style={{ fontSize: 26, fontWeight: 900, fontFamily: 'Rajdhani', letterSpacing: 2, color: dirColor, lineHeight: 1 }}>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 28, fontWeight: 900, fontFamily: 'Rajdhani', letterSpacing: 2, color: dirColor, lineHeight: 1 }}>
                       {dir}
                     </span>
                     {dir !== 'HOLD' && conf > 0 && (
-                      <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'JetBrains Mono', color: dirColor }}>
+                      <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'JetBrains Mono', color: dirColor }}>
                         {conf}%
                       </span>
                     )}
                   </div>
                 </div>
-                {sig && !sig.blocked && dir !== 'HOLD' && (
-                  <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-dim)' }}>
-                    <div style={{ color: actualMsLeft < 60000 ? 'var(--color-sell)' : 'var(--text-muted)' }}>
-                      {mLeft}m {String(sLeft).padStart(2, '0')}s
-                    </div>
-                    <div style={{ marginTop: 2 }}>valid until</div>
-                  </div>
-                )}
-                {(!sig || sig.blocked) && (
-                  <div style={{ fontSize: 10, color: 'var(--text-dim)', fontStyle: 'italic' }}>loading…</div>
-                )}
+                <div style={{ textAlign: 'right', flexShrink: 0, fontSize: 10 }}>
+                  {sig && !sig.blocked && dir !== 'HOLD' ? (
+                    <>
+                      <div style={{ color: actualMsLeft < 60000 ? 'var(--color-sell)' : 'var(--text-muted)', fontFamily: 'JetBrains Mono', fontWeight: 700 }}>
+                        {mLeft}m {String(sLeft).padStart(2, '0')}s
+                      </div>
+                      <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>valid until</div>
+                    </>
+                  ) : (!sig || sig.blocked) ? (
+                    <div style={{ color: 'var(--text-dim)', fontStyle: 'italic' }}>loading…</div>
+                  ) : null}
+                </div>
               </div>
 
+              {/* Price levels: entry / SL / TP — each with copy button */}
               {sig && !sig.blocked && dir !== 'HOLD' && (
-                <div style={{ display: 'flex', gap: 6, fontSize: 10, fontFamily: 'JetBrains Mono' }}>
-                  <div style={{ flex: 1, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '4px 6px' }}>
-                    <div style={{ color: 'var(--text-dim)', marginBottom: 1 }}>ENTRY</div>
-                    <div style={{ color: 'var(--color-accent)', fontWeight: 700 }}>{sig.entry.toFixed(dp)}</div>
-                  </div>
-                  <div style={{ flex: 1, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '4px 6px' }}>
-                    <div style={{ color: 'var(--text-dim)', marginBottom: 1 }}>SL</div>
-                    <div style={{ color: 'var(--color-loss)', fontWeight: 700 }}>{sig.sl.toFixed(dp)}</div>
-                  </div>
-                  <div style={{ flex: 1, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '4px 6px' }}>
-                    <div style={{ color: 'var(--text-dim)', marginBottom: 1 }}>TP</div>
-                    <div style={{ color: 'var(--color-profit)', fontWeight: 700 }}>{sig.tp.toFixed(dp)}</div>
-                  </div>
-                </div>
-              )}
-
-              {sig?.reasons && sig.reasons.length > 0 && dir !== 'HOLD' && (
-                <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.5 }}>
-                  {sig.reasons.slice(0, 2).map((r, i) => (
-                    <div key={i} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      <span style={{ color: dirColor, marginRight: 4 }}>›</span>{r}
+                <div style={{ display: 'flex', gap: 6 }}>
+                  {([
+                    { label: 'ENTRY', val: sig.entry, color: 'var(--color-accent)' },
+                    { label: 'SL',    val: sig.sl,    color: 'var(--color-loss)' },
+                    { label: 'TP',    val: sig.tp,    color: 'var(--color-profit)' },
+                  ] as const).map(({ label, val, color }) => (
+                    <div key={label} style={{
+                      flex: 1, minWidth: 0,
+                      background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px',
+                    }}>
+                      <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>{label}</div>
+                      <div style={{ fontSize: 11, color, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                        <CopyValue value={val.toFixed(dp)}>{val.toFixed(dp)}</CopyValue>
+                      </div>
                     </div>
                   ))}
                 </div>
               )}
 
+              {/* Reasons */}
+              {sig?.reasons && sig.reasons.length > 0 && dir !== 'HOLD' && (
+                <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+                  {sig.reasons.slice(0, 2).map((r, i) => (
+                    <div key={i} style={{ display: 'flex', gap: 4, alignItems: 'flex-start' }}>
+                      <span style={{ color: dirColor, flexShrink: 0, marginTop: 1 }}>›</span>
+                      <span style={{ wordBreak: 'break-word' }}>{r}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Place order button */}
               {sig && !sig.blocked && dir !== 'HOLD' && actualMsLeft > 0 && (
                 <button
                   className={`btn ${dir === 'BUY' ? 'btn-buy' : 'btn-sell'}`}
                   onClick={() => handleScalpOrder(sig)}
                   disabled={placingScalp === pair}
-                  style={{ marginTop: 4, padding: '9px', fontSize: 12, letterSpacing: 1.5, width: '100%' }}
+                  style={{ padding: '10px', fontSize: 13, letterSpacing: 1.5, width: '100%' }}
                 >
                   {placingScalp === pair
                     ? <LoadingDots color={dirColor} />
@@ -392,7 +400,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
               )}
 
               {sig?.blocked && (
-                <div style={{ fontSize: 10, color: 'var(--color-sell)', fontStyle: 'italic' }}>
+                <div style={{ fontSize: 11, color: 'var(--color-sell)', fontStyle: 'italic' }}>
                   Live MT5 feed required
                 </div>
               )}

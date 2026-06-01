@@ -612,3 +612,17 @@ input[type="number"]:focus { border-color: var(--blue); }
     flex: 1 1 100%;
   }
 }
+
+/* ─── Scalp signal grid ─────────────────────────────────────────────────────── */
+.scalp-signal-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+@media (max-width: 540px) {
+  /* Stack Gold + Silver cards vertically on phones */
+  .scalp-signal-grid {
+    grid-template-columns: 1fr;
+  }
+}
