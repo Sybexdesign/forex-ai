@@ -5,7 +5,7 @@ import { getAdminClient } from '@/lib/supabase'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
-type Strategy = 'Momentum' | 'Mean Reversion' | 'Breakout' | 'Order Flow'
+type Strategy = 'Momentum' | 'Mean Reversion' | 'Breakout' | 'Order Flow' | 'Scalp'
 type Direction = 'BUY' | 'SELL' | 'HOLD'
 
 interface TickSnapshot {
@@ -69,6 +69,21 @@ Signal SELL: sell pressure > 62% (buyPressure < 38%), RSI(14) above 55, high tic
 Wide spread or low volume reduces confidence significantly.
 Return HOLD if pressure is neutral (38–62%).
 Respond ONLY with valid JSON — no markdown, no prose.`,
+  'Scalp': `You are a precision scalp trader for precious metals (XAU/USD, XAG/USD).
+Generate a 1–5 minute directional scalp signal.
+
+CRITICAL: You MUST return BUY or SELL. Only return HOLD in an exact tie (extremely rare).
+
+Score 5 factors and pick the majority direction:
+1. RSI(14) < 50 → bullish | RSI(14) > 50 → bearish
+2. EMA9 > EMA21 → bullish | EMA9 < EMA21 → bearish
+3. MACD histogram > 0 → bullish | < 0 → bearish
+4. Buy pressure > 50% → bullish | < 50% → bearish
+5. Price below BB midline → bullish potential | above midline → bearish potential
+
+Confidence: 5/5 votes = 90–95, 4/5 = 72–85, 3/5 = 58–68.
+Entry at current price. SL = 1.5 × ATR. TP = 2.0 × ATR.
+Respond ONLY with valid JSON — no markdown, no prose.`,
 }
 
 function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
@@ -79,7 +94,7 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
   const reasons: string[] = []
   const maxSl  = maxSlDistance(pair)
   const slPips = Math.min(t.atr * 1.5, maxSl)
-  const tpPips = slPips * (5 / 3)
+  const tpPips = strategy === 'Scalp' ? slPips * (4 / 3) : slPips * (5 / 3)  // Scalp: 2:1.5 RR
 
   if (strategy === 'Momentum') {
     if (t.rsi14 < 38) { score += 15; reasons.push(`RSI(14) oversold (${t.rsi14.toFixed(0)})`) }
@@ -116,6 +131,28 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
         reasons.push('Price in mid-band consolidation zone — not a breakout yet')
       }
     }
+  } else if (strategy === 'Scalp') {
+    // 5-vote majority: always commits to a direction
+    const bbMid = (t.bbUpper + t.bbLower) / 2
+    const votes = [
+      t.rsi14 < 50 ? 1 : -1,
+      t.ema9  > t.ema21 ? 1 : -1,
+      t.macdHistogram > 0 ? 1 : -1,
+      t.buyPressure > 0.5 ? 1 : -1,
+      t.price < bbMid ? 1 : -1,
+    ]
+    const bullVotes = votes.filter(v => v > 0).length
+    const bearVotes = 5 - bullVotes
+    const edge = Math.abs(bullVotes - bearVotes)
+    if (bullVotes >= bearVotes) {
+      score = 55 + edge * 8   // 3/5→63, 4/5→71, 5/5→79 (before spread penalty)
+      reasons.push(`Scalp: ${bullVotes}/5 bullish indicators`)
+    } else {
+      score = 45 - edge * 8   // 3/5→37, 4/5→29, 5/5→21
+      reasons.push(`Scalp: ${bearVotes}/5 bearish indicators`)
+    }
+    if (t.ema9 > t.ema21) reasons.push('EMA9 > EMA21 bullish') ; else reasons.push('EMA9 < EMA21 bearish')
+    if (t.macdHistogram > 0) reasons.push(`MACD +${t.macdHistogram.toFixed(4)}`) ; else reasons.push(`MACD ${t.macdHistogram.toFixed(4)}`)
   } else {
     if (t.buyPressure > 0.62) { score += 18; reasons.push(`Buy pressure ${(t.buyPressure * 100).toFixed(0)}%`) }
     if (t.buyPressure < 0.38) { score -= 18; reasons.push(`Sell pressure ${((1 - t.buyPressure) * 100).toFixed(0)}%`) }
@@ -130,7 +167,9 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
   }
 
   score = Math.max(0, Math.min(100, score))
-  const direction: Direction = score >= 70 ? 'BUY' : score <= 30 ? 'SELL' : 'HOLD'
+  const direction: Direction = strategy === 'Scalp'
+    ? (score >= 55 ? 'BUY' : score <= 45 ? 'SELL' : 'HOLD')
+    : (score >= 70 ? 'BUY' : score <= 30 ? 'SELL' : 'HOLD')
   const entry = t.price
   const sl = direction === 'BUY' ? entry - slPips : direction === 'SELL' ? entry + slPips : entry
   const tp = direction === 'BUY' ? entry + tpPips : direction === 'SELL' ? entry - tpPips : entry
@@ -225,7 +264,7 @@ export async function POST(req: NextRequest) {
       result   = fallbackSignal(t, strategy, pair)
       fallback = true
     } else {
-      const systemPrompt = STRATEGY_PROMPTS[strategy] || STRATEGY_PROMPTS['Momentum']
+      const systemPrompt = STRATEGY_PROMPTS[strategy as Strategy] || STRATEGY_PROMPTS['Scalp']
       const userMsg = `Pair: ${pair} | Price: ${t.price.toFixed(decimals)} | Strategy: ${strategy}
 
 Indicators:
@@ -274,15 +313,17 @@ Return JSON only:
     // Query ML service in parallel with signal result (non-blocking)
     mlData = await queryMlService(body, pair, result.direction as Direction, result.confidence)
 
-    // Fix 5: ML win-probability now influences confidence (not just displayed)
+    // ML win-probability gate — softer threshold for Scalp (long-TF model not tuned for 1-5min)
     if (mlData && typeof mlData.win_probability === 'number' && result.direction !== 'HOLD') {
-      const winProb = mlData.win_probability
-      if (winProb < 0.40) {
-        // ML says likely loser — penalise up to -20 at 0% win probability
-        const penalty = Math.round((0.40 - winProb) * 50)
+      const winProb     = mlData.win_probability
+      const isScalp     = strategy === 'Scalp'
+      const mlThreshold = isScalp ? 0.25 : 0.40
+      const holdBelow   = isScalp ? 50   : 60
+      if (winProb < mlThreshold) {
+        const penalty = Math.round((mlThreshold - winProb) * 50)
         result.confidence = Math.max(0, result.confidence - penalty)
         result.reasons = [...(result.reasons || []), `⚠ ML win probability ${(winProb * 100).toFixed(0)}% — confidence reduced`]
-        if (result.confidence < 60) {
+        if (result.confidence < holdBelow) {
           result.direction = 'HOLD'
           result.risk_note = (result.risk_note || '') + ` | ML override: low win probability (${(winProb * 100).toFixed(0)}%)`
         }

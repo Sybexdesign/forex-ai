@@ -13,6 +13,23 @@ const TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1H', '4H']
 const METALS_ONLY = ['XAU/USD', 'XAG/USD']
 const DIR_COLOR: Record<string, string> = { BUY: 'var(--color-buy)', SELL: 'var(--color-sell)' }
 const PAGE_SIZE = 5
+const SCALP_REFRESH_MS = 15_000  // refresh scalp signals every 15 seconds
+const SCALP_EXPIRY_MS  = 3 * 60_000  // 3-minute signal validity
+
+interface ScalpSignal {
+  pair: string
+  direction: 'BUY' | 'SELL' | 'HOLD'
+  confidence: number
+  entry: number
+  sl: number
+  tp: number
+  reasons: string[]
+  expiresAt: number
+  fetchedAt: number
+  fallback: boolean
+  simulated?: boolean
+  blocked?: boolean
+}
 
 function Pager({ page, total, onPage }: { page: number; total: number; onPage: (p: number) => void }) {
   const pages = Math.ceil(total / PAGE_SIZE)
@@ -65,10 +82,72 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   const [tradesLoading, setTradesLoading] = useState(false)
   const [openPage, setOpenPage] = useState(0)
   const autoExecutedRef = useRef<Set<string>>(new Set())
+  const [scalpSignals, setScalpSignals] = useState<Record<string, ScalpSignal>>({})
+  const [scalpTick, setScalpTick] = useState(0)  // increments every second for expiry countdown
 
   const accountBalance = account?.balance || 10000
 
   const { enabled, setEnabled, scanning, lastScan, countdown, pendingSignals, diagnostics = [], error, runScan, rejectSignal, clearAll } = scanner
+
+  // 1-second tick for expiry countdown display
+  useEffect(() => {
+    const id = setInterval(() => setScalpTick(t => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  const fetchScalpSignalForPair = useCallback(async (pair: string) => {
+    try {
+      // Step 1: fetch live indicators for this pair
+      const tfRes = await fetch(`/api/scalper/tick?pair=${encodeURIComponent(pair)}&timeframe=5m`, {
+        cache: 'no-store',
+      })
+      if (!tfRes.ok) return
+      const tick = await tfRes.json()
+
+      if (tick.simulated) {
+        setScalpSignals(prev => ({
+          ...prev,
+          [pair]: { pair, direction: 'HOLD', confidence: 0, entry: tick.price, sl: tick.price, tp: tick.price,
+            reasons: ['Live MT5 data required — simulated feed'], expiresAt: 0, fetchedAt: Date.now(), fallback: false, blocked: true, simulated: true },
+        }))
+        return
+      }
+
+      // Step 2: call scalp signal API
+      const sigRes = await fetch('/api/scalper/signal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...tick, pair, strategy: 'Scalp', userId }),
+      })
+      if (!sigRes.ok) return
+      const sig = await sigRes.json()
+
+      setScalpSignals(prev => ({
+        ...prev,
+        [pair]: {
+          pair,
+          direction:  sig.direction,
+          confidence: sig.confidence,
+          entry:      sig.entry  || tick.price,
+          sl:         sig.sl     || tick.price,
+          tp:         sig.tp     || tick.price,
+          reasons:    sig.reasons || [],
+          expiresAt:  Date.now() + SCALP_EXPIRY_MS,
+          fetchedAt:  Date.now(),
+          fallback:   sig.fallback ?? false,
+        },
+      }))
+    } catch { /* silent — display nothing if unavailable */ }
+  }, [userId])
+
+  // Poll scalp signals for each metal pair
+  useEffect(() => {
+    METALS_ONLY.forEach(p => fetchScalpSignalForPair(p))
+    const id = setInterval(() => {
+      METALS_ONLY.forEach(p => fetchScalpSignalForPair(p))
+    }, SCALP_REFRESH_MS)
+    return () => clearInterval(id)
+  }, [fetchScalpSignalForPair])
 
   const loadOpenTrades = useCallback(async () => {
     if (!userId) return
@@ -180,6 +259,96 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+      {/* Live scalp signals — always-on direction panel for Gold and Silver */}
+      <div style={{
+        display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10,
+      }}>
+        {METALS_ONLY.map(pair => {
+          const sig  = scalpSignals[pair]
+          const name = pair === 'XAU/USD' ? 'Gold' : 'Silver'
+          const dir  = sig?.direction ?? 'HOLD'
+          const conf = sig?.confidence ?? 0
+          // scalpTick forces re-render; expiry recomputed from real Date.now() each second
+          void scalpTick
+          const actualMsLeft = sig ? Math.max(0, sig.expiresAt - Date.now()) : 0
+          const mLeft = Math.floor(actualMsLeft / 60000)
+          const sLeft = Math.floor((actualMsLeft % 60000) / 1000)
+          const dirColor = dir === 'BUY' ? 'var(--color-buy)' : dir === 'SELL' ? 'var(--color-sell)' : 'var(--text-muted)'
+          const borderColor = dir === 'BUY' ? 'rgba(0,200,83,0.3)' : dir === 'SELL' ? 'rgba(255,48,86,0.3)' : 'rgba(255,255,255,0.1)'
+          const bgColor     = dir === 'BUY' ? 'rgba(0,200,83,0.05)' : dir === 'SELL' ? 'rgba(255,48,86,0.05)' : 'rgba(255,255,255,0.02)'
+          const dp = pair.startsWith('XAU') ? 2 : 3
+          return (
+            <div key={pair} style={{
+              padding: '14px 16px', borderRadius: 4,
+              background: bgColor, border: `1px solid ${borderColor}`,
+              display: 'flex', flexDirection: 'column', gap: 6,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div>
+                  <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, fontWeight: 700 }}>
+                    {name} SCALP · 1–5m
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
+                    <span style={{ fontSize: 26, fontWeight: 900, fontFamily: 'Rajdhani', letterSpacing: 2, color: dirColor, lineHeight: 1 }}>
+                      {dir}
+                    </span>
+                    {dir !== 'HOLD' && conf > 0 && (
+                      <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'JetBrains Mono', color: dirColor }}>
+                        {conf}%
+                      </span>
+                    )}
+                  </div>
+                </div>
+                {sig && !sig.blocked && dir !== 'HOLD' && (
+                  <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-dim)' }}>
+                    <div style={{ color: actualMsLeft < 60000 ? 'var(--color-sell)' : 'var(--text-muted)' }}>
+                      {mLeft}m {String(sLeft).padStart(2, '0')}s
+                    </div>
+                    <div style={{ marginTop: 2 }}>valid until</div>
+                  </div>
+                )}
+                {(!sig || sig.blocked) && (
+                  <div style={{ fontSize: 10, color: 'var(--text-dim)', fontStyle: 'italic' }}>loading…</div>
+                )}
+              </div>
+
+              {sig && !sig.blocked && dir !== 'HOLD' && (
+                <div style={{ display: 'flex', gap: 6, fontSize: 10, fontFamily: 'JetBrains Mono' }}>
+                  <div style={{ flex: 1, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '4px 6px' }}>
+                    <div style={{ color: 'var(--text-dim)', marginBottom: 1 }}>ENTRY</div>
+                    <div style={{ color: 'var(--color-accent)', fontWeight: 700 }}>{sig.entry.toFixed(dp)}</div>
+                  </div>
+                  <div style={{ flex: 1, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '4px 6px' }}>
+                    <div style={{ color: 'var(--text-dim)', marginBottom: 1 }}>SL</div>
+                    <div style={{ color: 'var(--color-loss)', fontWeight: 700 }}>{sig.sl.toFixed(dp)}</div>
+                  </div>
+                  <div style={{ flex: 1, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '4px 6px' }}>
+                    <div style={{ color: 'var(--text-dim)', marginBottom: 1 }}>TP</div>
+                    <div style={{ color: 'var(--color-profit)', fontWeight: 700 }}>{sig.tp.toFixed(dp)}</div>
+                  </div>
+                </div>
+              )}
+
+              {sig?.reasons && sig.reasons.length > 0 && dir !== 'HOLD' && (
+                <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.5 }}>
+                  {sig.reasons.slice(0, 2).map((r, i) => (
+                    <div key={i} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <span style={{ color: dirColor, marginRight: 4 }}>›</span>{r}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {sig?.blocked && (
+                <div style={{ fontSize: 10, color: 'var(--color-sell)', fontStyle: 'italic' }}>
+                  Live MT5 feed required
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
 
       {/* Header controls */}
       <Panel title="AUTO TRADER" bright>
