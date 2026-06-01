@@ -84,6 +84,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   const autoExecutedRef = useRef<Set<string>>(new Set())
   const [scalpSignals, setScalpSignals] = useState<Record<string, ScalpSignal>>({})
   const [scalpTick, setScalpTick] = useState(0)  // increments every second for expiry countdown
+  const [placingScalp, setPlacingScalp] = useState<string | null>(null)
 
   const accountBalance = account?.balance || 10000
 
@@ -202,6 +203,43 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       onToast('Error: ' + e.message, '#ff3056')
     } finally {
       setApprovingId(null)
+    }
+  }
+
+  async function handleScalpOrder(sig: ScalpSignal) {
+    if (placingScalp) return
+    setPlacingScalp(sig.pair)
+    try {
+      const livePrice = prices[sig.pair]?.bid || sig.entry
+      const data = await authFetch('/api/orders', {
+        method: 'POST',
+        body: JSON.stringify({
+          pair:           sig.pair,
+          direction:      sig.direction,
+          strategy,
+          currentPrice:   livePrice,
+          newsInWindow,
+          aiConfidence:   sig.confidence,
+          checklistScore: 5,
+          userId,
+          signalId:       `scalp-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+        }),
+      }).then(r => r.json())
+
+      if (data.blocked) {
+        onToast('Blocked: ' + (data.reasons?.[0] || 'Risk rule'), '#ff3056')
+      } else if (data.success) {
+        onToast(`✓ ${sig.direction} ${sig.pair} — ${data.lots} lots queued`, DIR_COLOR[sig.direction])
+        loadOpenTrades()
+        onRefreshTrades?.()
+        setTimeout(() => onRefreshAccount?.(), 1500)
+      } else {
+        onToast('Order failed: ' + (data.error || 'Unknown'), '#ff3056')
+      }
+    } catch (e: any) {
+      onToast('Error: ' + e.message, '#ff3056')
+    } finally {
+      setPlacingScalp(null)
     }
   }
 
@@ -338,6 +376,19 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
                     </div>
                   ))}
                 </div>
+              )}
+
+              {sig && !sig.blocked && dir !== 'HOLD' && actualMsLeft > 0 && (
+                <button
+                  className={`btn ${dir === 'BUY' ? 'btn-buy' : 'btn-sell'}`}
+                  onClick={() => handleScalpOrder(sig)}
+                  disabled={placingScalp === pair}
+                  style={{ marginTop: 4, padding: '9px', fontSize: 12, letterSpacing: 1.5, width: '100%' }}
+                >
+                  {placingScalp === pair
+                    ? <LoadingDots color={dirColor} />
+                    : `▶ PLACE ${dir}`}
+                </button>
               )}
 
               {sig?.blocked && (
