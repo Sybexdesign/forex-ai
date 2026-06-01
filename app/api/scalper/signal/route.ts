@@ -334,7 +334,19 @@ Return JSON only:
       }
     }
 
-    // Ensure SL/TP are present
+    // For Scalp: always use server-computed SL/TP — AI misreads pip-to-price for metals (treats
+    // "80 pips" as 80 price units on XAU/USD, producing 10× oversized levels).
+    if (strategy === 'Scalp') {
+      result.entry = t.price
+      result.sl = result.direction === 'BUY'  ? t.price - slPips
+                : result.direction === 'SELL' ? t.price + slPips
+                : t.price
+      result.tp = result.direction === 'BUY'  ? t.price + tpPips
+                : result.direction === 'SELL' ? t.price - tpPips
+                : t.price
+    }
+
+    // Ensure SL/TP are present for other strategies
     if (!result.entry) result.entry = t.price
     if (!result.sl) result.sl = result.direction === 'BUY' ? t.price - slPips : result.direction === 'SELL' ? t.price + slPips : t.price
     if (!result.tp) result.tp = result.direction === 'BUY' ? t.price + tpPips : result.direction === 'SELL' ? t.price - tpPips : t.price
