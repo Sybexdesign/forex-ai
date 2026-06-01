@@ -333,8 +333,8 @@ export default function AppShell() {
             </div>
           )}
           {news.simulated && (
-            <span style={{ fontSize: 10, color: '#888', border: '1px solid #333', padding: '1px 6px', borderRadius: 2 }}>
-              news: demo
+            <span title="ForexFactory calendar unavailable — news feed offline, trade blocks disabled" style={{ fontSize: 10, color: '#ff9800', border: '1px solid rgba(255,152,0,0.35)', padding: '1px 6px', borderRadius: 2 }}>
+              news: offline
             </span>
           )}
           {/* Theme toggle — always visible */}
