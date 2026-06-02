@@ -56,11 +56,29 @@ while True:
 
 print(f"✓ Total rows with WIN/LOSS outcome: {len(all_rows)}")
 
-# Train on all historical WIN/LOSS data — the scan route's pre-filters (session
-# gate, ADX floor, RSI gate) already stop bad signals reaching the model at
-# inference time. Training on the full dataset gives the model enough samples
-# to learn what WIN vs LOSS looks like across all conditions.
+# Exclude signals generated before the direction-inversion fix was deployed
+# (2026-06-01 00:00–13:30 UTC). Those BUY signals used inverted vote logic and
+# nearly all became LOSS — training on them teaches the model the wrong pattern.
+# Keep all pre-June-1 historical data and all post-fix data.
 from datetime import datetime, timezone
+
+CONTAMINATED_START = datetime(2026, 6, 1,  0, 0, 0, tzinfo=timezone.utc)
+CONTAMINATED_END   = datetime(2026, 6, 1, 14, 0, 0, tzinfo=timezone.utc)
+
+def _parse_ts(ts: str) -> datetime:
+    import re
+    ts = re.sub(r'\.\d+', '', ts)
+    ts = re.sub(r'[+-]\d{2}:\d{2}$', '', ts).replace('Z', '').strip()
+    return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+
+before = len(all_rows)
+all_rows = [
+    r for r in all_rows
+    if not (CONTAMINATED_START <= _parse_ts(r['created_at']) < CONTAMINATED_END)
+]
+removed = before - len(all_rows)
+print(f"✓ Removed {removed} contaminated signals (2026-06-01 00:00–14:00 UTC, inverted-direction era)")
+print(f"✓ Clean training set: {len(all_rows)} rows")
 
 def add_session_feature(row: dict) -> dict:
     """Add hour_utc and is_session_active features derived from created_at."""
