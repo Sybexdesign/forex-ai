@@ -189,6 +189,40 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
   }
 }
 
+// ─── Directional discipline ──────────────────────────────────────────────────
+// Replicates the 5-vote fallback count using identical thresholds so the
+// consensus is directly comparable to what the rule-based system would have
+// produced. Near-threshold status is flagged in labels for logging only —
+// it does not change the vote count. The discipline check fires when the AI
+// direction contradicts a 4/5 or 5/5 majority; near-threshold readings on
+// the losing side are exactly the "weak evidence" Rule 6 blocks from overriding.
+function scalpConsensus(t: TickSnapshot): {
+  bullVotes: number; bearVotes: number; labels: string[]
+} {
+  const bbMid   = (t.bbUpper + t.bbLower) / 2
+  // Mark near-threshold readings for the log (RSI 48-52, BP 45-55%, tiny EMA gap)
+  const rsiNear = t.rsi14 >= 48 && t.rsi14 <= 52
+  const bpNear  = t.buyPressure >= 0.45 && t.buyPressure <= 0.55
+  const emaWeak = t.atr > 0 ? Math.abs(t.ema9 - t.ema21) < t.atr * 0.15 : false
+
+  // Votes use the same hard thresholds as fallbackSignal → count is authoritative
+  const raw: [string, boolean, number][] = [
+    // [name, is-near-threshold, vote]
+    ['RSI14',       rsiNear,  t.rsi14 > 50          ? 1 : -1],
+    ['EMA9/21',     emaWeak,  t.ema9 > t.ema21       ? 1 : -1],
+    ['MACD',        false,    t.macdHistogram > 0    ? 1 : -1],
+    ['BuyPressure', bpNear,   t.buyPressure > 0.5    ? 1 : -1],
+    ['BBMid',       false,    t.price > bbMid        ? 1 : -1],
+  ]
+
+  return {
+    bullVotes: raw.filter(([,, v]) => v > 0).length,
+    bearVotes: raw.filter(([,, v]) => v < 0).length,
+    // Label format: RSI14:▲ or RSI14:▲~ (~ = near-threshold / weak evidence)
+    labels: raw.map(([n, weak, v]) => `${n}:${v > 0 ? '▲' : '▼'}${weak ? '~' : ''}`),
+  }
+}
+
 const ML_URL = process.env.ML_SERVICE_URL || 'http://localhost:8100'
 
 async function queryMlService(body: any, pair: string, direction: Direction, confidence: number): Promise<{
@@ -313,6 +347,29 @@ Return JSON only:
         console.error('[scalper/signal] Claude error:', e?.status, e?.message)
         result   = fallbackSignal(t, strategy, pair)
         fallback = true
+      }
+    }
+
+    // ── Directional discipline — Scalp only ───────────────────────────────
+    // Prevents the AI from reversing a 4/5 or 5/5 indicator consensus.
+    // Near-threshold readings (RSI 48-52, BP 45-55%, tiny EMA gap) are
+    // treated as neutral so one marginal indicator cannot trigger a reversal.
+    // A conflicting AI call is demoted to HOLD, never flipped to the opposite.
+    if (strategy === 'Scalp' && result.direction !== 'HOLD') {
+      const { bullVotes, bearVotes, labels } = scalpConsensus(t)
+      const consensusDir: Direction | null =
+        bullVotes >= 4 ? 'BUY' : bearVotes >= 4 ? 'SELL' : null
+
+      if (consensusDir !== null && result.direction !== consensusDir) {
+        const aiDir   = result.direction as string
+        const side    = consensusDir === 'BUY' ? bullVotes : bearVotes
+        const voteStr = `${side}/5 ${consensusDir === 'BUY' ? 'bullish' : 'bearish'} (${labels.join(' ')})`
+        console.log(`[scalper/signal] Directional discipline: AI=${aiDir} conflicts with ${voteStr} → HOLD`)
+        result.direction = 'HOLD' as Direction
+        result.reasons   = [
+          ...(result.reasons || []).slice(0, 3),
+          `Directional guard: AI ${aiDir} conflicts with ${voteStr} — converted to HOLD`,
+        ]
       }
     }
 
