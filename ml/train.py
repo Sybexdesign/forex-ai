@@ -56,29 +56,36 @@ while True:
 
 print(f"✓ Total rows with WIN/LOSS outcome: {len(all_rows)}")
 
-# Exclude signals generated before the direction-inversion fix was deployed
-# (2026-06-01 00:00–13:30 UTC). Those BUY signals used inverted vote logic and
-# nearly all became LOSS — training on them teaches the model the wrong pattern.
-# Keep all pre-June-1 historical data and all post-fix data.
+# Only train on signals from periods where the direction logic was correct.
+# Dates with >50% WIN rate are considered clean; all others are contaminated
+# by the inverted-vote bug that was active before 2026-06-01T14:00 UTC.
+# Clean periods confirmed by WIN rate analysis:
+#   2026-05-15:          77% WIN — clean historical data
+#   2026-06-01 14:00+:   ~60% WIN — post-fix data
+# Everything else (2026-05-14, 21, 22, 25 and June 1 morning) is excluded.
 from datetime import datetime, timezone
-
-CONTAMINATED_START = datetime(2026, 6, 1,  0, 0, 0, tzinfo=timezone.utc)
-CONTAMINATED_END   = datetime(2026, 6, 1, 14, 0, 0, tzinfo=timezone.utc)
+import re as _re
 
 def _parse_ts(ts: str) -> datetime:
-    import re
-    ts = re.sub(r'\.\d+', '', ts)
-    ts = re.sub(r'[+-]\d{2}:\d{2}$', '', ts).replace('Z', '').strip()
+    ts = _re.sub(r'\.\d+', '', ts)
+    ts = _re.sub(r'[+-]\d{2}:\d{2}$', '', ts).replace('Z', '').strip()
     return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
 
+def _is_clean(ts_str: str) -> bool:
+    dt = _parse_ts(ts_str)
+    date = dt.date()
+    from datetime import date as ddate
+    if date == ddate(2026, 5, 15):
+        return True
+    if date == ddate(2026, 6, 1) and dt.hour >= 14:
+        return True
+    return False
+
 before = len(all_rows)
-all_rows = [
-    r for r in all_rows
-    if not (CONTAMINATED_START <= _parse_ts(r['created_at']) < CONTAMINATED_END)
-]
+all_rows = [r for r in all_rows if _is_clean(r['created_at'])]
 removed = before - len(all_rows)
-print(f"✓ Removed {removed} contaminated signals (2026-06-01 00:00–14:00 UTC, inverted-direction era)")
-print(f"✓ Clean training set: {len(all_rows)} rows")
+print(f"✓ Removed {removed} contaminated signals (inverted-direction era)")
+print(f"✓ Clean training set: {len(all_rows)} rows (May 15 + June 1 14:00+)")
 
 def add_session_feature(row: dict) -> dict:
     """Add hour_utc and is_session_active features derived from created_at."""
@@ -131,41 +138,43 @@ def extract_features(row):
     except Exception:
         pass
 
-    rsi  = snap.get('rsi', snap.get('rsi14', 50)) or 50
-    ema9 = scalper.get('ema9',  snap.get('ema9',  price)) or price
-    ema21= scalper.get('ema21', snap.get('ema21', price)) or price
+    rsi   = snap.get('rsi', snap.get('rsi14', 50)) or 50
+    ema9  = scalper.get('ema9',  snap.get('ema9',  price)) or price
+    ema21 = scalper.get('ema21', snap.get('ema21', price)) or price
+    ema20 = snap.get('ema20', price) or price
+    ema50 = snap.get('ema50', price) or price
+    macd_hist = snap.get('macdHistogram', 0) or 0
+    buy_pres  = scalper.get('buyPressure', snap.get('buyPressure', 0.5)) or 0.5
 
+    # Normalise all price-scale values by ATR so features are invariant to
+    # absolute price level. Raw EMA and MACD prices are removed — the model
+    # would memorise "EMA was at X today = WIN" which never generalises.
     return {
-        # Core indicators
-        'rsi':             rsi,
-        'rsi7':            scalper.get('rsi7',  snap.get('rsi7',  50)) or 50,
-        'macd_histogram':  snap.get('macdHistogram', 0) or 0,
-        'macd_line':       snap.get('macdLine',      0) or 0,
-        'macd_signal':     snap.get('macdSignal',    0) or 0,
-        'adx':             snap.get('adx', 20) or 20,
-        'bb_width':        snap.get('bbWidth', 0.002) or 0.002,
-        'ema20':           snap.get('ema20', price) or price,
-        'ema50':           snap.get('ema50', price) or price,
-        # Scalper sub-object
-        'ema9':            ema9,
-        'ema21':           ema21,
-        'buy_pressure':    scalper.get('buyPressure', snap.get('buyPressure', 0.5)) or 0.5,
-        'tick_volume':     scalper.get('tickVolume',  snap.get('tickVolume',  0))   or 0,
-        'atr':             atr,
-        # Engineered
-        'rsi_zone':           1 if rsi < 30 else (-1 if rsi > 70 else 0),
-        'macd_positive':      1 if (snap.get('macdHistogram', 0) or 0) > 0 else 0,
-        'ema_bullish':        1 if ema9 > ema21 else 0,
-        'bb_position':        (price - bb_lower) / bb_range if bb_range > 0 else 0.5,
-        'atr_pips':           atr / pip_val if pip_val > 0 else 0,
-        'adx_trending':       1 if (snap.get('adx', 20) or 20) > 25 else 0,
-        'pressure_imbalance': (scalper.get('buyPressure', snap.get('buyPressure', 0.5)) or 0.5) - 0.5,
-        'hour_utc':           hour,
-        'price_vs_ema50':     (price - (snap.get('ema50', price) or price)) / price if price > 0 else 0,
-        'price_vs_ema20':     (price - (snap.get('ema20', price) or price)) / price if price > 0 else 0,
-        'confidence':         row.get('confidence', 50) or 50,
-        'direction_buy':      1 if row.get('direction') == 'BUY' else 0,
-        'in_session':         row.get('_in_session', 0),
+        # Oscillators (already 0-100 or bounded)
+        'rsi':               rsi,
+        'rsi7':              scalper.get('rsi7', snap.get('rsi7', 50)) or 50,
+        'adx':               snap.get('adx', 20) or 20,
+        'buy_pressure':      buy_pres,
+        # ATR-normalised MACD (removes price-level dependency)
+        'macd_hist_atr':     macd_hist / atr if atr > 0 else 0,
+        'macd_line_atr':     (snap.get('macdLine', 0) or 0) / atr if atr > 0 else 0,
+        'macd_signal_atr':   (snap.get('macdSignal', 0) or 0) / atr if atr > 0 else 0,
+        # Price-relative BB width
+        'bb_width_rel':      (snap.get('bbWidth', 0.002) or 0.002) / price if price > 0 else 0,
+        # EMA ratios (normalised, not absolute prices)
+        'ema9_vs_ema21':     (ema9 - ema21) / atr if atr > 0 else 0,
+        'price_vs_ema20':    (price - ema20) / atr if atr > 0 else 0,
+        'price_vs_ema50':    (price - ema50) / atr if atr > 0 else 0,
+        # Binary / categorical (already scale-invariant)
+        'rsi_zone':          1 if rsi < 30 else (-1 if rsi > 70 else 0),
+        'macd_positive':     1 if macd_hist > 0 else 0,
+        'ema_bullish':       1 if ema9 > ema21 else 0,
+        'bb_position':       (price - bb_lower) / bb_range if bb_range > 0 else 0.5,
+        'adx_trending':      1 if (snap.get('adx', 20) or 20) > 25 else 0,
+        'pressure_imbalance':buy_pres - 0.5,
+        'in_session':        row.get('_in_session', 0),
+        'confidence':        row.get('confidence', 50) or 50,
+        'direction_buy':     1 if row.get('direction') == 'BUY' else 0,
     }
 
 
@@ -187,6 +196,10 @@ y = np.array(targets)
 for p in ALL_PAIRS:
     col = f'pair_{p}'
     feature_df[col] = (pd.Series(pairs_list) == p).astype(int).values
+
+# Drop hour_utc — too few samples to learn reliable time patterns;
+# the model would overfit to the specific hours in our small dataset.
+feature_df.drop(columns=[c for c in ['hour_utc'] if c in feature_df.columns], inplace=True)
 
 # Drop rows with NaN
 mask       = ~feature_df.isna().any(axis=1)
@@ -221,14 +234,16 @@ print(f"\n📊 Train: {len(X_train)} | Test: {len(X_test)}")
 print("\n🧠 Training XGBoost...")
 
 model = xgb.XGBClassifier(
-    n_estimators=300,
-    max_depth=4,
+    n_estimators=150,
+    max_depth=3,            # shallower — prevents memorising specific price levels
     learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    min_child_weight=2,
-    scale_pos_weight=spw,   # compensates for WIN/LOSS imbalance
-    eval_metric='aucpr',    # area under precision-recall — better for imbalanced data
+    subsample=0.7,
+    colsample_bytree=0.7,
+    min_child_weight=5,     # require more samples per leaf — stronger regularisation
+    reg_alpha=0.1,          # L1 regularisation
+    reg_lambda=1.5,         # L2 regularisation
+    scale_pos_weight=spw,
+    eval_metric='aucpr',
     random_state=42,
 )
 

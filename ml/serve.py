@@ -229,34 +229,37 @@ def extract_features(req: PredictRequest) -> dict:
         except Exception:
             pass
 
+    ema20     = ind.get('ema20', price) or price
+    ema50     = ind.get('ema50', price) or price
+    macd_hist = ind.get('macdHistogram', 0) or 0
+    buy_pres  = scal.get('buyPressure', ind.get('buyPressure', 0.5)) or 0.5
+
     features = {
-        'rsi':             rsi,
-        'rsi7':            scal.get('rsi7',  ind.get('rsi7',  50)) or 50,
-        'macd_histogram':  ind.get('macdHistogram', 0) or 0,
-        'macd_line':       ind.get('macdLine',      0) or 0,
-        'macd_signal':     ind.get('macdSignal',    0) or 0,
-        'adx':             ind.get('adx', 20) or 20,
-        'bb_width':        ind.get('bbWidth', 0.002) or 0.002,
-        'ema20':           ind.get('ema20', price) or price,
-        'ema50':           ind.get('ema50', price) or price,
-        'ema9':            ema9,
-        'ema21':           ema21,
-        'buy_pressure':    scal.get('buyPressure', ind.get('buyPressure', 0.5)) or 0.5,
-        'tick_volume':     scal.get('tickVolume',  ind.get('tickVolume',  0))   or 0,
-        'atr':             atr,
-        'rsi_zone':           1 if rsi < 30 else (-1 if rsi > 70 else 0),
-        'macd_positive':      1 if (ind.get('macdHistogram', 0) or 0) > 0 else 0,
-        'ema_bullish':        1 if ema9 > ema21 else 0,
-        'bb_position':        (price - bb_lower) / bb_range if bb_range > 0 else 0.5,
-        'atr_pips':           atr / pip_val if pip_val > 0 else 0,
-        'adx_trending':       1 if (ind.get('adx', 20) or 20) > 25 else 0,
-        'pressure_imbalance': (scal.get('buyPressure', ind.get('buyPressure', 0.5)) or 0.5) - 0.5,
-        'hour_utc':           hour,
-        'price_vs_ema50':     (price - (ind.get('ema50', price) or price)) / price if price > 0 else 0,
-        'price_vs_ema20':     (price - (ind.get('ema20', price) or price)) / price if price > 0 else 0,
-        'confidence':         req.confidence or 50,
-        'direction_buy':      1 if req.direction == 'BUY' else 0,
-        'in_session':         1 if (hour < 5 or hour >= 19) else 0,
+        # Oscillators (already bounded)
+        'rsi':               rsi,
+        'rsi7':              scal.get('rsi7', ind.get('rsi7', 50)) or 50,
+        'adx':               ind.get('adx', 20) or 20,
+        'buy_pressure':      buy_pres,
+        # ATR-normalised MACD
+        'macd_hist_atr':     macd_hist / atr if atr > 0 else 0,
+        'macd_line_atr':     (ind.get('macdLine', 0) or 0) / atr if atr > 0 else 0,
+        'macd_signal_atr':   (ind.get('macdSignal', 0) or 0) / atr if atr > 0 else 0,
+        # Price-relative BB width
+        'bb_width_rel':      (ind.get('bbWidth', 0.002) or 0.002) / price if price > 0 else 0,
+        # EMA ratios (ATR-normalised)
+        'ema9_vs_ema21':     (ema9 - ema21) / atr if atr > 0 else 0,
+        'price_vs_ema20':    (price - ema20) / atr if atr > 0 else 0,
+        'price_vs_ema50':    (price - ema50) / atr if atr > 0 else 0,
+        # Binary / categorical
+        'rsi_zone':          1 if rsi < 30 else (-1 if rsi > 70 else 0),
+        'macd_positive':     1 if macd_hist > 0 else 0,
+        'ema_bullish':       1 if ema9 > ema21 else 0,
+        'bb_position':       (price - bb_lower) / bb_range if bb_range > 0 else 0.5,
+        'adx_trending':      1 if (ind.get('adx', 20) or 20) > 25 else 0,
+        'pressure_imbalance':buy_pres - 0.5,
+        'in_session':        1 if (hour < 5 or hour >= 19) else 0,
+        'confidence':        req.confidence or 50,
+        'direction_buy':     1 if req.direction == 'BUY' else 0,
     }
 
     # One-hot pair encoding — same fixed set as train.py
