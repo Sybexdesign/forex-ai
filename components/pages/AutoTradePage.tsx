@@ -85,6 +85,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   const [scalpSignals, setScalpSignals] = useState<Record<string, ScalpSignal>>({})
   const [scalpTick, setScalpTick] = useState(0)  // increments every second for expiry countdown
   const [placingScalp, setPlacingScalp] = useState<string | null>(null)
+  const [placingMirrorScalp, setPlacingMirrorScalp] = useState<string | null>(null)
   const [pfEnabled, setPfEnabled]     = useState(false)
   const [pfRiskCap, setPfRiskCap]     = useState<number | null>(null)  // null = not yet loaded
 
@@ -262,6 +263,50 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       onToast('Error: ' + e.message, '#ff3056')
     } finally {
       setPlacingScalp(null)
+    }
+  }
+
+  async function handleMirrorScalpOrder(sig: ScalpSignal) {
+    if (placingMirrorScalp) return
+    setPlacingMirrorScalp(sig.pair)
+    try {
+      const mirrorDir = sig.direction === 'BUY' ? 'SELL' : 'BUY'
+      const mirrorSl  = 2 * sig.entry - sig.sl
+      const mirrorTp  = 2 * sig.entry - sig.tp
+      const pip = getPipValue(sig.pair)
+      const slPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
+      const tpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
+      const data = await authFetch('/api/orders', {
+        method: 'POST',
+        body: JSON.stringify({
+          pair:           sig.pair,
+          direction:      mirrorDir,
+          strategy:       { ...strategy, slPips, tpPips },
+          currentPrice:   sig.entry,
+          newsInWindow,
+          aiConfidence:   sig.confidence,
+          checklistScore: 5,
+          userId,
+          signalId:       `mirror-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+          mirrorSl,
+          mirrorTp,
+        }),
+      }).then(r => r.json())
+
+      if (data.blocked) {
+        onToast('Blocked: ' + (data.reasons?.[0] || 'Risk rule'), '#ff3056')
+      } else if (data.success) {
+        onToast(`✓ MIRROR ${mirrorDir} ${sig.pair} — ${data.lots} lots queued`, DIR_COLOR[mirrorDir])
+        loadOpenTrades()
+        onRefreshTrades?.()
+        setTimeout(() => onRefreshAccount?.(), 1500)
+      } else {
+        onToast('Order failed: ' + (data.error || 'Unknown'), '#ff3056')
+      }
+    } catch (e: any) {
+      onToast('Error: ' + e.message, '#ff3056')
+    } finally {
+      setPlacingMirrorScalp(null)
     }
   }
 
@@ -464,6 +509,162 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             </div>
           )
         })}
+      </div>
+
+      {/* Mirror Trades — opposite-direction cards for Gold and Silver */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2, fontWeight: 700, paddingLeft: 2 }}>
+          MIRROR TRADES
+        </div>
+        <div className="scalp-signal-grid">
+          {METALS_ONLY.map(pair => {
+            const sig      = scalpSignals[pair]
+            const name     = pair === 'XAU/USD' ? 'Gold' : 'Silver'
+            const origDir  = sig?.direction ?? 'HOLD'
+            const dir: 'BUY' | 'SELL' | 'HOLD' =
+              origDir === 'BUY' ? 'SELL' : origDir === 'SELL' ? 'BUY' : 'HOLD'
+            const conf = sig?.confidence ?? 0
+            void scalpTick
+            const actualMsLeft = sig ? Math.max(0, sig.expiresAt - Date.now()) : 0
+            const mLeft = Math.floor(actualMsLeft / 60000)
+            const sLeft = Math.floor((actualMsLeft % 60000) / 1000)
+            const dirColor    = dir === 'BUY' ? 'var(--color-buy)' : dir === 'SELL' ? 'var(--color-sell)' : 'var(--text-muted)'
+            const borderColor = dir === 'BUY' ? 'rgba(0,200,83,0.2)' : dir === 'SELL' ? 'rgba(255,48,86,0.2)' : 'rgba(255,255,255,0.08)'
+            const bgColor     = dir === 'BUY' ? 'rgba(0,200,83,0.03)' : dir === 'SELL' ? 'rgba(255,48,86,0.03)' : 'rgba(255,255,255,0.01)'
+            const dp = pair.startsWith('XAU') ? 2 : 3
+
+            const mirrorSl = sig && sig.sl !== sig.entry ? 2 * sig.entry - sig.sl : 0
+            const mirrorTp = sig && sig.tp !== sig.entry ? 2 * sig.entry - sig.tp : 0
+
+            const signalSlPips = sig && dir !== 'HOLD' && sig.entry !== sig.sl
+              ? Math.abs(sig.entry - sig.sl) / getPipValue(pair)
+              : strategy.slPips
+            const effectiveRiskPct = pfEnabled && pfRiskCap !== null && pfRiskCap < strategy.riskPct
+              ? pfRiskCap
+              : strategy.riskPct
+            const scalpLots    = calcStandardPositionSize(accountBalance, effectiveRiskPct, Math.max(1, signalSlPips), pair)
+            const scalpRiskAmt = accountBalance * effectiveRiskPct / 100
+            const pfCapped     = pfEnabled && pfRiskCap !== null && pfRiskCap < strategy.riskPct
+
+            return (
+              <div key={pair} style={{
+                padding: '14px 16px', borderRadius: 4,
+                background: bgColor, border: `1px solid ${borderColor}`,
+                display: 'flex', flexDirection: 'column', gap: 8,
+                opacity: dir === 'HOLD' ? 0.5 : 1,
+              }}>
+
+                {/* Header */}
+                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, fontWeight: 700, marginBottom: 2 }}>
+                      {name} MIRROR · 1–5m
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 28, fontWeight: 900, fontFamily: 'Rajdhani', letterSpacing: 2, color: dirColor, lineHeight: 1 }}>
+                        {dir}
+                      </span>
+                      {dir !== 'HOLD' && conf > 0 && (
+                        <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'JetBrains Mono', color: dirColor }}>
+                          {conf}%
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right', flexShrink: 0, fontSize: 10 }}>
+                    {sig && !sig.blocked && dir !== 'HOLD' ? (
+                      <>
+                        <div style={{ color: actualMsLeft < 60000 ? 'var(--color-sell)' : 'var(--text-muted)', fontFamily: 'JetBrains Mono', fontWeight: 700 }}>
+                          {mLeft}m {String(sLeft).padStart(2, '0')}s
+                        </div>
+                        <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>valid until</div>
+                      </>
+                    ) : (!sig || sig.blocked) ? (
+                      <div style={{ color: 'var(--text-dim)', fontStyle: 'italic' }}>loading…</div>
+                    ) : null}
+                  </div>
+                </div>
+
+                {/* Price levels with mirrored SL/TP */}
+                {sig && !sig.blocked && dir !== 'HOLD' && (
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {([
+                      { label: 'ENTRY', val: sig.entry, color: 'var(--color-accent)' },
+                      { label: 'SL',    val: mirrorSl,  color: 'var(--color-loss)' },
+                      { label: 'TP',    val: mirrorTp,  color: 'var(--color-profit)' },
+                    ] as const).map(({ label, val, color }) => (
+                      <div key={label} style={{
+                        flex: 1, minWidth: 0,
+                        background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px',
+                      }}>
+                        <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>{label}</div>
+                        <div style={{ fontSize: 11, color, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                          <CopyValue value={val.toFixed(dp)}>{val.toFixed(dp)}</CopyValue>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Lot size / risk row */}
+                {sig && !sig.blocked && dir !== 'HOLD' && (
+                  <div style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    background: 'rgba(0,85,176,0.07)', border: '1px solid rgba(0,85,176,0.18)',
+                    borderRadius: 2, padding: '6px 8px',
+                  }}>
+                    <div>
+                      <div style={{ fontSize: 9, color: 'var(--color-accent)', letterSpacing: 1, marginBottom: 1 }}>POSITION</div>
+                      <span style={{ fontSize: 16, fontWeight: 900, color: 'var(--color-accent)', fontFamily: 'JetBrains Mono', lineHeight: 1 }}>
+                        {scalpLots.toFixed(2)}
+                      </span>
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>lots</span>
+                    </div>
+                    <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                      <div style={{ color: 'var(--color-loss)' }}>${scalpRiskAmt.toFixed(2)} at risk</div>
+                      <div>{effectiveRiskPct}% of ${accountBalance.toLocaleString()}</div>
+                      {pfCapped && (
+                        <div style={{ color: 'var(--color-wait)', fontWeight: 700 }}>PF capped ↓{pfRiskCap}%</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Reasons (inherited from original) */}
+                {sig?.reasons && sig.reasons.length > 0 && dir !== 'HOLD' && (
+                  <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+                    {sig.reasons.slice(0, 2).map((r, i) => (
+                      <div key={i} style={{ display: 'flex', gap: 4, alignItems: 'flex-start' }}>
+                        <span style={{ color: dirColor, flexShrink: 0, marginTop: 1 }}>›</span>
+                        <span style={{ wordBreak: 'break-word' }}>{r}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Place Mirror button */}
+                {sig && !sig.blocked && dir !== 'HOLD' && actualMsLeft > 0 && (
+                  <button
+                    className={`btn ${dir === 'BUY' ? 'btn-buy' : 'btn-sell'}`}
+                    onClick={() => handleMirrorScalpOrder(sig)}
+                    disabled={placingMirrorScalp === pair}
+                    style={{ padding: '10px', fontSize: 13, letterSpacing: 1.5, width: '100%' }}
+                  >
+                    {placingMirrorScalp === pair
+                      ? <LoadingDots color={dirColor} />
+                      : `▶ PLACE MIRROR ${dir}`}
+                  </button>
+                )}
+
+                {sig?.blocked && (
+                  <div style={{ fontSize: 11, color: 'var(--color-sell)', fontStyle: 'italic' }}>
+                    Live MT5 feed required
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
       </div>
 
       {/* AUTO TRADER panel — commented out, scalp signal cards shown instead
