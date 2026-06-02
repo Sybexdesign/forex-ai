@@ -85,6 +85,8 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   const [scalpSignals, setScalpSignals] = useState<Record<string, ScalpSignal>>({})
   const [scalpTick, setScalpTick] = useState(0)  // increments every second for expiry countdown
   const [placingScalp, setPlacingScalp] = useState<string | null>(null)
+  const [pfEnabled, setPfEnabled]     = useState(false)
+  const [pfRiskCap, setPfRiskCap]     = useState<number | null>(null)  // null = not yet loaded
 
   const accountBalance = account?.balance || 10000
 
@@ -94,6 +96,22 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => {
     const id = setInterval(() => setScalpTick(t => t + 1), 1000)
     return () => clearInterval(id)
+  }, [])
+
+  // Fetch prop firm settings once to know if risk is capped
+  useEffect(() => {
+    authFetch('/api/prop-firm')
+      .then(r => r.json())
+      .then(({ settings }) => {
+        if (!settings?.enabled) return
+        const baseCap = settings.maxDailyLossPct / 2
+        const cap = settings.consistencyRulePct > 0
+          ? Math.min(baseCap, settings.consistencyRulePct)
+          : baseCap
+        setPfEnabled(true)
+        setPfRiskCap(cap)
+      })
+      .catch(() => {})
   }, [])
 
   const fetchScalpSignalForPair = useCallback(async (pair: string) => {
@@ -210,14 +228,18 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     if (placingScalp) return
     setPlacingScalp(sig.pair)
     try {
-      const livePrice = prices[sig.pair]?.bid || sig.entry
+      const pip = getPipValue(sig.pair)
+      // Derive SL/TP in pips from the signal's actual price levels so the broker
+      // places stops exactly where the card displayed them, and lot size matches.
+      const scalpSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
+      const scalpTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
           pair:           sig.pair,
           direction:      sig.direction,
-          strategy,
-          currentPrice:   livePrice,
+          strategy:       { ...strategy, slPips: scalpSlPips, tpPips: scalpTpPips },
+          currentPrice:   sig.entry,  // use signal entry so SL/TP are placed at displayed levels
           newsInWindow,
           aiConfidence:   sig.confidence,
           checklistScore: 5,
@@ -314,6 +336,17 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           const borderColor = dir === 'BUY' ? 'rgba(0,200,83,0.3)' : dir === 'SELL' ? 'rgba(255,48,86,0.3)' : 'rgba(255,255,255,0.1)'
           const bgColor     = dir === 'BUY' ? 'rgba(0,200,83,0.05)' : dir === 'SELL' ? 'rgba(255,48,86,0.05)' : 'rgba(255,255,255,0.02)'
           const dp = pair.startsWith('XAU') ? 2 : 3
+
+          // Lot size: derive SL pips from the signal's actual SL distance, apply prop firm risk cap
+          const signalSlPips = sig && dir !== 'HOLD' && sig.entry !== sig.sl
+            ? Math.abs(sig.entry - sig.sl) / getPipValue(pair)
+            : strategy.slPips
+          const effectiveRiskPct = pfEnabled && pfRiskCap !== null && pfRiskCap < strategy.riskPct
+            ? pfRiskCap
+            : strategy.riskPct
+          const scalpLots    = calcStandardPositionSize(accountBalance, effectiveRiskPct, Math.max(1, signalSlPips), pair)
+          const scalpRiskAmt = accountBalance * effectiveRiskPct / 100
+          const pfCapped     = pfEnabled && pfRiskCap !== null && pfRiskCap < strategy.riskPct
           return (
             <div key={pair} style={{
               padding: '14px 16px', borderRadius: 4,
@@ -373,6 +406,30 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
                 </div>
               )}
 
+              {/* Lot size / risk row */}
+              {sig && !sig.blocked && dir !== 'HOLD' && (
+                <div style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  background: 'rgba(0,85,176,0.07)', border: '1px solid rgba(0,85,176,0.18)',
+                  borderRadius: 2, padding: '6px 8px',
+                }}>
+                  <div>
+                    <div style={{ fontSize: 9, color: 'var(--color-accent)', letterSpacing: 1, marginBottom: 1 }}>POSITION</div>
+                    <span style={{ fontSize: 16, fontWeight: 900, color: 'var(--color-accent)', fontFamily: 'JetBrains Mono', lineHeight: 1 }}>
+                      {scalpLots.toFixed(2)}
+                    </span>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>lots</span>
+                  </div>
+                  <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                    <div style={{ color: 'var(--color-loss)' }}>${scalpRiskAmt.toFixed(2)} at risk</div>
+                    <div>{effectiveRiskPct}% of ${accountBalance.toLocaleString()}</div>
+                    {pfCapped && (
+                      <div style={{ color: 'var(--color-wait)', fontWeight: 700 }}>PF capped ↓{pfRiskCap}%</div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* Reasons */}
               {sig?.reasons && sig.reasons.length > 0 && dir !== 'HOLD' && (
                 <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.6 }}>
@@ -409,300 +466,17 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         })}
       </div>
 
-      {/* Header controls */}
+      {/* AUTO TRADER panel — commented out, scalp signal cards shown instead
       <Panel title="AUTO TRADER" bright>
-        <div style={{ padding: '14px 16px' }}>
-          <div className="auto-controls-row" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-
-            {/* Scanner ON/OFF */}
-            <button
-              onClick={() => setEnabled(!enabled)}
-              style={{
-                padding: '10px 24px', borderRadius: 4, cursor: 'pointer',
-                fontFamily: 'Rajdhani', fontWeight: 700, fontSize: 15, letterSpacing: 2,
-                background: enabled ? 'rgba(255,48,86,0.12)' : 'rgba(0,104,51,0.1)',
-                border: `1px solid ${enabled ? 'rgba(255,48,86,0.4)' : 'rgba(0,104,51,0.35)'}`,
-                color: enabled ? 'var(--color-sell)' : 'var(--color-buy)',
-                transition: 'all 0.2s',
-              }}
-            >
-              {enabled ? '⏹ STOP SCANNER' : '▶ START SCANNER'}
-            </button>
-
-            {/* Auto-execute toggle */}
-            <button
-              onClick={() => setAutoExecute(v => !v)}
-              title={autoExecute ? 'Signals auto-execute on your broker instantly' : 'Click to enable fully automatic execution'}
-              style={{
-                padding: '10px 20px', borderRadius: 4, cursor: 'pointer',
-                fontFamily: 'Rajdhani', fontWeight: 700, fontSize: 14, letterSpacing: 1,
-                background: autoExecute ? 'rgba(138,98,0,0.1)' : 'rgba(0,85,176,0.07)',
-                border: `1px solid ${autoExecute ? 'rgba(138,98,0,0.4)' : 'rgba(0,85,176,0.3)'}`,
-                color: autoExecute ? 'var(--color-wait)' : 'var(--color-accent)',
-                transition: 'all 0.2s',
-              }}
-            >
-              {autoExecute ? '⚡ AUTO-EXECUTE ON' : '◎ MANUAL APPROVE'}
-            </button>
-
-            {/* Timeframe */}
-            <div style={{ display: 'flex', gap: 6 }}>
-              {TIMEFRAMES.map(tf => (
-                <button
-                  key={tf}
-                  className={`tab-btn ${timeframe === tf ? 'active' : ''}`}
-                  onClick={() => setTimeframe(tf)}
-                  disabled={enabled}
-                >
-                  {tf}
-                </button>
-              ))}
-            </div>
-
-            {/* Manual scan */}
-            <button
-              className="btn btn-ghost"
-              onClick={runScan}
-              disabled={scanning}
-              style={{ padding: '8px 16px', fontSize: 12 }}
-            >
-              {scanning ? <LoadingDots /> : '⟳ SCAN NOW'}
-            </button>
-
-            {/* Status */}
-            <div className="controls-status" style={{ marginLeft: 'auto', textAlign: 'right' }}>
-              {enabled && !scanning && countdown > 0 && (
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                  Next scan in <span className="mono" style={{ color: 'var(--color-accent)' }}>{fmtCountdown(countdown)}</span>
-                </div>
-              )}
-              {scanning && (
-                <div style={{ fontSize: 11, color: 'var(--color-wait)' }}>Scanning Gold &amp; Silver…</div>
-              )}
-              {lastScan && !scanning && (
-                <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
-                  Last scan: {lastScan.toLocaleTimeString('en', { hour12: false })}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Auto-execute warning */}
-          {autoExecute && (
-            <div style={{
-              marginTop: 12, padding: '8px 12px', borderRadius: 3,
-              background: 'rgba(138,98,0,0.08)', border: '1px solid rgba(138,98,0,0.28)',
-              fontSize: 12, color: 'var(--color-warn-text)',
-            }}>
-              ⚡ <strong>Full auto-execute active</strong> — signals that pass all risk & prop firm rules will be placed on your broker automatically. No manual approval needed.
-            </div>
-          )}
-
-          {/* Watchlist pills */}
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 }}>
-            {watchlist.map(p => (
-              <span key={p} style={{
-                fontSize: 11, padding: '2px 8px', borderRadius: 2,
-                background: 'rgba(0,85,176,0.08)', border: '1px solid rgba(0,85,176,0.2)',
-                color: 'var(--color-accent)', fontFamily: 'JetBrains Mono',
-              }}>{p}</span>
-            ))}
-            <span style={{ fontSize: 11, color: 'var(--text-muted)', alignSelf: 'center', marginLeft: 4 }}>
-              scanning {timeframe} timeframe
-            </span>
-          </div>
-
-          {error && (
-            <div style={{ marginTop: 10, padding: '8px 12px', background: 'rgba(200,16,46,0.07)', border: '1px solid rgba(200,16,46,0.25)', borderRadius: 3, fontSize: 12, color: 'var(--color-sell)' }}>
-              ⚠ {error}
-            </div>
-          )}
-        </div>
+        ...scanner controls, timeframe selector, watchlist pills...
       </Panel>
+      */}
 
-      {/* Open positions */}
-      <Panel title={`OPEN POSITIONS${openTrades.length ? ` (${openTrades.length})` : ''}`}>
-        <div style={{ padding: '10px 16px' }}>
-          {tradesLoading ? (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', textAlign: 'center', padding: '12px 0' }}>
-              <LoadingDots />
-            </div>
-          ) : openTrades.length === 0 ? (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', textAlign: 'center', padding: '12px 0' }}>
-              No open positions — trades placed will appear here
-            </div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {openTrades.slice(openPage * PAGE_SIZE, (openPage + 1) * PAGE_SIZE).map(trade => {
-                const color = DIR_COLOR[trade.direction] || 'var(--color-wait)'
-                const pl = trade.unrealized_pl ?? trade.unrealizedPL ?? 0
-                return (
-                  <div key={trade.id} className="dir-card" data-dir={trade.direction || 'WAIT'} style={{
-                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                    padding: '8px 12px',
-                  }}>
-                    <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
-                      <div>
-                        <div style={{ fontSize: 13, fontWeight: 700, color, fontFamily: 'Rajdhani', letterSpacing: 1 }}>
-                          {trade.direction}
-                        </div>
-                        <div style={{ fontSize: 12, color: 'var(--text-primary)', fontWeight: 600 }}>{trade.pair}</div>
-                      </div>
-                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                        <div>{trade.lots?.toFixed(2)} lots</div>
-                        <div>@ {trade.entry_price?.toFixed(trade.pair?.includes('JPY') ? 3 : 5) ?? '—'}</div>
-                      </div>
-                    </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                      <div style={{
-                        fontSize: 14, fontWeight: 700, fontFamily: 'JetBrains Mono',
-                        color: pl >= 0 ? 'var(--color-profit)' : 'var(--color-sell)',
-                      }}>
-                        {pl >= 0 ? '+' : ''}{pl.toFixed(2)}
-                      </div>
-                      <button
-                        className="btn btn-ghost"
-                        onClick={() => handleClose({ ...trade, id: trade.oanda_trade_id || trade.id })}
-                        disabled={closingId === (trade.oanda_trade_id || trade.id)}
-                        style={{ fontSize: 11, padding: '5px 12px', color: 'var(--color-sell)', borderColor: 'rgba(200,16,46,0.3)' }}
-                      >
-                        {closingId === (trade.oanda_trade_id || trade.id) ? <LoadingDots /> : 'CLOSE'}
-                      </button>
-                    </div>
-                  </div>
-                )
-              })}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <button
-                  className="btn btn-ghost"
-                  onClick={loadOpenTrades}
-                  style={{ fontSize: 11, padding: '6px' }}
-                >
-                  ⟳ Refresh
-                </button>
-                <Pager page={openPage} total={openTrades.length} onPage={setOpenPage} />
-              </div>
-            </div>
-          )}
-        </div>
+      {/* OPEN POSITIONS panel — commented out
+      <Panel title="OPEN POSITIONS">
+        ...open trades list with close buttons...
       </Panel>
-
-      {/* How it works — only when idle */}
-      {!enabled && pendingSignals.length === 0 && (
-        <div style={{
-          padding: '20px 24px',
-          background: 'rgba(0,128,255,0.04)', border: '1px solid rgba(0,128,255,0.15)',
-          borderRadius: 4, display: 'flex', flexDirection: 'column', gap: 10,
-        }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-accent)', letterSpacing: 1 }}>HOW IT WORKS</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {[
-              ['1', 'Scanner analyses XAU/USD (Gold) and XAG/USD (Silver) continuously using live MT5 data + AI'],
-              ['2', 'Multi-timeframe confirmation: 5m signals verified on 15m, 15m on 1H, 1H on 4H'],
-              ['3', 'Only signals with live market data and ≥ 55% AI confidence appear — simulation is blocked'],
-              ['4', 'Manual mode: review each signal and tap APPROVE to queue it on your MT5 broker'],
-              ['5', 'Auto-execute mode: qualifying signals execute instantly — all risk guards enforced'],
-            ].map(([n, text]) => (
-              <div key={n} style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
-                <span style={{
-                  width: 20, height: 20, borderRadius: '50%', background: 'rgba(0,85,176,0.12)',
-                  border: '1px solid rgba(0,85,176,0.35)', display: 'flex', alignItems: 'center',
-                  justifyContent: 'center', fontSize: 10, color: 'var(--color-accent)', flexShrink: 0, fontWeight: 700,
-                }}>{n}</span>
-                <span style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.5 }}>{text}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Approval queue — only shown in manual mode */}
-      {!autoExecute && pendingSignals.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-wait)', letterSpacing: 1 }}>
-              ⚡ {pendingSignals.length} SIGNAL{pendingSignals.length > 1 ? 'S' : ''} AWAITING APPROVAL
-            </div>
-            <button
-              className="btn btn-ghost"
-              onClick={clearAll}
-              style={{ fontSize: 11, padding: '4px 12px' }}
-            >
-              Dismiss all
-            </button>
-          </div>
-
-          {pendingSignals.map(signal => (
-            <SignalCard
-              key={signal.id}
-              signal={signal}
-              strategy={strategy}
-              accountBalance={accountBalance}
-              livePrice={prices[signal.pair]?.bid}
-              approving={approvingId === signal.id}
-              onApprove={() => handleApprove(signal)}
-              onReject={() => rejectSignal(signal)}
-            />
-          ))}
-        </div>
-      )}
-
-      {/* Auto-execute queue notification */}
-      {autoExecute && pendingSignals.length > 0 && (
-        <div style={{
-          padding: '14px 18px', borderRadius: 4,
-          background: 'rgba(255,184,0,0.06)', border: '1px solid rgba(255,184,0,0.25)',
-        }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-wait)' }}>
-            ⚡ Auto-executing {pendingSignals.length} signal{pendingSignals.length > 1 ? 's' : ''}…
-          </div>
-          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-            All risk and prop firm rules are checked before each trade is placed.
-          </div>
-        </div>
-      )}
-
-      {/* Empty state when enabled but no signals yet */}
-      {enabled && !scanning && pendingSignals.length === 0 && lastScan && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
-          <div style={{
-            textAlign: 'center', padding: '28px 20px 20px',
-            color: 'var(--text-muted)', fontSize: 13,
-          }}>
-            <div style={{ fontSize: 28, marginBottom: 10 }}>◎</div>
-            <div>No actionable signals — {diagnostics.length > 0 ? `${diagnostics.length} pair${diagnostics.length > 1 ? 's' : ''} scanned, all filtered` : 'no qualifying setups found'}.</div>
-            <div style={{ fontSize: 12, marginTop: 6, color: 'var(--text-dim)' }}>
-              Next scan in <span className="mono" style={{ color: 'var(--color-accent)' }}>{fmtCountdown(countdown)}</span> — or hit ⟳ SCAN NOW
-            </div>
-          </div>
-
-          {diagnostics.length > 0 && (
-            <div style={{
-              margin: '0 0 4px', padding: '12px 16px',
-              background: 'rgba(0,0,0,0.15)', border: '1px solid rgba(255,255,255,0.07)',
-              borderRadius: 4,
-            }}>
-              <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 8, fontWeight: 700 }}>
-                SCAN FILTER LOG
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                {diagnostics.map((d, i) => (
-                  <div key={i} style={{
-                    display: 'flex', alignItems: 'baseline', gap: 10,
-                    fontSize: 12, lineHeight: 1.5,
-                  }}>
-                    <span style={{
-                      fontFamily: 'JetBrains Mono', fontSize: 11, fontWeight: 700,
-                      color: 'var(--color-accent-dim)', flexShrink: 0, minWidth: 70,
-                    }}>{d.pair}</span>
-                    <span style={{ color: 'var(--text-muted)' }}>{d.blockedBy}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+      */}
 
     </div>
   )

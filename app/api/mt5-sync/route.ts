@@ -140,13 +140,28 @@ export async function POST(req: NextRequest) {
     }
 
     // ── Merge EA-pushed candle data ───────────────────────────────────────
-    // candles: { timeframe: "M5", data: { EURUSD: [{t,o,h,l,c,v},...], GBPUSD: [...] } }
+    // EA sends: { M5: { EURUSD: [...], XAGUSD: [...] }, M15: { ... }, H1: { ... }, H4: { ... } }
+    // Legacy format (never used by this EA): { timeframe: "M5", data: { EURUSD: [...] } }
     let candleCache: Record<string, any> = row.config?.candleCache || {}
-    if (candles?.timeframe && candles?.data && typeof candles.data === 'object') {
-      const tf = String(candles.timeframe)
-      for (const [sym, bars] of Object.entries(candles.data as Record<string, any>)) {
-        if (Array.isArray(bars) && bars.length >= 10) {
-          candleCache[`${sym}_${tf}`] = { candles: bars, updatedAt: now }
+    if (candles && typeof candles === 'object') {
+      const KNOWN_TFS = new Set(['M1','M3','M5','M15','M30','H1','H4','D1','W1'])
+      if (candles.timeframe && candles.data && typeof candles.data === 'object') {
+        // Legacy single-TF format
+        const tf = String(candles.timeframe)
+        for (const [sym, bars] of Object.entries(candles.data as Record<string, any>)) {
+          if (Array.isArray(bars) && bars.length >= 10) {
+            candleCache[`${sym}_${tf}`] = { candles: bars, updatedAt: now }
+          }
+        }
+      } else {
+        // EA multi-TF format: top-level keys are timeframe names
+        for (const [tf, tfData] of Object.entries(candles as Record<string, any>)) {
+          if (!KNOWN_TFS.has(tf) || typeof tfData !== 'object') continue
+          for (const [sym, bars] of Object.entries(tfData as Record<string, any>)) {
+            if (Array.isArray(bars) && bars.length >= 10) {
+              candleCache[`${sym}_${tf}`] = { candles: bars, updatedAt: now }
+            }
+          }
         }
       }
     }
@@ -168,7 +183,8 @@ export async function POST(req: NextRequest) {
 
     const priceSymbols  = Object.keys(latestPrices)
     const candleSymbols = Object.keys(candleCache)
-    console.log(`[mt5-sync] storing — prices:${priceSymbols.length} (${priceSymbols.slice(0,3).join(',')}) candleKeys:${candleSymbols.length}`)
+    const xagKeys = candleSymbols.filter(k => k.startsWith('XAGUSD'))
+    console.log(`[mt5-sync] storing — prices:${priceSymbols.length} (${priceSymbols.slice(0,4).join(',')}) candleKeys:${candleSymbols.length} xag:${xagKeys.join(',') || 'NONE'}`)
 
     const { error: updateErr } = await sb.from('broker_configs')
       .update({ config: updatedConfig, updated_at: new Date().toISOString() })

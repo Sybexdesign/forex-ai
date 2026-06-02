@@ -74,12 +74,12 @@ Generate a 1–5 minute directional scalp signal.
 
 CRITICAL: You MUST return BUY or SELL. Only return HOLD in an exact tie (extremely rare).
 
-Score 5 factors and pick the majority direction:
-1. RSI(14) < 50 → bullish | RSI(14) > 50 → bearish
+Score 5 momentum factors and pick the majority direction:
+1. RSI(14) > 50 → bullish | RSI(14) < 50 → bearish
 2. EMA9 > EMA21 → bullish | EMA9 < EMA21 → bearish
 3. MACD histogram > 0 → bullish | < 0 → bearish
 4. Buy pressure > 50% → bullish | < 50% → bearish
-5. Price below BB midline → bullish potential | above midline → bearish potential
+5. Price above BB midline → bullish | below midline → bearish
 
 Confidence: 5/5 votes = 90–95, 4/5 = 72–85, 3/5 = 58–68.
 Entry at current price. SL = 1.5 × ATR. TP = 2.0 × ATR.
@@ -135,11 +135,11 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
     // 5-vote majority: always commits to a direction
     const bbMid = (t.bbUpper + t.bbLower) / 2
     const votes = [
-      t.rsi14 < 50 ? 1 : -1,
-      t.ema9  > t.ema21 ? 1 : -1,
-      t.macdHistogram > 0 ? 1 : -1,
-      t.buyPressure > 0.5 ? 1 : -1,
-      t.price < bbMid ? 1 : -1,
+      t.rsi14 > 50 ? 1 : -1,          // RSI > 50 = bullish momentum
+      t.ema9  > t.ema21 ? 1 : -1,      // EMA9 above EMA21 = bullish trend
+      t.macdHistogram > 0 ? 1 : -1,    // MACD positive = bullish momentum
+      t.buyPressure > 0.5 ? 1 : -1,    // buyers dominant = bullish pressure
+      t.price > bbMid ? 1 : -1,        // price in upper BB half = bullish position
     ]
     const bullVotes = votes.filter(v => v > 0).length
     const bearVotes = 5 - bullVotes
@@ -151,7 +151,8 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
       score = 45 - edge * 8   // 3/5→37, 4/5→29, 5/5→21
       reasons.push(`Scalp: ${bearVotes}/5 bearish indicators`)
     }
-    if (t.ema9 > t.ema21) reasons.push('EMA9 > EMA21 bullish') ; else reasons.push('EMA9 < EMA21 bearish')
+    if (t.rsi14 > 50) reasons.push(`RSI ${t.rsi14.toFixed(1)} — bullish momentum`) ; else reasons.push(`RSI ${t.rsi14.toFixed(1)} — bearish momentum`)
+    if (t.ema9 > t.ema21) reasons.push('EMA9 > EMA21 — bullish trend') ; else reasons.push('EMA9 < EMA21 — bearish trend')
     if (t.macdHistogram > 0) reasons.push(`MACD +${t.macdHistogram.toFixed(4)}`) ; else reasons.push(`MACD ${t.macdHistogram.toFixed(4)}`)
   } else {
     if (t.buyPressure > 0.62) { score += 18; reasons.push(`Buy pressure ${(t.buyPressure * 100).toFixed(0)}%`) }
@@ -174,9 +175,14 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
   const sl = direction === 'BUY' ? entry - slPips : direction === 'SELL' ? entry + slPips : entry
   const tp = direction === 'BUY' ? entry + tpPips : direction === 'SELL' ? entry - tpPips : entry
 
+  // Normalise confidence to signal STRENGTH regardless of direction.
+  // Raw score for SELL sits at 5–45 (strong=5, weak=37), which the ML reads as low confidence.
+  // Mirror it so 5/5 SELL = 95, 4/5 SELL = 79, 3/5 SELL = 63 — same scale as BUY.
+  const confidence = direction === 'SELL' ? Math.round(100 - score) : Math.round(score)
+
   return {
     direction,
-    confidence: Math.round(score),
+    confidence,
     reasons: reasons.slice(0, 4),
     entry, sl, tp,
     risk_note: `Rule-based (AI offline). Spread: ${t.spreadPips.toFixed(1)} pips · ATR: ${t.atrPips.toFixed(1)} pips.`,
