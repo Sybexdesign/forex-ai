@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| SybexForexAI Balance Sync EA v8                                  |
+//| SybexForexAI Balance Sync EA v8.1                                |
 //| Posts DIRECTLY to Supabase RPC -- bypasses Vercel entirely.      |
 //| v5 fix: ORDER_FILLING_RETURN (IOC caused all orders to reject).  |
 //| v6 fix: split fast order-poll (2s) from heavy data sync (10s)    |
@@ -12,21 +12,35 @@
 //|           match when app sends "XAUUSD" but broker has "XAUUSD.s"|
 //| v8 add: in-EA Profit Protection Layer runs on every timer tick   |
 //|         break-even (+0.5R), partial lock (+1R), ATR trail,       |
-//|         profit-decay exit (< 50% of peak) — no server round-trip |
+//|         profit-decay exit (< 50% of peak) -- no server round-trip|
+//| v8.1 fix: 6 profit protection improvements                       |
+//|   (1) BE trend filter: ATR expansion + momentum confirmation     |
+//|   (2) ATR trail normalised per symbol class (XAU/XAG/FX)        |
+//|   (3) Decay threshold eased to 40% + min hold guard             |
+//|   (4) MinHoldSeconds: no exits until trade matures               |
+//|   (5) Spread + rollover session guard before any SL action       |
+//|   (6) Dynamic g_prot array -- no silent position drops           |
 //+------------------------------------------------------------------+
 #property strict
-#property description "SybexForexAI v8 -- in-EA profit protection"
+#property description "SybexForexAI v8.1 -- profit protection tuning"
 
 //--- Inputs -----------------------------------------------------------
 input string WebhookToken        = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
 input string SymbolSuffix        = "";   // broker symbol suffix, e.g. ".s" for Exness
-input int    OrderPollSeconds     = 2;   // how often to check for new pending orders
-input int    DataSyncSeconds      = 10;  // how often to push full market data (candles, balance, positions)
-input int    CandleBars           = 200;
-input int    CandleBarsHTF        = 100;
-input int    MagicNumber          = 20260001;
-input int    SlippagePoints       = 10;
+input int    OrderPollSeconds    = 2;    // how often to check for new pending orders
+input int    DataSyncSeconds     = 10;   // how often to push full market data
+input int    CandleBars          = 200;
+input int    CandleBarsHTF       = 100;
+input int    MagicNumber         = 20260001;
+input int    SlippagePoints      = 10;
 input ENUM_ORDER_TYPE_FILLING FillMode = ORDER_FILLING_RETURN;
+
+// v8.1 FIX - MIN HOLD TIME
+input int    MinHoldSeconds      = 60;   // no BE / trail / decay until trade is this old
+
+// v8.1 FIX - SPREAD + SESSION PROTECTION
+input int    MaxSpreadPips       = 30;   // skip SL actions if spread exceeds this
+input bool   UseRolloverFilter   = true; // skip actions during broker rollover 21:55-22:05
 
 string SYMBOLS[] = {"EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","XAGUSD","USDCAD"};
 
@@ -41,21 +55,23 @@ int    g_syncCounter   = 0;
 int    g_syncEveryN    = 5;
 
 //+------------------------------------------------------------------+
-//  Profit Protection Layer — state per open position
+//  Profit Protection Layer — state per open position                 |
 //+------------------------------------------------------------------+
-#define MAX_PROT_POSITIONS 50
 
 struct ProtState {
-   ulong  ticket;
-   double origEntry;
-   double origSl;
-   double peakProfit;
-   bool   beApplied;
-   bool   partialLocked;
+   ulong    ticket;
+   double   origEntry;
+   double   origSl;
+   double   peakProfit;
+   bool     beApplied;
+   bool     partialLocked;
+   datetime openedAt;   // v8.1 FIX - MIN HOLD TIME: set on first tick for this ticket
 };
 
-ProtState g_prot[MAX_PROT_POSITIONS];
-int       g_protCount = 0;
+// v8.1 FIX - DYNAMIC ARRAY: no fixed-size limit, doubles capacity as needed
+ProtState g_prot[];
+int       g_protCount    = 0;
+int       g_protCapacity = 0;
 
 //--- Find state index by ticket; returns -1 if not found -----------
 int FindProtState(ulong ticket)
@@ -65,12 +81,26 @@ int FindProtState(ulong ticket)
    return -1;
 }
 
-//--- Get-or-create state for a ticket ------------------------------
+//--- Get-or-create state for a ticket (dynamic array) --------------
 int EnsureProtState(ulong ticket, double entry, double sl)
 {
    int i = FindProtState(ticket);
    if(i >= 0) return i;
-   if(g_protCount >= MAX_PROT_POSITIONS) return -1;
+
+   // v8.1 FIX - DYNAMIC ARRAY: expand when full, never silently drop positions
+   if(g_protCount >= g_protCapacity)
+   {
+      int newCap = (g_protCapacity == 0) ? 20 : g_protCapacity * 2;
+      if(ArrayResize(g_prot, newCap) < 0)
+      {
+         Print("[pp] ERROR: ArrayResize failed, capacity=", g_protCapacity,
+               " — cannot track ticket=", ticket);
+         return -1;
+      }
+      g_protCapacity = newCap;
+      Print("[pp] g_prot expanded to capacity=", g_protCapacity);
+   }
+
    i = g_protCount++;
    g_prot[i].ticket        = ticket;
    g_prot[i].origEntry     = entry;
@@ -78,6 +108,7 @@ int EnsureProtState(ulong ticket, double entry, double sl)
    g_prot[i].peakProfit    = 0.0;
    g_prot[i].beApplied     = false;
    g_prot[i].partialLocked = false;
+   g_prot[i].openedAt      = TimeCurrent();   // v8.1 FIX - MIN HOLD TIME
    return i;
 }
 
@@ -131,6 +162,98 @@ double CalcATR_M5(string symbol)
 }
 
 //+------------------------------------------------------------------+
+//  v8.1 FIX - BE FILTER                                              |
+//  Return true if market is trending/volatile enough to justify BE.  |
+//  Requires at least one of:                                          |
+//    (a) ATR expanding: recent 3-bar ATR > older 5-bar ATR by 5%    |
+//    (b) Momentum aligned: 5-close avg on right side of 10-close avg |
+//+------------------------------------------------------------------+
+bool IsTrendSufficient(string symbol, bool isBuy)
+{
+   MqlRates r[];
+   int n = CopyRates(symbol, PERIOD_M5, 0, 15, r);
+   if(n < 10) return true;   // not enough data → allow BE
+
+   // (a) ATR expansion
+   double atrRecent = 0.0, atrOlder = 0.0;
+   for(int i = n - 3; i < n; i++)      atrRecent += r[i].high - r[i].low;
+   for(int i = n - 8; i < n - 3; i++) atrOlder  += r[i].high - r[i].low;
+   atrRecent /= 3.0;
+   atrOlder  /= 5.0;
+   if(atrOlder > 0.0 && atrRecent > atrOlder * 1.05) return true;
+
+   // (b) Momentum: 5-bar close average vs 10-bar close average
+   double avg5 = 0.0, avg10 = 0.0;
+   for(int i = n - 5;  i < n; i++) avg5  += r[i].close;
+   for(int i = n - 10; i < n; i++) avg10 += r[i].close;
+   avg5  /= 5.0;
+   avg10 /= 10.0;
+   bool aligned = isBuy ? (avg5 > avg10) : (avg5 < avg10);
+   if(aligned) return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//  v8.1 FIX - ATR NORMALIZATION                                      |
+//  Symbol-class specific ATR multiplier so trailing SL width is     |
+//  appropriate for both metals (wider) and FX pairs (tighter).      |
+//+------------------------------------------------------------------+
+double GetTrailMult(string sym)
+{
+   if(StringFind(sym, "XAU") >= 0) return 1.5;   // Gold: wide trail, high vol
+   if(StringFind(sym, "XAG") >= 0) return 1.2;   // Silver: moderate trail
+   if(StringFind(sym, "JPY") >= 0) return 0.5;   // JPY pairs: standard
+   return 0.5;                                    // all other FX
+}
+
+//--- Compute normalised trailing SL level --------------------------
+double CalcTrailSL(string sym, bool isBuy, double midPx)
+{
+   // v8.1 FIX - ATR NORMALIZATION
+   double atr  = CalcATR_M5(sym);
+   if(atr <= 0.0 || midPx <= 0.0) return 0.0;
+   double mult = GetTrailMult(sym);
+   return isBuy ? midPx - atr * mult : midPx + atr * mult;
+}
+
+//+------------------------------------------------------------------+
+//  v8.1 FIX - SPREAD + SESSION PROTECTION                            |
+//+------------------------------------------------------------------+
+double GetPipSize(string sym)
+{
+   if(StringFind(sym, "JPY") >= 0) return 0.01;
+   if(StringFind(sym, "XAU") >= 0) return 0.1;
+   if(StringFind(sym, "XAG") >= 0) return 0.001;
+   return 0.0001;
+}
+
+bool IsHighSpread(string sym)
+{
+   double spread  = SymbolInfoDouble(sym, SYMBOL_ASK) - SymbolInfoDouble(sym, SYMBOL_BID);
+   double pipSize = GetPipSize(sym);
+   return pipSize > 0.0 && (spread / pipSize) > MaxSpreadPips;
+}
+
+bool IsRolloverTime()
+{
+   // Skip during broker rollover window: 21:55–22:05 server time
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   if(dt.hour == 21 && dt.min >= 55) return true;
+   if(dt.hour == 22 && dt.min <= 5)  return true;
+   return false;
+}
+
+bool IsSafeToAct(string sym)
+{
+   // v8.1 FIX - SPREAD + SESSION PROTECTION
+   if(UseRolloverFilter && IsRolloverTime()) return false;
+   if(IsHighSpread(sym))                     return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //  RunProfitProtection — called every OrderPollSeconds               |
 //  Execution order: BE → partial-lock → ATR trail → decay-exit      |
 //+------------------------------------------------------------------+
@@ -146,44 +269,51 @@ void RunProfitProtection()
       // Only manage positions opened by this EA instance
       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
 
-      string sym       = PositionGetString(POSITION_SYMBOL);   // e.g. "XAUUSD.s"
-      string rawSym    = StripSuffix(sym);                      // e.g. "XAUUSD"
-      bool   isBuy     = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      string sym      = PositionGetString(POSITION_SYMBOL);   // e.g. "XAUUSD.s"
+      string rawSym   = StripSuffix(sym);                      // e.g. "XAUUSD"
+      bool   isBuy    = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double currentSl = PositionGetDouble(POSITION_SL);
       double profit    = PositionGetDouble(POSITION_PROFIT);
       int    dp        = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
 
-      // Current mid price for trailing reference
       double midPx = isBuy ? SymbolInfoDouble(sym, SYMBOL_BID)
                            : SymbolInfoDouble(sym, SYMBOL_ASK);
-      if(midPx <= 0) continue;
+      if(midPx <= 0.0) continue;
 
       // Get-or-create state
       int si = EnsureProtState(ticket, openPrice, currentSl);
       if(si < 0) continue;
 
-      // Update peak profit (only track positive peaks)
+      // v8.1 FIX - MIN HOLD TIME: gate ALL logic until trade is old enough
+      int holdSecs = (int)(TimeCurrent() - g_prot[si].openedAt);
+      if(holdSecs < MinHoldSeconds) continue;
+
+      // v8.1 FIX - SPREAD + SESSION PROTECTION: skip SL/close during bad conditions
+      if(!IsSafeToAct(sym)) continue;
+
+      // Update peak profit (positive profits only)
       if(profit > g_prot[si].peakProfit)
          g_prot[si].peakProfit = profit;
 
       double origEntry = g_prot[si].origEntry;
       double origSl    = g_prot[si].origSl;
       double riskDist  = MathAbs(origEntry - origSl);
-      if(riskDist < 0.000001) continue;   // degenerate position, skip
+      if(riskDist < 0.000001) continue;
 
-      // Price-based R-multiple (works for all symbols without pip-value tables)
+      // Price-based R-multiple
       double pnlDist = isBuy ? midPx - origEntry : origEntry - midPx;
       double rMult   = pnlDist / riskDist;
 
-      double newSl   = 0.0;    // best SL candidate from rules 1-3; 0 = no change
+      double newSl   = 0.0;
       bool   doClose = false;
 
-      // ── 1. Break-even at +0.5R ─────────────────────────────────────
+      // ── 1. Break-even at +0.5R (with trend confirmation) ──────────
       if(!g_prot[si].beApplied && rMult >= 0.5)
       {
+         // v8.1 FIX - BE FILTER: only apply in trending/volatile market
          bool improves = isBuy ? origEntry > currentSl : origEntry < currentSl;
-         if(improves)
+         if(improves && IsTrendSufficient(sym, isBuy))
          {
             newSl = origEntry;
             g_prot[si].beApplied = true;
@@ -191,14 +321,19 @@ void RunProfitProtection()
                   " BE: R=", DoubleToString(rMult, 2),
                   " → SL to entry ", DoubleToString(origEntry, dp));
          }
+         else if(improves)
+         {
+            Print("[pp] ", rawSym, "#", ticket,
+                  " BE skipped: R=", DoubleToString(rMult, 2), " — choppy market");
+         }
       }
 
-      // ── 2. Partial profit lock at +1R → SL moves to +0.5R level ───
+      // ── 2. Partial profit lock at +1R → SL to +0.5R level ─────────
       if(!g_prot[si].partialLocked && rMult >= 1.0)
       {
          g_prot[si].partialLocked = true;
-         double lockSl = isBuy ? origEntry + 0.5 * riskDist
-                               : origEntry - 0.5 * riskDist;
+         double lockSl   = isBuy ? origEntry + 0.5 * riskDist
+                                 : origEntry - 0.5 * riskDist;
          double baseline = (newSl > 0.0) ? newSl : currentSl;
          bool   improves = isBuy ? lockSl > baseline : lockSl < baseline;
          if(improves)
@@ -210,20 +345,20 @@ void RunProfitProtection()
          }
       }
 
-      // ── 3. ATR trailing stop (only advances, only in profit) ───────
-      double atr = CalcATR_M5(sym);
-      if(atr > 0.0)
+      // ── 3. ATR trailing stop (normalised, only advances in profit) ──
+      // v8.1 FIX - ATR NORMALIZATION: CalcTrailSL uses symbol-class multiplier
+      double trailSl = CalcTrailSL(sym, isBuy, midPx);
+      if(trailSl > 0.0)
       {
-         double trailSl  = isBuy ? midPx - atr * 0.5 : midPx + atr * 0.5;
-         bool   inProfit = isBuy ? trailSl > origEntry  : trailSl < origEntry;
+         bool inProfit = isBuy ? trailSl > origEntry  : trailSl < origEntry;
          double baseline = (newSl > 0.0) ? newSl : currentSl;
-         bool   improves = isBuy ? trailSl > baseline   : trailSl < baseline;
+         bool improves   = isBuy ? trailSl > baseline : trailSl < baseline;
          if(inProfit && improves)
          {
             newSl = trailSl;
             Print("[pp] ", rawSym, "#", ticket,
                   " trail: px=", DoubleToString(midPx, dp),
-                  " ATR=", DoubleToString(atr, dp),
+                  " ATR*mult=", DoubleToString(CalcATR_M5(sym) * GetTrailMult(sym), dp),
                   " → SL=", DoubleToString(trailSl, dp));
          }
       }
@@ -236,12 +371,18 @@ void RunProfitProtection()
             Print("[pp] ModifySL FAILED ", rawSym, " ticket=", ticket, " retcode=", rc);
       }
 
-      // ── 4. Profit decay exit: close if profit < 50% of peak ────────
-      if(g_prot[si].peakProfit > 0.0 && profit < g_prot[si].peakProfit * 0.5)
+      // ── 4. Profit decay exit ────────────────────────────────────────
+      // v8.1 FIX - DECAY THRESHOLD: eased from 50% → 40% peak to allow
+      // natural 30-60% retracements in trending markets
+      // Also requires peakProfit to be meaningful (> 0.1 USD) to avoid
+      // triggering on spread noise at open
+      double peak = g_prot[si].peakProfit;
+      if(peak > 0.1 && profit < peak * 0.40)
       {
          Print("[pp] ", rawSym, "#", ticket,
                " DECAY-EXIT: profit=$", DoubleToString(profit, 2),
-               " < 50% of peak=$", DoubleToString(g_prot[si].peakProfit, 2));
+               " < 40% of peak=$", DoubleToString(peak, 2),
+               " held=", holdSecs, "s");
          doClose = true;
       }
 
@@ -260,11 +401,18 @@ int OnInit()
    g_totalSymbols = ArraySize(SYMBOLS);
    g_syncEveryN   = MathMax(1, DataSyncSeconds / OrderPollSeconds);
    g_protCount    = 0;
+   g_protCapacity = 0;
+   // v8.1 FIX - DYNAMIC ARRAY: initialise with starting capacity
+   ArrayResize(g_prot, 20);
+   g_protCapacity = 20;
+
    EventSetTimer(OrderPollSeconds);
-   Print("SybexForexAI v8 started | FillMode=", EnumToString(FillMode),
+   Print("SybexForexAI v8.1 started | FillMode=", EnumToString(FillMode),
          " | OrderPoll=", OrderPollSeconds, "s | DataSync=", DataSyncSeconds, "s",
          " | Suffix='", SymbolSuffix, "'",
-         " | Token prefix: ", StringSubstr(WebhookToken,0,8));
+         " | MinHold=", MinHoldSeconds, "s",
+         " | MaxSpread=", MaxSpreadPips, "pip",
+         " | Token prefix: ", StringSubstr(WebhookToken, 0, 8));
    return INIT_SUCCEEDED;
 }
 
@@ -284,9 +432,9 @@ void OnTimer()
       while(StringFind(resp, "\"id\":", sp) >= 0) { sp = StringFind(resp,"\"id\":",sp)+1; cnt++; }
       if(cnt > 0)
       {
-         Print("SybexForexAI v8: ", cnt, " pending command(s) -- executing...");
+         Print("SybexForexAI v8.1: ", cnt, " pending command(s) -- executing...");
          g_completedJson = ExecuteOrders(resp);
-         Print("SybexForexAI v8: completedOrders=", g_completedJson);
+         Print("SybexForexAI v8.1: completedOrders=", g_completedJson);
       }
    }
 
@@ -322,13 +470,13 @@ string FetchPendingOrders()
    int rc = WebRequest("POST", SYNC_URL, BuildHeaders(), 4000, post, result, respHdr);
    if(rc == -1)
    {
-      Print("SybexForexAI v8: pull FAILED err=", GetLastError(),
+      Print("SybexForexAI v8.1: pull FAILED err=", GetLastError(),
             " -- add URL to Tools>Options>Expert Advisors>Allowed URLs");
       return "";
    }
    if(rc != 200)
    {
-      Print("SybexForexAI v8: pull HTTP ", rc);
+      Print("SybexForexAI v8.1: pull HTTP ", rc);
       return "";
    }
    return CharArrayToString(result);
@@ -359,13 +507,13 @@ void SendDataToApp()
    ResetLastError();
    int rc = WebRequest("POST", SYNC_URL, BuildHeaders(), 15000, post, result, respHdr);
    if(rc == -1)
-      Print("SybexForexAI v8: push FAILED err=", GetLastError());
+      Print("SybexForexAI v8.1: push FAILED err=", GetLastError());
    else if(rc == 200)
-      Print("SybexForexAI v8: push OK | Bal=",
+      Print("SybexForexAI v8.1: push OK | Bal=",
             DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2),
             " Pos=", PositionsTotal());
    else
-      Print("SybexForexAI v8: push HTTP ", rc, " -- ", StringSubstr(CharArrayToString(result),0,200));
+      Print("SybexForexAI v8.1: push HTTP ", rc, " -- ", StringSubstr(CharArrayToString(result),0,200));
 }
 
 //+------------------------------------------------------------------+
@@ -520,17 +668,17 @@ bool PlaceOrder(string symbol, string direction, double lots,
       if(ok && res.retcode == 10009)
       {
          filledPrice = res.price;
-         if(f > 0) Print("SybexForexAI v8: used fallback fill mode ", EnumToString(modes[f]));
+         if(f > 0) Print("SybexForexAI v8.1: used fallback fill mode ", EnumToString(modes[f]));
          return true;
       }
 
       if(res.retcode != 10015 && res.retcode != 10030)
       {
-         Print("SybexForexAI v8: order FAILED ", fullSym, " ", direction,
+         Print("SybexForexAI v8.1: order FAILED ", fullSym, " ", direction,
                " retcode=", res.retcode, " fill=", EnumToString(modes[f]));
          return false;
       }
-      Print("SybexForexAI v8: fill mode ", EnumToString(modes[f]),
+      Print("SybexForexAI v8.1: fill mode ", EnumToString(modes[f]),
             " rejected -- trying next mode...");
    }
    return false;
@@ -646,14 +794,14 @@ string ExecuteOrders(string response)
             completed += "{\"id\":\"" + orderId + "\",\"success\":true,\"type\":\"modify_sl\""
                        + ",\"ticket\":" + IntegerToString((long)ticket)
                        + ",\"newSl\":"  + DoubleToString(newSl, 5) + "}";
-            Print("SybexForexAI v8: SL modified ", symbol,
+            Print("SybexForexAI v8.1: SL modified ", symbol,
                   " ticket=", ticket, " newSl=", newSl);
          }
          else
          {
             completed += "{\"id\":\"" + orderId + "\",\"success\":false,\"type\":\"modify_sl\""
                        + ",\"error\":\"retcode " + IntegerToString(rc) + "\"}";
-            Print("SybexForexAI v8: modify_sl FAILED ", symbol,
+            Print("SybexForexAI v8.1: modify_sl FAILED ", symbol,
                   " ticket=", ticket, " retcode=", rc);
          }
       }
@@ -669,7 +817,7 @@ string ExecuteOrders(string response)
          {
             ok = CloseByTicket(cmdTicket, symbol, rc);
             if(!ok)
-               Print("SybexForexAI v8: ticket close failed ticket=", cmdTicket,
+               Print("SybexForexAI v8.1: ticket close failed ticket=", cmdTicket,
                      " retcode=", rc, " -- falling back to symbol close");
          }
 
@@ -683,7 +831,7 @@ string ExecuteOrders(string response)
                if(PositionGetString(POSITION_SYMBOL) != fullSym) continue;
                int   rc2 = 0;
                if(!CloseByTicket(t, symbol, rc2))
-                  Print("SybexForexAI v8: symbol close failed ticket=", t, " retcode=", rc2);
+                  Print("SybexForexAI v8.1: symbol close failed ticket=", t, " retcode=", rc2);
                else
                   ok = true;
             }
@@ -691,7 +839,7 @@ string ExecuteOrders(string response)
 
          completed += "{\"id\":\"" + orderId + "\",\"success\":" + (ok ? "true" : "false")
                     + ",\"type\":\"close\"}";
-         Print("SybexForexAI v8: close ", (ok ? "OK" : "FAILED"), " ", symbol);
+         Print("SybexForexAI v8.1: close ", (ok ? "OK" : "FAILED"), " ", symbol);
       }
 
       // ── new order ───────────────────────────────────────────────────
@@ -708,21 +856,21 @@ string ExecuteOrders(string response)
          {
             completed += "{\"id\":\"" + orderId + "\",\"success\":true"
                        + ",\"filledPrice\":" + DoubleToString(filledPrice,5) + "}";
-            Print("SybexForexAI v8: FILLED ", symbol, " ", direction,
+            Print("SybexForexAI v8.1: FILLED ", symbol, " ", direction,
                   " lots=", lots, " @ ", filledPrice);
          }
          else
          {
             completed += "{\"id\":\"" + orderId + "\",\"success\":false"
                        + ",\"error\":\"retcode " + IntegerToString(retcode) + "\"}";
-            Print("SybexForexAI v8: REJECTED ", symbol, " retcode=", retcode);
+            Print("SybexForexAI v8.1: REJECTED ", symbol, " retcode=", retcode);
          }
       }
       else
       {
          completed += "{\"id\":\"" + orderId + "\",\"success\":false"
                     + ",\"error\":\"unknown command type\"}";
-         Print("SybexForexAI v8: unknown command in ", StringSubstr(obj,0,80));
+         Print("SybexForexAI v8.1: unknown command in ", StringSubstr(obj,0,80));
       }
 
       first     = false;

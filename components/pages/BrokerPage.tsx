@@ -280,7 +280,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                 <div style={{ marginBottom: 14 }}>
                   {/* Setup instructions */}
                   <div style={{ padding: '12px 14px', background: 'rgba(0,255,135,0.04)', border: '1px solid rgba(0,255,135,0.2)', borderRadius: 3, fontSize: 12, color: '#80d0a0', marginBottom: 12 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 8, color: '#00ff87' }}>EA v8 setup — in-EA profit protection + fast order polling (2s), direct Supabase sync:</div>
+                    <div style={{ fontWeight: 700, marginBottom: 8, color: '#00ff87' }}>EA v8.1 setup — tuned profit protection + fast order polling (2s), direct Supabase sync:</div>
                     <div style={{ marginBottom: 5 }}>1. Save this broker config, then download <strong>SybexForexAI_EA_v8.mq5</strong> below</div>
                     <div style={{ marginBottom: 5 }}>2. In MT5: <strong>Tools → Options → Expert Advisors → Allow WebRequest</strong> → add the Supabase URL below</div>
                     <div style={{ marginBottom: 5 }}>3. Compile the EA in MetaEditor and attach to any chart</div>
@@ -322,7 +322,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                     ↓ Download SybexForexAI_EA_v8.mq5
                   </a>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
-                    v8 — in-EA profit protection: break-even (+0.5R), partial lock (+1R), ATR trail, decay exit — runs every 2s without server round-trip
+                    v8.1 — profit protection tuning: BE trend filter, per-symbol ATR normalisation, decay threshold 40%, min hold time, spread/rollover guard, dynamic state array
                   </div>
                 </div>
               )
