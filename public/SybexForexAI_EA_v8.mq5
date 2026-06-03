@@ -1,0 +1,732 @@
+//+------------------------------------------------------------------+
+//| SybexForexAI Balance Sync EA v8                                  |
+//| Posts DIRECTLY to Supabase RPC -- bypasses Vercel entirely.      |
+//| v5 fix: ORDER_FILLING_RETURN (IOC caused all orders to reject).  |
+//| v6 fix: split fast order-poll (2s) from heavy data sync (10s)    |
+//|         so scalp orders are picked up in ~2s instead of ~30s.    |
+//| v7 add: modify_sl command (post-entry trade management layer)    |
+//|         close command now uses ticket when available (precise)   |
+//|         fixed: close/modify_sl no longer skipped by lots>0 guard |
+//| v7.1 fix: SymbolSuffix input for brokers using .s/.m/.r suffixes |
+//|           retcode 10013 (invalid request) caused by suffix mis-  |
+//|           match when app sends "XAUUSD" but broker has "XAUUSD.s"|
+//| v8 add: in-EA Profit Protection Layer runs on every timer tick   |
+//|         break-even (+0.5R), partial lock (+1R), ATR trail,       |
+//|         profit-decay exit (< 50% of peak) — no server round-trip |
+//+------------------------------------------------------------------+
+#property strict
+#property description "SybexForexAI v8 -- in-EA profit protection"
+
+//--- Inputs -----------------------------------------------------------
+input string WebhookToken        = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
+input string SymbolSuffix        = "";   // broker symbol suffix, e.g. ".s" for Exness
+input int    OrderPollSeconds     = 2;   // how often to check for new pending orders
+input int    DataSyncSeconds      = 10;  // how often to push full market data (candles, balance, positions)
+input int    CandleBars           = 200;
+input int    CandleBarsHTF        = 100;
+input int    MagicNumber          = 20260001;
+input int    SlippagePoints       = 10;
+input ENUM_ORDER_TYPE_FILLING FillMode = ORDER_FILLING_RETURN;
+
+string SYMBOLS[] = {"EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","XAGUSD","USDCAD"};
+
+//--- Constants --------------------------------------------------------
+string SYNC_URL = "https://lfurosnmkwvqtlifggaa.supabase.co/rest/v1/rpc/mt5_webhook_sync";
+string ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxmdXJvc25ta3d2cXRsaWZnZ2FhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjQ4MzEsImV4cCI6MjA5MzMwMDgzMX0.ZWxFA-D57GqObQM_jSQ2PvNbqfxPOY4YBd__XZiFeWA";
+
+//--- Globals ----------------------------------------------------------
+int    g_totalSymbols  = 0;
+string g_completedJson = "[]";
+int    g_syncCounter   = 0;
+int    g_syncEveryN    = 5;
+
+//+------------------------------------------------------------------+
+//  Profit Protection Layer — state per open position
+//+------------------------------------------------------------------+
+#define MAX_PROT_POSITIONS 50
+
+struct ProtState {
+   ulong  ticket;
+   double origEntry;
+   double origSl;
+   double peakProfit;
+   bool   beApplied;
+   bool   partialLocked;
+};
+
+ProtState g_prot[MAX_PROT_POSITIONS];
+int       g_protCount = 0;
+
+//--- Find state index by ticket; returns -1 if not found -----------
+int FindProtState(ulong ticket)
+{
+   for(int i = 0; i < g_protCount; i++)
+      if(g_prot[i].ticket == ticket) return i;
+   return -1;
+}
+
+//--- Get-or-create state for a ticket ------------------------------
+int EnsureProtState(ulong ticket, double entry, double sl)
+{
+   int i = FindProtState(ticket);
+   if(i >= 0) return i;
+   if(g_protCount >= MAX_PROT_POSITIONS) return -1;
+   i = g_protCount++;
+   g_prot[i].ticket        = ticket;
+   g_prot[i].origEntry     = entry;
+   g_prot[i].origSl        = sl;
+   g_prot[i].peakProfit    = 0.0;
+   g_prot[i].beApplied     = false;
+   g_prot[i].partialLocked = false;
+   return i;
+}
+
+//--- Remove state entries for tickets that are no longer open ------
+void PurgeClosedStates()
+{
+   for(int i = g_protCount - 1; i >= 0; i--)
+   {
+      bool open = false;
+      for(int j = 0; j < PositionsTotal(); j++)
+      {
+         if(PositionGetTicket(j) == g_prot[i].ticket) { open = true; break; }
+      }
+      if(!open)
+      {
+         for(int k = i; k < g_protCount - 1; k++)
+            g_prot[k] = g_prot[k + 1];
+         g_protCount--;
+      }
+   }
+}
+
+//--- Strip broker suffix so raw symbol can be passed to ModifySL/Close
+string StripSuffix(string sym)
+{
+   int sufLen = StringLen(SymbolSuffix);
+   if(sufLen == 0) return sym;
+   int symLen = StringLen(sym);
+   if(symLen > sufLen && StringSubstr(sym, symLen - sufLen) == SymbolSuffix)
+      return StringSubstr(sym, 0, symLen - sufLen);
+   return sym;
+}
+
+//--- 14-period ATR from M5 candles ---------------------------------
+double CalcATR_M5(string symbol)
+{
+   MqlRates rates[];
+   int copied = CopyRates(symbol, PERIOD_M5, 0, 15, rates);
+   if(copied < 2) return 0.0;
+   double sum = 0.0;
+   int    cnt = 0;
+   for(int i = 1; i < copied; i++)
+   {
+      double tr = MathMax(rates[i].high - rates[i].low,
+                  MathMax(MathAbs(rates[i].high - rates[i-1].close),
+                          MathAbs(rates[i].low  - rates[i-1].close)));
+      sum += tr;
+      cnt++;
+   }
+   return cnt > 0 ? sum / cnt : 0.0;
+}
+
+//+------------------------------------------------------------------+
+//  RunProfitProtection — called every OrderPollSeconds               |
+//  Execution order: BE → partial-lock → ATR trail → decay-exit      |
+//+------------------------------------------------------------------+
+void RunProfitProtection()
+{
+   PurgeClosedStates();
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+
+      // Only manage positions opened by this EA instance
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      string sym       = PositionGetString(POSITION_SYMBOL);   // e.g. "XAUUSD.s"
+      string rawSym    = StripSuffix(sym);                      // e.g. "XAUUSD"
+      bool   isBuy     = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSl = PositionGetDouble(POSITION_SL);
+      double profit    = PositionGetDouble(POSITION_PROFIT);
+      int    dp        = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+
+      // Current mid price for trailing reference
+      double midPx = isBuy ? SymbolInfoDouble(sym, SYMBOL_BID)
+                           : SymbolInfoDouble(sym, SYMBOL_ASK);
+      if(midPx <= 0) continue;
+
+      // Get-or-create state
+      int si = EnsureProtState(ticket, openPrice, currentSl);
+      if(si < 0) continue;
+
+      // Update peak profit (only track positive peaks)
+      if(profit > g_prot[si].peakProfit)
+         g_prot[si].peakProfit = profit;
+
+      double origEntry = g_prot[si].origEntry;
+      double origSl    = g_prot[si].origSl;
+      double riskDist  = MathAbs(origEntry - origSl);
+      if(riskDist < 0.000001) continue;   // degenerate position, skip
+
+      // Price-based R-multiple (works for all symbols without pip-value tables)
+      double pnlDist = isBuy ? midPx - origEntry : origEntry - midPx;
+      double rMult   = pnlDist / riskDist;
+
+      double newSl   = 0.0;    // best SL candidate from rules 1-3; 0 = no change
+      bool   doClose = false;
+
+      // ── 1. Break-even at +0.5R ─────────────────────────────────────
+      if(!g_prot[si].beApplied && rMult >= 0.5)
+      {
+         bool improves = isBuy ? origEntry > currentSl : origEntry < currentSl;
+         if(improves)
+         {
+            newSl = origEntry;
+            g_prot[si].beApplied = true;
+            Print("[pp] ", rawSym, "#", ticket,
+                  " BE: R=", DoubleToString(rMult, 2),
+                  " → SL to entry ", DoubleToString(origEntry, dp));
+         }
+      }
+
+      // ── 2. Partial profit lock at +1R → SL moves to +0.5R level ───
+      if(!g_prot[si].partialLocked && rMult >= 1.0)
+      {
+         g_prot[si].partialLocked = true;
+         double lockSl = isBuy ? origEntry + 0.5 * riskDist
+                               : origEntry - 0.5 * riskDist;
+         double baseline = (newSl > 0.0) ? newSl : currentSl;
+         bool   improves = isBuy ? lockSl > baseline : lockSl < baseline;
+         if(improves)
+         {
+            newSl = lockSl;
+            Print("[pp] ", rawSym, "#", ticket,
+                  " partial-lock: R=", DoubleToString(rMult, 2),
+                  " → SL=", DoubleToString(lockSl, dp));
+         }
+      }
+
+      // ── 3. ATR trailing stop (only advances, only in profit) ───────
+      double atr = CalcATR_M5(sym);
+      if(atr > 0.0)
+      {
+         double trailSl  = isBuy ? midPx - atr * 0.5 : midPx + atr * 0.5;
+         bool   inProfit = isBuy ? trailSl > origEntry  : trailSl < origEntry;
+         double baseline = (newSl > 0.0) ? newSl : currentSl;
+         bool   improves = isBuy ? trailSl > baseline   : trailSl < baseline;
+         if(inProfit && improves)
+         {
+            newSl = trailSl;
+            Print("[pp] ", rawSym, "#", ticket,
+                  " trail: px=", DoubleToString(midPx, dp),
+                  " ATR=", DoubleToString(atr, dp),
+                  " → SL=", DoubleToString(trailSl, dp));
+         }
+      }
+
+      // Apply any SL improvement from rules 1-3
+      if(newSl > 0.0)
+      {
+         int rc = 0;
+         if(!ModifySL(ticket, rawSym, NormalizeDouble(newSl, dp), rc))
+            Print("[pp] ModifySL FAILED ", rawSym, " ticket=", ticket, " retcode=", rc);
+      }
+
+      // ── 4. Profit decay exit: close if profit < 50% of peak ────────
+      if(g_prot[si].peakProfit > 0.0 && profit < g_prot[si].peakProfit * 0.5)
+      {
+         Print("[pp] ", rawSym, "#", ticket,
+               " DECAY-EXIT: profit=$", DoubleToString(profit, 2),
+               " < 50% of peak=$", DoubleToString(g_prot[si].peakProfit, 2));
+         doClose = true;
+      }
+
+      if(doClose)
+      {
+         int rc = 0;
+         if(!CloseByTicket(ticket, rawSym, rc))
+            Print("[pp] CloseByTicket FAILED ", rawSym, " ticket=", ticket, " retcode=", rc);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_totalSymbols = ArraySize(SYMBOLS);
+   g_syncEveryN   = MathMax(1, DataSyncSeconds / OrderPollSeconds);
+   g_protCount    = 0;
+   EventSetTimer(OrderPollSeconds);
+   Print("SybexForexAI v8 started | FillMode=", EnumToString(FillMode),
+         " | OrderPoll=", OrderPollSeconds, "s | DataSync=", DataSyncSeconds, "s",
+         " | Suffix='", SymbolSuffix, "'",
+         " | Token prefix: ", StringSubstr(WebhookToken,0,8));
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) { EventKillTimer(); }
+
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   // ── Profit Protection (every OrderPollSeconds, no server round-trip)
+   RunProfitProtection();
+
+   // ── Fast path: always check for pending orders ──────────────────
+   string resp = FetchPendingOrders();
+   if(StringLen(resp) > 10)
+   {
+      int cnt = 0, sp = 0;
+      while(StringFind(resp, "\"id\":", sp) >= 0) { sp = StringFind(resp,"\"id\":",sp)+1; cnt++; }
+      if(cnt > 0)
+      {
+         Print("SybexForexAI v8: ", cnt, " pending command(s) -- executing...");
+         g_completedJson = ExecuteOrders(resp);
+         Print("SybexForexAI v8: completedOrders=", g_completedJson);
+      }
+   }
+
+   // ── Slow path: full data push every DataSyncSeconds ─────────────
+   bool ordersJustFilled = (g_completedJson != "[]");
+   g_syncCounter++;
+   if(g_syncCounter >= g_syncEveryN || ordersJustFilled)
+   {
+      g_syncCounter   = 0;
+      SendDataToApp();
+      g_completedJson = "[]";
+   }
+}
+
+//+------------------------------------------------------------------+
+string BuildHeaders()
+{
+   return "Content-Type: application/json\r\n"
+        + "apikey: " + ANON_KEY + "\r\n"
+        + "Authorization: Bearer " + ANON_KEY + "\r\n";
+}
+
+//+------------------------------------------------------------------+
+string FetchPendingOrders()
+{
+   char post[], result[];
+   string respHdr = "";
+   string body = "{\"p_token\":\"" + WebhookToken + "\",\"p_payload\":null}";
+   StringToCharArray(body, post, 0, StringLen(body));
+   ArrayResize(post, StringLen(body));
+
+   ResetLastError();
+   int rc = WebRequest("POST", SYNC_URL, BuildHeaders(), 4000, post, result, respHdr);
+   if(rc == -1)
+   {
+      Print("SybexForexAI v8: pull FAILED err=", GetLastError(),
+            " -- add URL to Tools>Options>Expert Advisors>Allowed URLs");
+      return "";
+   }
+   if(rc != 200)
+   {
+      Print("SybexForexAI v8: pull HTTP ", rc);
+      return "";
+   }
+   return CharArrayToString(result);
+}
+
+//+------------------------------------------------------------------+
+void SendDataToApp()
+{
+   string body = "{"
+      + "\"p_token\":\"" + WebhookToken + "\","
+      + "\"p_payload\":{"
+      + "\"balance\":"         + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2)
+      + ",\"equity\":"         + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2)
+      + ",\"currency\":\""     + AccountInfoString(ACCOUNT_CURRENCY) + "\""
+      + ",\"login\":\""        + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\""
+      + ",\"server\":\""       + AccountInfoString(ACCOUNT_SERVER) + "\""
+      + ",\"prices\":"         + BuildPricesJSON()
+      + ",\"candles\":"        + BuildCandlesJSON()
+      + ",\"openPositions\":"  + BuildOpenPositionsJSON()
+      + ",\"completedOrders\":" + g_completedJson
+      + "}}";
+
+   char post[], result[];
+   string respHdr = "";
+   StringToCharArray(body, post, 0, StringLen(body));
+   ArrayResize(post, StringLen(body));
+
+   ResetLastError();
+   int rc = WebRequest("POST", SYNC_URL, BuildHeaders(), 15000, post, result, respHdr);
+   if(rc == -1)
+      Print("SybexForexAI v8: push FAILED err=", GetLastError());
+   else if(rc == 200)
+      Print("SybexForexAI v8: push OK | Bal=",
+            DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2),
+            " Pos=", PositionsTotal());
+   else
+      Print("SybexForexAI v8: push HTTP ", rc, " -- ", StringSubstr(CharArrayToString(result),0,200));
+}
+
+//+------------------------------------------------------------------+
+string JsonStr(string j, string key)
+{
+   string s = "\"" + key + "\":";
+   int p = StringFind(j, s);
+   if(p < 0) return "";
+   p += StringLen(s);
+   while(StringGetCharacter(j,p) == 32) p++;
+   if(StringGetCharacter(j,p) != '"') return "";
+   p++;
+   int e = StringFind(j, "\"", p);
+   return e < 0 ? "" : StringSubstr(j, p, e-p);
+}
+
+double JsonNum(string j, string key)
+{
+   string s = "\"" + key + "\":";
+   int p = StringFind(j, s);
+   if(p < 0) return 0;
+   p += StringLen(s);
+   while(StringGetCharacter(j,p) == 32) p++;
+   return StringToDouble(StringSubstr(j, p, 30));
+}
+
+//+------------------------------------------------------------------+
+string BuildPricesJSON()
+{
+   string out = "{";
+   bool first = true;
+   for(int i = 0; i < g_totalSymbols; i++)
+   {
+      double bid = SymbolInfoDouble(SYMBOLS[i], SYMBOL_BID);
+      double ask = SymbolInfoDouble(SYMBOLS[i], SYMBOL_ASK);
+      if(bid <= 0 || ask <= 0) continue;
+      int dp = (int)SymbolInfoInteger(SYMBOLS[i], SYMBOL_DIGITS);
+      if(!first) out += ",";
+      out += "\"" + SYMBOLS[i] + "\":{\"bid\":" + DoubleToString(bid,dp)
+           + ",\"ask\":" + DoubleToString(ask,dp) + "}";
+      first = false;
+   }
+   return out + "}";
+}
+
+//+------------------------------------------------------------------+
+string BuildCandleArray(string symbol, ENUM_TIMEFRAMES period, int bars)
+{
+   MqlRates rates[];
+   int copied = CopyRates(symbol, period, 0, bars, rates);
+   if(copied <= 0) return "[]";
+   int dp = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string out = "[";
+   for(int i = 0; i < copied; i++)
+   {
+      if(i > 0) out += ",";
+      out += "{\"t\":" + IntegerToString((long)rates[i].time)
+           + ",\"o\":" + DoubleToString(rates[i].open,  dp)
+           + ",\"h\":" + DoubleToString(rates[i].high,  dp)
+           + ",\"l\":" + DoubleToString(rates[i].low,   dp)
+           + ",\"c\":" + DoubleToString(rates[i].close, dp)
+           + ",\"v\":" + IntegerToString((long)rates[i].tick_volume) + "}";
+   }
+   return out + "]";
+}
+
+string BuildCandlesForTF(ENUM_TIMEFRAMES period, int bars)
+{
+   string out = "{";
+   bool first = true;
+   for(int i = 0; i < g_totalSymbols; i++)
+   {
+      string arr = BuildCandleArray(SYMBOLS[i], period, bars);
+      if(arr == "[]") continue;
+      if(!first) out += ",";
+      out += "\"" + SYMBOLS[i] + "\":" + arr;
+      first = false;
+   }
+   return out + "}";
+}
+
+string BuildCandlesJSON()
+{
+   return "{"
+      + "\"M5\":"   + BuildCandlesForTF(PERIOD_M5,  CandleBars)
+      + ",\"M15\":" + BuildCandlesForTF(PERIOD_M15, CandleBarsHTF)
+      + ",\"H1\":"  + BuildCandlesForTF(PERIOD_H1,  CandleBarsHTF)
+      + ",\"H4\":"  + BuildCandlesForTF(PERIOD_H4,  50)
+      + "}";
+}
+
+string BuildOpenPositionsJSON()
+{
+   string out = "[";
+   bool first = true;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!first) out += ",";
+      out += "{"
+           + "\"ticket\":"     + IntegerToString((long)ticket)
+           + ",\"symbol\":\""  + PositionGetString(POSITION_SYMBOL) + "\""
+           + ",\"type\":\""    + (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL") + "\""
+           + ",\"lots\":"      + DoubleToString(PositionGetDouble(POSITION_VOLUME),2)
+           + ",\"openPrice\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN),5)
+           + ",\"sl\":"        + DoubleToString(PositionGetDouble(POSITION_SL),5)
+           + ",\"tp\":"        + DoubleToString(PositionGetDouble(POSITION_TP),5)
+           + ",\"profit\":"    + DoubleToString(PositionGetDouble(POSITION_PROFIT),2)
+           + "}";
+      first = false;
+   }
+   return out + "]";
+}
+
+//+------------------------------------------------------------------+
+// PlaceOrder: tries FillMode first, then FOK, then IOC as fallbacks.
+//+------------------------------------------------------------------+
+bool PlaceOrder(string symbol, string direction, double lots,
+                double slPrice, double tpPrice,
+                double &filledPrice, int &retcode)
+{
+   string fullSym = symbol + SymbolSuffix;
+   ENUM_ORDER_TYPE_FILLING modes[3];
+   modes[0] = FillMode;
+   modes[1] = ORDER_FILLING_FOK;
+   modes[2] = ORDER_FILLING_IOC;
+
+   for(int f = 0; f < 3; f++)
+   {
+      MqlTradeRequest req;
+      MqlTradeResult  res;
+      ZeroMemory(req);
+      ZeroMemory(res);
+
+      req.action       = TRADE_ACTION_DEAL;
+      req.symbol       = fullSym;
+      req.volume       = lots;
+      req.type         = (direction == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      req.price        = (direction == "BUY")
+                         ? SymbolInfoDouble(fullSym, SYMBOL_ASK)
+                         : SymbolInfoDouble(fullSym, SYMBOL_BID);
+      req.sl           = slPrice;
+      req.tp           = tpPrice;
+      req.deviation    = SlippagePoints;
+      req.magic        = MagicNumber;
+      req.type_filling = modes[f];
+
+      bool ok  = OrderSend(req, res);
+      retcode  = (int)res.retcode;
+
+      if(ok && res.retcode == 10009)
+      {
+         filledPrice = res.price;
+         if(f > 0) Print("SybexForexAI v8: used fallback fill mode ", EnumToString(modes[f]));
+         return true;
+      }
+
+      if(res.retcode != 10015 && res.retcode != 10030)
+      {
+         Print("SybexForexAI v8: order FAILED ", fullSym, " ", direction,
+               " retcode=", res.retcode, " fill=", EnumToString(modes[f]));
+         return false;
+      }
+      Print("SybexForexAI v8: fill mode ", EnumToString(modes[f]),
+            " rejected -- trying next mode...");
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+// CloseByTicket: close a specific position by ticket number.
+//+------------------------------------------------------------------+
+bool CloseByTicket(ulong ticket, string symbol, int &retcode)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+
+   string fullSym = symbol + SymbolSuffix;
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   req.action       = TRADE_ACTION_DEAL;
+   req.symbol       = fullSym;
+   req.volume       = PositionGetDouble(POSITION_VOLUME);
+   req.type         = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   req.price        = (posType == POSITION_TYPE_BUY)
+                      ? SymbolInfoDouble(fullSym, SYMBOL_BID)
+                      : SymbolInfoDouble(fullSym, SYMBOL_ASK);
+   req.deviation    = SlippagePoints;
+   req.magic        = MagicNumber;
+   req.position     = ticket;
+   req.type_filling = FillMode;
+
+   bool ok = OrderSend(req, res);
+   retcode = (int)res.retcode;
+   return ok && res.retcode == 10009;
+}
+
+//+------------------------------------------------------------------+
+// ModifySL: move stop loss for a specific position ticket.
+//           Preserves the existing take-profit unchanged.
+//+------------------------------------------------------------------+
+bool ModifySL(ulong ticket, string symbol, double newSl, int &retcode)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action   = TRADE_ACTION_SLTP;
+   req.symbol   = symbol + SymbolSuffix;
+   req.sl       = newSl;
+   req.tp       = PositionGetDouble(POSITION_TP);   // preserve existing TP
+   req.position = ticket;
+
+   bool ok = OrderSend(req, res);
+   retcode = (int)res.retcode;
+   return ok && res.retcode == 10009;
+}
+
+//+------------------------------------------------------------------+
+string ExecuteOrders(string response)
+{
+   string completed = "[";
+   bool   first     = true;
+
+   int pos = StringFind(response, "\"pendingOrders\"");
+   if(pos < 0) return "[]";
+
+   int arrStart = StringFind(response, "[", pos);
+   int arrEnd   = StringFind(response, "]", arrStart);
+   if(arrStart < 0 || arrEnd < 0) return "[]";
+
+   string arr       = StringSubstr(response, arrStart, arrEnd - arrStart + 1);
+   int    searchPos = 0;
+
+   while(true)
+   {
+      int objStart = StringFind(arr, "{", searchPos);
+      if(objStart < 0) break;
+      int objEnd = StringFind(arr, "}", objStart);
+      if(objEnd < 0) break;
+
+      string obj     = StringSubstr(arr, objStart, objEnd - objStart + 1);
+      string orderId = JsonStr(obj, "id");
+      string symbol  = JsonStr(obj, "symbol");
+
+      bool isClose    = (StringFind(obj, "\"type\":\"close\"")     >= 0);
+      bool isModifySl = (StringFind(obj, "\"type\":\"modify_sl\"") >= 0);
+      double lots     = JsonNum(obj, "lots");
+
+      if(StringLen(orderId) == 0 || StringLen(symbol) == 0)
+      {
+         searchPos = objEnd + 1;
+         continue;
+      }
+
+      if(!first) completed += ",";
+
+      // ── modify_sl ───────────────────────────────────────────────────
+      if(isModifySl)
+      {
+         ulong  ticket = (ulong)JsonNum(obj, "ticket");
+         double newSl  = JsonNum(obj, "newSl");
+         int    rc     = 0;
+         bool   ok     = false;
+
+         if(ticket > 0 && newSl > 0)
+            ok = ModifySL(ticket, symbol, newSl, rc);
+
+         if(ok)
+         {
+            completed += "{\"id\":\"" + orderId + "\",\"success\":true,\"type\":\"modify_sl\""
+                       + ",\"ticket\":" + IntegerToString((long)ticket)
+                       + ",\"newSl\":"  + DoubleToString(newSl, 5) + "}";
+            Print("SybexForexAI v8: SL modified ", symbol,
+                  " ticket=", ticket, " newSl=", newSl);
+         }
+         else
+         {
+            completed += "{\"id\":\"" + orderId + "\",\"success\":false,\"type\":\"modify_sl\""
+                       + ",\"error\":\"retcode " + IntegerToString(rc) + "\"}";
+            Print("SybexForexAI v8: modify_sl FAILED ", symbol,
+                  " ticket=", ticket, " retcode=", rc);
+         }
+      }
+
+      // ── close ───────────────────────────────────────────────────────
+      else if(isClose)
+      {
+         ulong cmdTicket = (ulong)JsonNum(obj, "ticket");
+         int   rc        = 0;
+         bool  ok        = false;
+
+         if(cmdTicket > 0)
+         {
+            ok = CloseByTicket(cmdTicket, symbol, rc);
+            if(!ok)
+               Print("SybexForexAI v8: ticket close failed ticket=", cmdTicket,
+                     " retcode=", rc, " -- falling back to symbol close");
+         }
+
+         if(!ok)
+         {
+            string fullSym = symbol + SymbolSuffix;
+            for(int i = PositionsTotal()-1; i >= 0; i--)
+            {
+               ulong t = PositionGetTicket(i);
+               if(t == 0) continue;
+               if(PositionGetString(POSITION_SYMBOL) != fullSym) continue;
+               int   rc2 = 0;
+               if(!CloseByTicket(t, symbol, rc2))
+                  Print("SybexForexAI v8: symbol close failed ticket=", t, " retcode=", rc2);
+               else
+                  ok = true;
+            }
+         }
+
+         completed += "{\"id\":\"" + orderId + "\",\"success\":" + (ok ? "true" : "false")
+                    + ",\"type\":\"close\"}";
+         Print("SybexForexAI v8: close ", (ok ? "OK" : "FAILED"), " ", symbol);
+      }
+
+      // ── new order ───────────────────────────────────────────────────
+      else if(lots > 0)
+      {
+         string direction = JsonStr(obj, "direction");
+         double slPrice   = JsonNum(obj, "slPrice");
+         double tpPrice   = JsonNum(obj, "tpPrice");
+         double filledPrice = 0;
+         int    retcode     = 0;
+         bool   ok = PlaceOrder(symbol, direction, lots, slPrice, tpPrice, filledPrice, retcode);
+
+         if(ok)
+         {
+            completed += "{\"id\":\"" + orderId + "\",\"success\":true"
+                       + ",\"filledPrice\":" + DoubleToString(filledPrice,5) + "}";
+            Print("SybexForexAI v8: FILLED ", symbol, " ", direction,
+                  " lots=", lots, " @ ", filledPrice);
+         }
+         else
+         {
+            completed += "{\"id\":\"" + orderId + "\",\"success\":false"
+                       + ",\"error\":\"retcode " + IntegerToString(retcode) + "\"}";
+            Print("SybexForexAI v8: REJECTED ", symbol, " retcode=", retcode);
+         }
+      }
+      else
+      {
+         completed += "{\"id\":\"" + orderId + "\",\"success\":false"
+                    + ",\"error\":\"unknown command type\"}";
+         Print("SybexForexAI v8: unknown command in ", StringSubstr(obj,0,80));
+      }
+
+      first     = false;
+      searchPos = objEnd + 1;
+   }
+   return completed + "]";
+}
