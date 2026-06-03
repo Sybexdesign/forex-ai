@@ -7,12 +7,16 @@
 //| v7 add: modify_sl command (post-entry trade management layer)    |
 //|         close command now uses ticket when available (precise)   |
 //|         fixed: close/modify_sl no longer skipped by lots>0 guard |
+//| v7.1 fix: SymbolSuffix input for brokers using .s/.m/.r suffixes |
+//|           retcode 10013 (invalid request) caused by suffix mis-  |
+//|           match when app sends "XAUUSD" but broker has "XAUUSD.s"|
 //+------------------------------------------------------------------+
 #property strict
-#property description "SybexForexAI v7 -- trade management + fast order polling"
+#property description "SybexForexAI v7.1 -- symbol suffix fix + trade management"
 
 //--- Inputs -----------------------------------------------------------
 input string WebhookToken        = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
+input string SymbolSuffix        = "";   // broker symbol suffix, e.g. ".s" for Exness
 input int    OrderPollSeconds     = 2;   // how often to check for new pending orders
 input int    DataSyncSeconds      = 10;  // how often to push full market data (candles, balance, positions)
 input int    CandleBars           = 200;
@@ -39,8 +43,9 @@ int OnInit()
    g_totalSymbols = ArraySize(SYMBOLS);
    g_syncEveryN   = MathMax(1, DataSyncSeconds / OrderPollSeconds);
    EventSetTimer(OrderPollSeconds);
-   Print("SybexForexAI v7 started | FillMode=", EnumToString(FillMode),
+   Print("SybexForexAI v7.1 started | FillMode=", EnumToString(FillMode),
          " | OrderPoll=", OrderPollSeconds, "s | DataSync=", DataSyncSeconds, "s",
+         " | Suffix='", SymbolSuffix, "'",
          " | Token prefix: ", StringSubstr(WebhookToken,0,8));
    return INIT_SUCCEEDED;
 }
@@ -262,6 +267,7 @@ bool PlaceOrder(string symbol, string direction, double lots,
                 double slPrice, double tpPrice,
                 double &filledPrice, int &retcode)
 {
+   string fullSym = symbol + SymbolSuffix;
    ENUM_ORDER_TYPE_FILLING modes[3];
    modes[0] = FillMode;
    modes[1] = ORDER_FILLING_FOK;
@@ -275,12 +281,12 @@ bool PlaceOrder(string symbol, string direction, double lots,
       ZeroMemory(res);
 
       req.action       = TRADE_ACTION_DEAL;
-      req.symbol       = symbol;
+      req.symbol       = fullSym;
       req.volume       = lots;
       req.type         = (direction == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
       req.price        = (direction == "BUY")
-                         ? SymbolInfoDouble(symbol, SYMBOL_ASK)
-                         : SymbolInfoDouble(symbol, SYMBOL_BID);
+                         ? SymbolInfoDouble(fullSym, SYMBOL_ASK)
+                         : SymbolInfoDouble(fullSym, SYMBOL_BID);
       req.sl           = slPrice;
       req.tp           = tpPrice;
       req.deviation    = SlippagePoints;
@@ -293,17 +299,17 @@ bool PlaceOrder(string symbol, string direction, double lots,
       if(ok && res.retcode == 10009)
       {
          filledPrice = res.price;
-         if(f > 0) Print("SybexForexAI v7: used fallback fill mode ", EnumToString(modes[f]));
+         if(f > 0) Print("SybexForexAI v7.1: used fallback fill mode ", EnumToString(modes[f]));
          return true;
       }
 
       if(res.retcode != 10015 && res.retcode != 10030)
       {
-         Print("SybexForexAI v7: order FAILED ", symbol, " ", direction,
+         Print("SybexForexAI v7.1: order FAILED ", fullSym, " ", direction,
                " retcode=", res.retcode, " fill=", EnumToString(modes[f]));
          return false;
       }
-      Print("SybexForexAI v7: fill mode ", EnumToString(modes[f]),
+      Print("SybexForexAI v7.1: fill mode ", EnumToString(modes[f]),
             " rejected -- trying next mode...");
    }
    return false;
@@ -316,6 +322,7 @@ bool CloseByTicket(ulong ticket, string symbol, int &retcode)
 {
    if(!PositionSelectByTicket(ticket)) return false;
 
+   string fullSym = symbol + SymbolSuffix;
    MqlTradeRequest req;
    MqlTradeResult  res;
    ZeroMemory(req);
@@ -323,12 +330,12 @@ bool CloseByTicket(ulong ticket, string symbol, int &retcode)
 
    ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
    req.action       = TRADE_ACTION_DEAL;
-   req.symbol       = symbol;
+   req.symbol       = fullSym;
    req.volume       = PositionGetDouble(POSITION_VOLUME);
    req.type         = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
    req.price        = (posType == POSITION_TYPE_BUY)
-                      ? SymbolInfoDouble(symbol, SYMBOL_BID)
-                      : SymbolInfoDouble(symbol, SYMBOL_ASK);
+                      ? SymbolInfoDouble(fullSym, SYMBOL_BID)
+                      : SymbolInfoDouble(fullSym, SYMBOL_ASK);
    req.deviation    = SlippagePoints;
    req.magic        = MagicNumber;
    req.position     = ticket;
@@ -353,7 +360,7 @@ bool ModifySL(ulong ticket, string symbol, double newSl, int &retcode)
    ZeroMemory(res);
 
    req.action   = TRADE_ACTION_SLTP;
-   req.symbol   = symbol;
+   req.symbol   = symbol + SymbolSuffix;
    req.sl       = newSl;
    req.tp       = PositionGetDouble(POSITION_TP);   // preserve existing TP
    req.position = ticket;
@@ -451,11 +458,12 @@ string ExecuteOrders(string response)
          if(!ok)
          {
             // Symbol-based close: close all positions for this symbol
+            string fullSym = symbol + SymbolSuffix;
             for(int i = PositionsTotal()-1; i >= 0; i--)
             {
                ulong t = PositionGetTicket(i);
                if(t == 0) continue;
-               if(PositionGetString(POSITION_SYMBOL) != symbol) continue;
+               if(PositionGetString(POSITION_SYMBOL) != fullSym) continue;
                int   rc2 = 0;
                if(!CloseByTicket(t, symbol, rc2))
                   Print("SybexForexAI v7: symbol close failed ticket=", t, " retcode=", rc2);

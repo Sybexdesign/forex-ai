@@ -429,7 +429,10 @@ Return JSON only:
           risk_note:          result.risk_note,
           acted_on:           false,
           outcome:            'PENDING',
-          indicator_snapshot: body,
+          indicator_snapshot: {
+            ...body,
+            _computed: { entry: result.entry, sl: result.sl, tp: result.tp },
+          },
         })
       } catch { /* non-critical */ }
     }

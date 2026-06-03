@@ -199,6 +199,17 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // ── Rate-limited signal labelling (every 5 min while EA is active) ───
+    const lastLabelAt = row.config?.lastLabelAt
+      ? new Date(row.config.lastLabelAt).getTime() : 0
+    const labelDue = Date.now() - lastLabelAt > 5 * 60_000
+    if (labelDue) {
+      const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://forex.sybexdesigns.co.uk'
+      fetch(`${appUrl}/api/scalper/label`, {
+        headers: { 'x-vercel-cron': '1' },
+      }).catch(() => {})
+    }
+
     // ── Update broker config with latest balance ──────────────────────────
     const updatedConfig = {
       ...row.config,
@@ -213,6 +224,7 @@ export async function POST(req: NextRequest) {
       candleCache,
       tradeState,
       openPositions: activePositions,
+      lastLabelAt: labelDue ? now : (row.config?.lastLabelAt ?? now),
     }
 
     const priceSymbols  = Object.keys(latestPrices)

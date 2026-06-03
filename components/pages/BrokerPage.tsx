@@ -322,7 +322,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                     ↓ Download SybexForexAI_EA_v7.mq5
                   </a>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
-                    v7 — auto break-even, trailing stop, profit-decay exit + precise ticket-based close
+                    v7.1 — fix retcode 10013: add SymbolSuffix input (set to <strong>.s</strong> for Exness)
                   </div>
                 </div>
               )
