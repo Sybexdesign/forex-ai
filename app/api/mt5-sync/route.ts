@@ -4,6 +4,7 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
+import { manageTrades } from '@/lib/trade-manager'
 
 export const dynamic = 'force-dynamic'
 
@@ -166,6 +167,38 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // ── Post-entry trade management ───────────────────────────────────────
+    // Runs on every EA sync — applies break-even, trailing stop, time exit,
+    // and profit-decay exit rules to all open positions.
+    const activePositions = Array.isArray(openPositions)
+      ? openPositions
+      : (row.config?.openPositions || [])
+    let tradeState: Record<string, any> = row.config?.tradeState || {}
+
+    if (activePositions.length > 0) {
+      const { tradeState: nextState, commands, log } = manageTrades(
+        activePositions,
+        latestPrices,
+        candleCache,
+        tradeState,
+      )
+      tradeState = nextState
+      for (const line of log) console.log(line)
+
+      for (const cmd of commands) {
+        // Dedup: don't queue the same action for the same ticket twice
+        const duplicate = pendingOrders.some(
+          (o: any) => o.type === cmd.type && o.symbol === cmd.symbol &&
+                      (!cmd.ticket || o.ticket === cmd.ticket)
+        )
+        if (!duplicate) pendingOrders.push(cmd)
+      }
+
+      if (commands.length > 0) {
+        console.log(`[mt5-sync] trade-manager issued ${commands.length} command(s): ${commands.map(c => `${c.type}:${c.symbol}`).join(' ')}`)
+      }
+    }
+
     // ── Update broker config with latest balance ──────────────────────────
     const updatedConfig = {
       ...row.config,
@@ -178,7 +211,8 @@ export async function POST(req: NextRequest) {
       pendingOrders,
       latestPrices,
       candleCache,
-      openPositions: Array.isArray(openPositions) ? openPositions : (row.config?.openPositions || []),
+      tradeState,
+      openPositions: activePositions,
     }
 
     const priceSymbols  = Object.keys(latestPrices)
