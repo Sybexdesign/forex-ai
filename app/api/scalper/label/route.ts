@@ -24,18 +24,28 @@ const CANDLE_WINDOW = 3
 const MIN_AGE_MS    = 5 * 60_000
 // Max candle cache age before we consider it stale
 const CACHE_TTL_MS  = 90 * 60_000
+// M5 candle cache holds ~200 candles ≈ 16.7 hours; skip signals older than this
+// to avoid mis-labelling with candles from the wrong time window
+const MAX_SIGNAL_AGE_MS = 16 * 60 * 60_000
+
+// Mirror the max-SL caps from the signal route so legacy reconstruction stays consistent
+function maxSlDistance(pair: string): number {
+  if (pair.startsWith('XAU')) return 80 * 0.1    // 8.0 price units
+  if (pair.startsWith('XAG')) return 60 * 0.01   // 0.60
+  if (pair.includes('JPY'))   return 50 * 0.01
+  return                              40 * 0.0001
+}
 
 function reconstructSlTp(snap: any, direction: string, pair: string) {
   // Prefer pre-computed values stored by the signal route (new signals)
   if (snap?._computed?.sl && snap?._computed?.tp && snap?._computed?.entry) {
     return { entry: snap._computed.entry, sl: snap._computed.sl, tp: snap._computed.tp }
   }
-  // Reconstruct from raw snapshot (legacy signals)
+  // Reconstruct from raw snapshot (legacy / analyze-route signals)
   const price  = snap?.currentPrice || snap?.price || 0
   const scalper = snap?.scalper || {}
   const atr    = scalper.atr || snap?.atr || 0.0005
-  const pip    = getPipValue(pair)
-  const maxSl  = pair.startsWith('XA') ? 30 * pip : 15 * pip
+  const maxSl  = maxSlDistance(pair)
   const slDist = Math.min(atr * 1.5, maxSl)
   const tpDist = slDist * (4 / 3)
   const sl = direction === 'BUY' ? price - slDist : price + slDist
@@ -81,8 +91,11 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const sb     = getAdminClient()
-    const cutoff = new Date(Date.now() - MIN_AGE_MS).toISOString()
+    const sb        = getAdminClient()
+    const cutoff    = new Date(Date.now() - MIN_AGE_MS).toISOString()
+    // Don't attempt to label signals older than the candle cache window —
+    // the candle data for that period is gone and we'd label against wrong candles.
+    const oldestOk  = new Date(Date.now() - MAX_SIGNAL_AGE_MS).toISOString()
 
     // ── Fetch PENDING signals older than MIN_AGE_MS ───────────────────────
     const { data: signals, error: sigErr } = await sb
@@ -90,6 +103,7 @@ export async function GET(req: NextRequest) {
       .select('id, user_id, pair, direction, indicator_snapshot, created_at')
       .eq('outcome', 'PENDING')
       .lt('created_at', cutoff)
+      .gt('created_at', oldestOk)
       .order('created_at', { ascending: true })
       .limit(500)
 
