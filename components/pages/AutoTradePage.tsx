@@ -494,10 +494,10 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
 
         // Priority 1: fixed USD target — closes immediately, overrides % mode
         if (fixedProfitUsd > 0 && currentProfit >= fixedProfitUsd) {
+          const snapshot = { pair: trade.pair, profit: currentProfit, target: fixedProfitUsd }
           closingForTargetRef.current.add(trade.id)
           handleClose(trade)
-            .then(() => onToast(`⚡ Auto-closed ${trade.pair} @ $${fixedProfitUsd.toFixed(2)} fixed target (+$${currentProfit.toFixed(2)})`, '#00e5b4'))
-            .catch(() => {})
+            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snapshot.pair} @ $${snapshot.target.toFixed(2)} fixed target (+$${snapshot.profit.toFixed(2)})`, '#00e5b4') })
             .finally(() => closingForTargetRef.current.delete(trade.id))
           continue
         }
@@ -508,10 +508,10 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         if (expectedProfit <= 0) continue
 
         if (currentProfit >= expectedProfit * profitTargetPct / 100) {
+          const snapshot = { pair: trade.pair, profit: currentProfit, pct: profitTargetPct }
           closingForTargetRef.current.add(trade.id)
           handleClose(trade)
-            .then(() => onToast(`⚡ Auto-closed ${trade.pair} @ ${profitTargetPct}% target (+$${currentProfit.toFixed(2)})`, '#00e5b4'))
-            .catch(() => {})
+            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snapshot.pair} @ ${snapshot.pct}% target (+$${snapshot.profit.toFixed(2)})`, '#00e5b4') })
             .finally(() => closingForTargetRef.current.delete(trade.id))
         }
       }
@@ -519,7 +519,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     return () => clearInterval(id)
   }, [autoTradeEnabled, profitTargetPct, fixedProfitUsd, loadOpenTrades]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function handleClose(trade: any) {
+  async function handleClose(trade: any): Promise<boolean> {
     setClosingId(trade.id)
     try {
       const res = await authFetch('/api/close-trade', {
@@ -533,15 +533,17 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       })
       const data = await res.json()
       if (data.success) {
-        onToast(`Closed ${trade.pair} — sent to broker`, '#00ff87')
         loadOpenTrades()
         onRefreshTrades?.()
         setTimeout(() => onRefreshAccount?.(), 1500)
+        return true
       } else {
         onToast('Close failed: ' + (data.error || 'Unknown'), '#ff3056')
+        return false
       }
     } catch (e: any) {
       onToast('Close error: ' + e.message, '#ff3056')
+      return false
     } finally {
       setClosingId(null)
     }
