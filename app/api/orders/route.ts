@@ -31,7 +31,7 @@ function dbToSettings(d: any): PropFirmSettings {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-    const { pair, direction, strategy, userId, signalId, newsInWindow, newsEvent, aiConfidence, checklistScore, currentPrice } = body
+    const { pair, direction, strategy, userId, signalId, newsInWindow, newsEvent, aiConfidence, checklistScore, currentPrice, maxConcurrentTrades } = body
 
     const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
     const broker = await getBroker(authToken)
@@ -47,6 +47,7 @@ export async function POST(req: NextRequest) {
     // Fetch real-time account data for risk checks
     let openTrades: any[] = []
     let balance = 10000
+    let equity  = 10000
     let todayPL = 0
     let allTimePL = 0
     let tradingDays = 0
@@ -55,8 +56,41 @@ export async function POST(req: NextRequest) {
     try {
       const [trades, account] = await Promise.all([broker.getOpenTrades(), broker.getAccountSummary()])
       openTrades = trades
-      balance = account.balance
+      balance    = account.balance
+      equity     = account.nav ?? account.balance
     } catch { /* use defaults if broker fails */ }
+
+    // ─── Account protection: equity ratio guard ───────────────────────────
+    // Block new trades if floating losses have consumed more than 25% of balance.
+    // Uses EA-synced equity (unrealised P/L inclusive). Skipped if balance is 0
+    // (EA not yet synced) to avoid false-blocking on first connection.
+    if (balance > 0 && equity < balance * 0.75) {
+      const reason = `Account equity ($${equity.toFixed(2)}) has fallen below 75% of balance ($${balance.toFixed(2)}) — auto-trading paused to protect the account`
+      await alertOrderBlocked({ pair, direction, reason })
+      return NextResponse.json({ success: false, blocked: true, reasons: [reason] }, { status: 422 })
+    }
+
+    // ─── Server-side max concurrent trades guard ─────────────────────────
+    // Authoritative check against the DB rather than trusting client state.
+    // Uses the maxConcurrentTrades value the UI sends (defaults to strategy.maxPositions).
+    const maxTrades = (typeof maxConcurrentTrades === 'number' && maxConcurrentTrades > 0)
+      ? maxConcurrentTrades
+      : (strategy?.maxPositions ?? 2)
+    if (userId) {
+      try {
+        const admin = getAdminClient()
+        const { count } = await admin
+          .from('trades')
+          .select('id', { count: 'exact', head: true })
+          .eq('user_id', userId)
+          .eq('result', 'OPEN')
+        if (typeof count === 'number' && count >= maxTrades) {
+          const reason = `Maximum ${maxTrades} concurrent trade(s) already open (${count} in DB) — wait for a position to close before placing more`
+          await alertOrderBlocked({ pair, direction, reason })
+          return NextResponse.json({ success: false, blocked: true, reasons: [reason] }, { status: 422 })
+        }
+      } catch { /* non-fatal — fall through to risk guards */ }
+    }
 
     if (userId) {
       try {

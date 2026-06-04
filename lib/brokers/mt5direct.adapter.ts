@@ -214,7 +214,7 @@ export class Mt5DirectBroker implements IBroker {
       slPrice,
       tpPrice,
       createdAt: new Date().toISOString(),
-      expiresAt: Math.floor(Date.now() / 1000) + 300,
+      expiresAt: Math.floor(Date.now() / 1000) + 600,  // 10-min window (EA polls every 2s)
     }
 
     try {
@@ -268,7 +268,7 @@ export class Mt5DirectBroker implements IBroker {
         type:      'close',
         symbol,
         createdAt: new Date().toISOString(),
-        expiresAt: Math.floor(Date.now() / 1000) + 300,
+        expiresAt: Math.floor(Date.now() / 1000) + 600,  // 10-min window (EA polls every 2s)
       }
 
       const pending = (row?.config?.pendingOrders || []) as typeof closeCommand[]

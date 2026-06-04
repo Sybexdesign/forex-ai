@@ -29,6 +29,7 @@ interface ScalpSignal {
   fallback: boolean
   simulated?: boolean
   blocked?: boolean
+  fetchError?: string
 }
 
 function Pager({ page, total, onPage }: { page: number; total: number; onPage: (p: number) => void }) {
@@ -92,6 +93,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   // Auto-trading
   const [autoTradeEnabled, setAutoTradeEnabled]   = useState(false)
   const [profitTargetPct, setProfitTargetPct]     = useState(75)
+  const [maxConcurrentTrades, setMaxConcurrentTrades] = useState(2)
   const [autoSections, setAutoSections]           = useState<Set<string>>(new Set(['scalp']))
   const [autoPairs, setAutoPairs]                 = useState<Set<string>>(new Set(METALS_ONLY))
   const autoScalpExecutedRef                      = useRef<Set<string>>(new Set())
@@ -131,7 +133,16 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       const tfRes = await fetch(`/api/scalper/tick?pair=${encodeURIComponent(pair)}&timeframe=5m`, {
         cache: 'no-store',
       })
-      if (!tfRes.ok) return
+      if (!tfRes.ok) {
+        setScalpSignals(prev => {
+          const existing = prev[pair]
+          // Keep last valid signal if one exists; just tag it with the error
+          if (existing && existing.direction !== 'HOLD') return { ...prev, [pair]: { ...existing, fetchError: `tick ${tfRes.status}` } }
+          return { ...prev, [pair]: { pair, direction: 'HOLD', confidence: 0, entry: 0, sl: 0, tp: 0,
+            reasons: [], expiresAt: 0, fetchedAt: Date.now(), fallback: false, fetchError: `tick ${tfRes.status}` } }
+        })
+        return
+      }
       const tick = await tfRes.json()
 
       if (tick.simulated) {
@@ -149,7 +160,15 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...tick, pair, strategy: 'Scalp', userId }),
       })
-      if (!sigRes.ok) return
+      if (!sigRes.ok) {
+        setScalpSignals(prev => {
+          const existing = prev[pair]
+          if (existing && existing.direction !== 'HOLD') return { ...prev, [pair]: { ...existing, fetchError: `signal ${sigRes.status}` } }
+          return { ...prev, [pair]: { pair, direction: 'HOLD', confidence: 0, entry: tick.price, sl: tick.price, tp: tick.price,
+            reasons: [], expiresAt: 0, fetchedAt: Date.now(), fallback: false, fetchError: `signal ${sigRes.status}` } }
+        })
+        return
+      }
       const sig = await sigRes.json()
 
       setScalpSignals(prev => ({
@@ -165,9 +184,18 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           expiresAt:  Date.now() + SCALP_EXPIRY_MS,
           fetchedAt:  Date.now(),
           fallback:   sig.fallback ?? false,
+          // fetchError cleared on success
         },
       }))
-    } catch { /* silent — display nothing if unavailable */ }
+    } catch (err: any) {
+      const msg = err?.message || 'Network error'
+      setScalpSignals(prev => {
+        const existing = prev[pair]
+        if (existing && existing.direction !== 'HOLD') return { ...prev, [pair]: { ...existing, fetchError: msg } }
+        return { ...prev, [pair]: { pair, direction: 'HOLD', confidence: 0, entry: 0, sl: 0, tp: 0,
+          reasons: [], expiresAt: 0, fetchedAt: Date.now(), fallback: false, fetchError: msg } }
+      })
+    }
   }, [userId])
 
   // Poll scalp signals for each metal pair
@@ -331,13 +359,14 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     const prefix    = isMirror ? 'mirror' : 'scalp'
     const body: Record<string, any> = {
       pair: sig.pair, direction,
-      strategy:       { ...strategy, slPips, tpPips },
-      currentPrice:   sig.entry,
+      strategy:             { ...strategy, slPips, tpPips },
+      currentPrice:         sig.entry,
       newsInWindow,
-      aiConfidence:   sig.confidence,
-      checklistScore: 5,
+      aiConfidence:         sig.confidence,
+      checklistScore:       5,
       userId,
-      signalId:       `${prefix}-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+      signalId:             `${prefix}-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+      maxConcurrentTrades,  // server enforces the same limit as the UI
     }
     if (isMirror) {
       body.mirrorSl = 2 * sig.entry - sig.sl
@@ -387,7 +416,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           if (!autoSections.has(section)) continue
           const key = `${section}-${pair}-${sig.fetchedAt}`
           if (autoScalpExecutedRef.current.has(key)) continue
-          if (localOpenCount >= 2) continue
+          if (localOpenCount >= maxConcurrentTrades) continue
           autoScalpExecutedRef.current.add(key)
           const isMirror = section === 'mirror'
           const dir = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
@@ -402,7 +431,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         }
       }
     })()
-  }, [scalpSignals, autoTradeEnabled]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [scalpSignals, autoTradeEnabled, maxConcurrentTrades]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Profit target monitoring: auto-close when currentProfit >= expectedProfit * target%
   useEffect(() => {
@@ -490,7 +519,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             </div>
             <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
               {autoTradeEnabled
-                ? `Active · ${openTrades.length} / 2 trades open · target ${profitTargetPct}%`
+                ? `Active · ${openTrades.length} / ${maxConcurrentTrades} trades open · target ${profitTargetPct}%`
                 : 'Configure below then enable'}
             </div>
           </div>
@@ -523,6 +552,23 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
                   background: profitTargetPct === pct ? 'rgba(0,229,180,0.18)' : 'rgba(255,255,255,0.05)',
                   color: profitTargetPct === pct ? '#00e5b4' : 'var(--text-muted)',
                 }}>{pct}%</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Max Concurrent Trades */}
+          <div>
+            <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
+              MAX CONCURRENT TRADES — maximum open positions at any time
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {[1, 2, 3, 5, 10].map(n => (
+                <button key={n} onClick={() => setMaxConcurrentTrades(n)} style={{
+                  padding: '5px 14px', borderRadius: 3, border: 'none', cursor: 'pointer',
+                  fontWeight: 700, fontSize: 12,
+                  background: maxConcurrentTrades === n ? 'rgba(0,229,180,0.18)' : 'rgba(255,255,255,0.05)',
+                  color: maxConcurrentTrades === n ? '#00e5b4' : 'var(--text-muted)',
+                }}>{n}</button>
               ))}
             </div>
           </div>
@@ -581,14 +627,14 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             <div style={{
               display: 'flex', alignItems: 'center', gap: 8,
               padding: '7px 10px', borderRadius: 3,
-              background: openTrades.length >= 2 ? 'rgba(255,48,86,0.07)' : 'rgba(0,229,180,0.05)',
-              border: `1px solid ${openTrades.length >= 2 ? 'rgba(255,48,86,0.2)' : 'rgba(0,229,180,0.15)'}`,
+              background: openTrades.length >= maxConcurrentTrades ? 'rgba(255,48,86,0.07)' : 'rgba(0,229,180,0.05)',
+              border: `1px solid ${openTrades.length >= maxConcurrentTrades ? 'rgba(255,48,86,0.2)' : 'rgba(0,229,180,0.15)'}`,
             }}>
-              <span style={{ fontSize: 12, color: openTrades.length >= 2 ? 'var(--color-sell)' : '#00e5b4', fontWeight: 700 }}>
-                {openTrades.length >= 2 ? '⚠ Max trades reached' : '✓ Ready'}
+              <span style={{ fontSize: 12, color: openTrades.length >= maxConcurrentTrades ? 'var(--color-sell)' : '#00e5b4', fontWeight: 700 }}>
+                {openTrades.length >= maxConcurrentTrades ? '⚠ Max trades reached' : '✓ Ready'}
               </span>
               <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                {openTrades.length} / 2 active — new signals {openTrades.length >= 2 ? 'paused' : 'will execute'}
+                {openTrades.length} / {maxConcurrentTrades} active — new signals {openTrades.length >= maxConcurrentTrades ? 'paused' : 'will execute'}
               </span>
             </div>
           )}
@@ -658,7 +704,11 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
                       </div>
                       <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>valid until</div>
                     </>
-                  ) : (!sig || sig.blocked) ? (
+                  ) : sig?.fetchError ? (
+                    <div style={{ color: 'var(--color-sell)', fontStyle: 'italic', maxWidth: 120, wordBreak: 'break-all' }}>
+                      error: {sig.fetchError}
+                    </div>
+                  ) : !sig ? (
                     <div style={{ color: 'var(--text-dim)', fontStyle: 'italic' }}>loading…</div>
                   ) : null}
                 </div>
@@ -814,7 +864,11 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
                         </div>
                         <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>valid until</div>
                       </>
-                    ) : (!sig || sig.blocked) ? (
+                    ) : sig?.fetchError ? (
+                      <div style={{ color: 'var(--color-sell)', fontStyle: 'italic', maxWidth: 120, wordBreak: 'break-all' }}>
+                        error: {sig.fetchError}
+                      </div>
+                    ) : !sig ? (
                       <div style={{ color: 'var(--text-dim)', fontStyle: 'italic' }}>loading…</div>
                     ) : null}
                   </div>
