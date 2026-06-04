@@ -14,8 +14,9 @@ export async function GET(req: NextRequest) {
       .eq('user_id', userId)
       .single()
     return NextResponse.json({ settings: data?.settings || DEFAULT_STRATEGY })
-  } catch {
-    return NextResponse.json({ settings: DEFAULT_STRATEGY })
+  } catch (e: any) {
+    console.error('[strategy GET]', e?.message)
+    return NextResponse.json({ settings: DEFAULT_STRATEGY, isDefault: true })
   }
 }
 

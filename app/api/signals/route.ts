@@ -17,7 +17,8 @@ export async function GET(req: NextRequest) {
 
     if (error) throw error
     return NextResponse.json({ signals: data || [] })
-  } catch {
-    return NextResponse.json({ signals: [] })
+  } catch (e: any) {
+    console.error('[signals GET]', e?.message)
+    return NextResponse.json({ signals: [], error: e?.message }, { status: 500 })
   }
 }
