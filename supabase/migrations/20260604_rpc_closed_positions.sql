@@ -268,39 +268,37 @@ BEGIN
   -- or v8 EA without closedPositions support) without P/L data.
   -- Keeps the newest N DB trades per pair+direction to match the EA count;
   -- marks any excess as CLOSED.
+  -- NOTE: written as UPDATE ... FROM (subquery) rather than WITH ... UPDATE
+  -- to avoid PL/pgSQL's CTE-in-DML parser ambiguity.
   IF p_payload->'openPositions' IS NOT NULL AND v_user_id IS NOT NULL THEN
-    WITH db_open AS (
-      SELECT
-        id,
-        replace(pair, '/', '') AS raw_pair,
-        direction,
-        opened_at,
-        row_number() OVER (
-          PARTITION BY replace(pair, '/',''), direction
-          ORDER BY opened_at DESC
-        ) AS rn
-      FROM trades
-      WHERE user_id = v_user_id
-        AND result  = 'OPEN'
-        AND opened_at < now() - interval '2 minutes'
-    ),
-    ea_counts AS (
-      SELECT
-        regexp_replace(upper(ea->>'symbol'), '[^A-Za-z]', '', 'g') AS raw_sym,
-        upper(COALESCE(ea->>'type', 'BUY'))                          AS direction,
-        count(*)::int                                                 AS cnt
-      FROM jsonb_array_elements(p_payload->'openPositions') ea
-      WHERE (ea->>'symbol') IS NOT NULL
-      GROUP BY 1, 2
-    )
     UPDATE trades t
        SET result    = 'CLOSED',
            closed_at = now()
-      FROM db_open d
-      LEFT JOIN ea_counts e
-        ON e.raw_sym  = d.raw_pair
-       AND e.direction = d.direction
-     WHERE t.id    = d.id
+      FROM (
+        SELECT
+          id,
+          replace(pair, '/', '') AS raw_pair,
+          direction,
+          row_number() OVER (
+            PARTITION BY replace(pair, '/',''), direction
+            ORDER BY opened_at DESC
+          ) AS rn
+        FROM trades
+        WHERE user_id  = v_user_id
+          AND result   = 'OPEN'
+          AND opened_at < now() - interval '2 minutes'
+      ) d
+      LEFT JOIN (
+        SELECT
+          regexp_replace(upper(ea->>'symbol'), '[^A-Za-z]', '', 'g') AS raw_sym,
+          upper(COALESCE(ea->>'type', 'BUY'))                         AS direction,
+          count(*)::int                                                AS cnt
+        FROM jsonb_array_elements(p_payload->'openPositions') ea
+        WHERE (ea->>'symbol') IS NOT NULL
+        GROUP BY 1, 2
+      ) e ON e.raw_sym  = d.raw_pair
+         AND e.direction = d.direction
+     WHERE t.id = d.id
        AND d.rn > COALESCE(e.cnt, 0);
 
     GET DIAGNOSTICS v_reconciled = ROW_COUNT;
