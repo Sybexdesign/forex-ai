@@ -45,7 +45,7 @@ interface ToastProps { msg: string; color?: string; onClose: () => void }
 
 export function Toast({ msg, color = '#60c0ff', onClose }: ToastProps) {
   useEffect(() => {
-    const t = setTimeout(onClose, 5000)
+    const t = setTimeout(onClose, 2500)
     return () => clearTimeout(t)
   }, [onClose])
 
