@@ -81,7 +81,7 @@ void SnapshotOpenPositions()
       ulong t = PositionGetTicket(i);
       if(t == 0) continue;
       g_prevPos[g_prevPosCount].ticket    = t;
-      g_prevPos[g_prevPosCount].symbol    = PositionGetString(POSITION_SYMBOL);
+      g_prevPos[g_prevPosCount].symbol    = StripSuffix(PositionGetString(POSITION_SYMBOL));
       g_prevPos[g_prevPosCount].direction =
          (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
       g_prevPos[g_prevPosCount].openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
@@ -138,8 +138,8 @@ string BuildClosedPositionsJSON()
                     + HistoryDealGetDouble(dealTkt, DEAL_COMMISSION)
                     + HistoryDealGetDouble(dealTkt, DEAL_SWAP);
          double closePrice = HistoryDealGetDouble(dealTkt, DEAL_PRICE);
-         string sym        = g_prevPos[i].symbol;  // use snapshot symbol (with suffix)
-         int    dp         = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+         string sym        = g_prevPos[i].symbol;  // clean name (suffix already stripped)
+         int    dp         = (int)SymbolInfoInteger(sym + SymbolSuffix, SYMBOL_DIGITS);
          if(dp == 0) dp    = 5; // fallback
 
          if(!first) out += ",";
@@ -607,10 +607,11 @@ string BuildPricesJSON()
    bool first = true;
    for(int i = 0; i < g_totalSymbols; i++)
    {
-      double bid = SymbolInfoDouble(SYMBOLS[i], SYMBOL_BID);
-      double ask = SymbolInfoDouble(SYMBOLS[i], SYMBOL_ASK);
+      string fullSym = SYMBOLS[i] + SymbolSuffix;
+      double bid = SymbolInfoDouble(fullSym, SYMBOL_BID);
+      double ask = SymbolInfoDouble(fullSym, SYMBOL_ASK);
       if(bid <= 0 || ask <= 0) continue;
-      int dp = (int)SymbolInfoInteger(SYMBOLS[i], SYMBOL_DIGITS);
+      int dp = (int)SymbolInfoInteger(fullSym, SYMBOL_DIGITS);
       if(!first) out += ",";
       out += "\"" + SYMBOLS[i] + "\":{\"bid\":" + DoubleToString(bid,dp)
            + ",\"ask\":" + DoubleToString(ask,dp) + "}";
@@ -646,10 +647,11 @@ string BuildCandlesForTF(ENUM_TIMEFRAMES period, int bars)
    bool first = true;
    for(int i = 0; i < g_totalSymbols; i++)
    {
-      string arr = BuildCandleArray(SYMBOLS[i], period, bars);
+      string fullSym = SYMBOLS[i] + SymbolSuffix;
+      string arr = BuildCandleArray(fullSym, period, bars);
       if(arr == "[]") continue;
       if(!first) out += ",";
-      out += "\"" + SYMBOLS[i] + "\":" + arr;
+      out += "\"" + SYMBOLS[i] + "\":" + arr;  // key is always the clean name
       first = false;
    }
    return out + "}";
@@ -676,7 +678,7 @@ string BuildOpenPositionsJSON()
       if(!first) out += ",";
       out += "{"
            + "\"ticket\":"     + IntegerToString((long)ticket)
-           + ",\"symbol\":\""  + PositionGetString(POSITION_SYMBOL) + "\""
+           + ",\"symbol\":\""  + StripSuffix(PositionGetString(POSITION_SYMBOL)) + "\""
            + ",\"type\":\""    + (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL") + "\""
            + ",\"lots\":"      + DoubleToString(PositionGetDouble(POSITION_VOLUME),2)
            + ",\"openPrice\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN),5)
