@@ -626,3 +626,107 @@ input[type="number"]:focus { border-color: var(--blue); }
     grid-template-columns: 1fr;
   }
 }
+
+/* ─── Mobile responsive additions ───────────────────────────────────────────── */
+
+/* Button pill rows — wrap on any screen */
+.btn-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Signal card direction text — scale down on small screens */
+.signal-dir-text {
+  font-size: 28px;
+  font-weight: 900;
+  font-family: 'Rajdhani', sans-serif;
+  letter-spacing: 2px;
+  line-height: 1;
+}
+
+/* Auto-trade USD fixed target input */
+.at-usd-input {
+  width: 90px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 3px;
+  padding: 5px 8px;
+  font-size: 13px;
+  font-weight: 700;
+  outline: none;
+  -moz-appearance: textfield;
+}
+.at-usd-input::-webkit-outer-spin-button,
+.at-usd-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+/* Credit alert popup — don't overflow right edge */
+.credit-alert-popup {
+  right: 0 !important;
+  max-width: calc(100vw - 24px) !important;
+}
+
+/* Toast — stretch near full-width on small phones */
+.toast {
+  max-width: 380px;
+  min-width: 240px;
+}
+
+/* Table: hide secondary columns on mobile to keep table readable */
+@media (max-width: 540px) {
+  .hide-mobile { display: none !important; }
+
+  /* Auto-trade USD input fills row on mobile */
+  .at-usd-input { width: 100%; max-width: 140px; }
+
+  /* Signal direction text smaller on small phones */
+  .signal-dir-text { font-size: 22px; }
+
+  /* Auto-trade toggle row: stack on tiny screens */
+  .at-toggle-row {
+    align-items: flex-start !important;
+    flex-wrap: wrap;
+    gap: 10px !important;
+  }
+}
+
+@media (max-width: 380px) {
+  /* Very small screens */
+  .signal-dir-text { font-size: 18px; letter-spacing: 1px; }
+
+  /* Page header: hide page title text if news alert visible */
+  .header-page-title { display: none; }
+
+  /* Stat cards: 2 equal columns */
+  .stat-card-grid {
+    grid-template-columns: 1fr 1fr !important;
+  }
+
+  /* Toast full-width */
+  .toast { min-width: 0; width: calc(100vw - 32px); max-width: none; }
+}
+
+/* Toast container — full width anchor on very small screens */
+@media (max-width: 400px) {
+  .toast-container {
+    left: 12px !important;
+    right: 12px !important;
+    bottom: 16px !important;
+    align-items: stretch;
+  }
+  .toast { width: 100%; max-width: none; }
+}
+
+/* Mobile header: compress when screen is narrow */
+@media (max-width: 480px) {
+  .mobile-logo {
+    font-size: 14px !important;
+  }
+  /* Hide news event title text; keep the icon */
+  .header-news-text { display: none; }
+}
+
+/* Drawer: extra-tight on very small screens */
+@media (max-width: 320px) {
+  .mobile-drawer { width: calc(100vw - 32px) !important; max-width: none; }
+  .drawer-nav-btn { padding: 9px 10px; font-size: 13px; }
+}

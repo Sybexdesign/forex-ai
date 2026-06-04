@@ -606,7 +606,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         borderRadius: 5, padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12,
       }}>
         {/* Toggle row */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+        <div className="at-toggle-row" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <div>
             <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, color: autoTradeEnabled ? '#00e5b4' : 'var(--text-muted)' }}>
               AUTO TRADING
@@ -638,7 +638,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
               PROFIT TARGET (%) — auto-close at this % of expected TP
             </div>
-            <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+            <div className="btn-pill-row" style={{ marginBottom: 10 }}>
               {[50, 65, 75, 100].map(pct => (
                 <button key={pct} onClick={() => setProfitTargetPct(pct)} style={{
                   padding: '5px 14px', borderRadius: 3, border: 'none', cursor: 'pointer',
@@ -651,19 +651,17 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
               FIXED USD TARGET — close immediately at this profit (0 = disabled, overrides %)
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <span style={{ color: 'var(--text-muted)', fontSize: 13, fontWeight: 700 }}>$</span>
               <input
                 type="number" min="0" step="0.25"
                 value={fixedProfitUsd || ''}
                 placeholder="0.00"
                 onChange={e => setFixedProfitUsd(Math.max(0, parseFloat(e.target.value) || 0))}
+                className="at-usd-input"
                 style={{
-                  width: 90, background: 'rgba(255,255,255,0.05)',
                   border: `1px solid ${fixedProfitUsd > 0 ? 'rgba(0,229,180,0.4)' : 'rgba(255,255,255,0.1)'}`,
-                  borderRadius: 3, padding: '5px 8px',
                   color: fixedProfitUsd > 0 ? '#00e5b4' : 'var(--text-muted)',
-                  fontSize: 13, fontWeight: 700, outline: 'none',
                 }}
               />
               {fixedProfitUsd > 0 && (
@@ -685,7 +683,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
               MAX CONCURRENT TRADES — maximum open positions at any time
             </div>
-            <div style={{ display: 'flex', gap: 6 }}>
+            <div className="btn-pill-row">
               {[1, 2, 3, 5, 10].map(n => (
                 <button key={n} onClick={() => setMaxConcurrentTrades(n)} style={{
                   padding: '5px 14px', borderRadius: 3, border: 'none', cursor: 'pointer',
@@ -702,7 +700,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
               SIGNAL SECTIONS — choose which section to execute signals from
             </div>
-            <div style={{ display: 'flex', gap: 6 }}>
+            <div className="btn-pill-row">
               {[{ key: 'scalp', label: 'SCALP SIGNALS' }, { key: 'mirror', label: 'MIRROR TRADE' }].map(({ key, label }) => {
                 const active = autoSections.has(key)
                 return (
@@ -810,7 +808,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
                     {name} SCALP · 1–5m
                   </div>
                   <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-                    <span style={{ fontSize: 28, fontWeight: 900, fontFamily: 'Rajdhani', letterSpacing: 2, color: dirColor, lineHeight: 1 }}>
+                    <span className="signal-dir-text" style={{ color: dirColor }}>
                       {dir}
                     </span>
                     {dir !== 'HOLD' && conf > 0 && (

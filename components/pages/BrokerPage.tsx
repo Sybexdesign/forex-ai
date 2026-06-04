@@ -142,7 +142,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                   {activeConfig.broker_type.toUpperCase()}
                 </span>
               </div>
-              <div style={{ display: 'flex', gap: 8, marginLeft: 'auto' }}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <button onClick={testConnection} disabled={testing} className="btn btn-ghost" style={{ fontSize: 12, padding: '6px 14px' }}>
                   {testing ? <LoadingDots /> : '⚡ Test Connection'}
                 </button>
@@ -312,11 +312,11 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                     href="/SybexForexAI_EA_v9.mq5"
                     download="SybexForexAI_EA_v9.mq5"
                     style={{
-                      display: 'inline-flex', alignItems: 'center', gap: 8,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
                       background: 'rgba(0,229,180,0.12)', color: '#00e5b4',
                       border: '1px solid rgba(0,229,180,0.4)', borderRadius: 5,
-                      padding: '8px 18px', fontSize: 13, fontWeight: 700,
-                      textDecoration: 'none', letterSpacing: 0.3,
+                      padding: '10px 18px', fontSize: 13, fontWeight: 700,
+                      textDecoration: 'none', letterSpacing: 0.3, width: '100%', boxSizing: 'border-box',
                     }}
                   >
                     ↓ Download SybexForexAI_EA_v9.mq5

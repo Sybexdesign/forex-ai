@@ -320,13 +320,13 @@ export default function AppShell() {
             <span style={{ color: '#0080ff' }}>FOREX</span>
             <span style={{ color: '#00ff87' }}>AI</span>
           </div>
-          <span style={{ fontFamily: 'Rajdhani', fontWeight: 700, fontSize: 14, color: '#60c0ff', letterSpacing: 2 }}>
+          <span className="header-page-title" style={{ fontFamily: 'Rajdhani', fontWeight: 700, fontSize: 14, color: '#60c0ff', letterSpacing: 2 }}>
             {PAGE_TITLES[page] || page.toUpperCase()}
           </span>
           {news.hasHighImpactInWindow && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
               <span className="blink" style={{ color: '#ff3056' }}>⚠</span>
-              <span style={{ color: '#ff8060' }}>
+              <span className="header-news-text" style={{ color: '#ff8060' }}>
                 {news.events.find(e => e.isInWindow)?.title} in{' '}
                 <span className="mono" style={{ color: '#ffb800' }}>{news.events.find(e => e.isInWindow)?.minutesAway}m</span>
               </span>
@@ -384,7 +384,7 @@ export default function AppShell() {
                   <div className="credit-alert-popup" style={{
                     position: 'absolute', top: 36, right: 0, zIndex: 1000,
                     background: 'var(--bg-panel)', border: '1px solid rgba(255,48,86,0.4)',
-                    borderRadius: 4, padding: '12px 16px', minWidth: 260,
+                    borderRadius: 4, padding: '12px 16px', minWidth: 240,
                     boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
                   }}>
                     <div style={{ fontWeight: 700, color: '#ff3056', fontSize: 13, marginBottom: 6 }}>
@@ -554,7 +554,7 @@ export default function AppShell() {
       </div>
 
       {/* Toasts */}
-      <div style={{ position: 'fixed', bottom: 24, right: 24, display: 'flex', flexDirection: 'column', gap: 8, zIndex: 9999 }}>
+      <div className="toast-container" style={{ position: 'fixed', bottom: 24, right: 16, display: 'flex', flexDirection: 'column', gap: 8, zIndex: 9999 }}>
         {toasts.map(t => (
           <Toast key={t.id} msg={t.msg} color={t.color} onClose={() => removeToast(t.id)} />
         ))}

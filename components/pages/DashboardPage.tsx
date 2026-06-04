@@ -118,7 +118,7 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
       ))}
 
       {/* Account stats */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 10 }}>
+      <div className="stat-card-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 10 }}>
         <StatCard
           label="BALANCE"
           value={account?.balance ? `$${account.balance.toLocaleString('en', { minimumFractionDigits: 2 })}` : account === null ? '…' : 'Not synced'}
@@ -186,7 +186,7 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
             <div style={{ overflowX: 'auto' }}>
               <table>
                 <thead>
-                  <tr><th>PAIR</th><th>DIR</th><th>LOTS</th><th>ENTRY</th><th>TP</th><th>SL</th><th>ACTION</th></tr>
+                  <tr><th>PAIR</th><th>DIR</th><th>LOTS</th><th className="hide-mobile">ENTRY</th><th className="hide-mobile">TP</th><th className="hide-mobile">SL</th><th>ACTION</th></tr>
                 </thead>
                 <tbody>
                   {openTrades.slice(openPage * PAGE_SIZE, (openPage + 1) * PAGE_SIZE).map((pos: any) => {
@@ -200,13 +200,13 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
                           </span>
                         </td>
                         <td className="mono" style={{ fontSize: 12 }}>{pos.lots?.toFixed(2) ?? '—'}</td>
-                        <td className="mono" style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                        <td className="mono hide-mobile" style={{ color: 'var(--text-muted)', fontSize: 12 }}>
                           {pos.entry_price ? pos.entry_price.toFixed(dp) : '—'}
                         </td>
-                        <td className="mono" style={{ color: '#00c060', fontSize: 12 }}>
+                        <td className="mono hide-mobile" style={{ color: '#00c060', fontSize: 12 }}>
                           {pos.tp_price ? pos.tp_price.toFixed(dp) : '—'}
                         </td>
-                        <td className="mono" style={{ color: '#ff6060', fontSize: 12 }}>
+                        <td className="mono hide-mobile" style={{ color: '#ff6060', fontSize: 12 }}>
                           {pos.sl_price ? pos.sl_price.toFixed(dp) : '—'}
                         </td>
                         <td>
