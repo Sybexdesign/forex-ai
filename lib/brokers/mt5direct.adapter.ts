@@ -219,17 +219,13 @@ export class Mt5DirectBroker implements IBroker {
 
     try {
       const sb = getAdminClient()
-      const { data: row } = await sb
-        .from('broker_configs')
-        .select('config')
-        .eq('id', this.config._configId)
-        .single()
-      const pending = (row?.config?.pendingOrders || []) as typeof newOrder[]
-      pending.push(newOrder)
-      await sb
-        .from('broker_configs')
-        .update({ config: { ...row?.config, pendingOrders: pending } })
-        .eq('id', this.config._configId)
+      // Use atomic RPC to append order — prevents race condition where two simultaneous
+      // requests read the same pendingOrders array and one overwrites the other's entry.
+      const { error } = await sb.rpc('append_pending_order', {
+        p_config_id: this.config._configId,
+        p_order: newOrder,
+      })
+      if (error) throw new Error(error.message)
 
       return { success: true, orderId, tradeId: orderId, filledPrice: req.currentPrice, tpPrice, slPrice }
     } catch (e: any) {

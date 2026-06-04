@@ -279,6 +279,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         checklistScore: signal.checklistScore,
         userId,
         signalId: signal.id,
+        signalTimestamp: signal.scannedAt,
       }),
     })
     return res.json()
@@ -318,15 +319,16 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
-          pair:           sig.pair,
-          direction:      sig.direction,
-          strategy:       { ...strategy, slPips: scalpSlPips, tpPips: scalpTpPips },
-          currentPrice:   sig.entry,  // use signal entry so SL/TP are placed at displayed levels
+          pair:            sig.pair,
+          direction:       sig.direction,
+          strategy:        { ...strategy, slPips: scalpSlPips, tpPips: scalpTpPips },
+          currentPrice:    sig.entry,
           newsInWindow,
-          aiConfidence:   sig.confidence,
-          checklistScore: 5,
+          aiConfidence:    sig.confidence,
+          checklistScore:  5,
           userId,
-          signalId:       `scalp-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+          signalId:        `scalp-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+          signalTimestamp: new Date(sig.fetchedAt).toISOString(),
         }),
       }).then(r => r.json())
 

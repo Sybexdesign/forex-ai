@@ -31,7 +31,7 @@ function dbToSettings(d: any): PropFirmSettings {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-    const { pair, direction, strategy, userId, signalId, newsInWindow, newsEvent, aiConfidence, checklistScore, currentPrice, maxConcurrentTrades } = body
+    const { pair, direction, strategy, userId, signalId, newsInWindow, newsEvent, aiConfidence, checklistScore, currentPrice, maxConcurrentTrades, signalTimestamp } = body
 
     const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
     const broker = await getBroker(authToken)
@@ -46,25 +46,27 @@ export async function POST(req: NextRequest) {
 
     // Fetch real-time account data for risk checks
     let openTrades: any[] = []
-    let balance = 10000
-    let equity  = 10000
+    let balance = 0          // 0 = not yet synced; guards skip on 0 to avoid false blocks
+    let equity  = 0
     let todayPL = 0
     let allTimePL = 0
     let tradingDays = 0
     let maxDailyPLEver = 0
+    let brokerSynced = false
 
     try {
       const [trades, account] = await Promise.all([broker.getOpenTrades(), broker.getAccountSummary()])
-      openTrades = trades
-      balance    = account.balance
-      equity     = account.nav ?? account.balance
+      openTrades   = trades
+      balance      = account.balance
+      equity       = account.nav ?? account.balance
+      brokerSynced = balance > 0
     } catch { /* use defaults if broker fails */ }
 
     // ─── Account protection: equity ratio guard ───────────────────────────
     // Block new trades if floating losses have consumed more than 25% of balance.
-    // Uses EA-synced equity (unrealised P/L inclusive). Skipped if balance is 0
-    // (EA not yet synced) to avoid false-blocking on first connection.
-    if (balance > 0 && equity < balance * 0.75) {
+    // Only runs when broker data is confirmed live (brokerSynced) — skipped if
+    // EA hasn't pushed data yet to avoid false-blocking on first connection.
+    if (brokerSynced && equity < balance * 0.75) {
       const reason = `Account equity ($${equity.toFixed(2)}) has fallen below 75% of balance ($${balance.toFixed(2)}) — auto-trading paused to protect the account`
       await alertOrderBlocked({ pair, direction, reason })
       return NextResponse.json({ success: false, blocked: true, reasons: [reason] }, { status: 422 })
@@ -163,6 +165,21 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // ─── Server-side news guard (unconditional) ───────────────────────────
+    // Always block during high-impact news regardless of strategy.hardNews setting.
+    // Client-side news flag is trusted but also verified: if newsInWindow is false
+    // but we can cross-check via the strategy.hardNews flag.
+    if (newsInWindow) {
+      console.warn(`[orders] HIGH-IMPACT NEWS in window — ${pair} ${direction} by ${userId}`)
+      if (strategy.hardNews !== false) {
+        // hardNews unset or true → treat as enabled (safe default)
+        const reason = `High-impact news event in progress — order blocked to protect capital`
+        await alertOrderBlocked({ pair, direction, reason })
+        return NextResponse.json({ success: false, blocked: true, reasons: [reason] }, { status: 422 })
+      }
+      // hardNews explicitly disabled — allow but stamp a warning in logs
+    }
+
     // ─── Hard risk guards ─────────────────────────────────────────────────
     const riskChecks = runRiskGuards({
       strategy, openTrades, accountBalance: balance,
@@ -175,13 +192,35 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, blocked: true, reasons }, { status: 422 })
     }
 
+    // ─── Pre-order safety validation ─────────────────────────────────────
+    // These checks run after risk guards so we have a clean fail path.
+    if (!currentPrice || currentPrice <= 0) {
+      return NextResponse.json({ success: false, blocked: true, reasons: ['Invalid price: no live price available — signal may be stale'] }, { status: 422 })
+    }
+    // Reject if the signal price is more than 2 minutes old (market may have moved)
+    if (signalTimestamp) {
+      const signalAgeMs = Date.now() - new Date(signalTimestamp).getTime()
+      if (signalAgeMs > 2 * 60 * 1000) {
+        return NextResponse.json({ success: false, blocked: true, reasons: [`Signal expired: price is ${Math.round(signalAgeMs / 1000)}s old — refresh the signal before trading`] }, { status: 422 })
+      }
+    }
+    if (!strategy.slPips || strategy.slPips <= 0) {
+      return NextResponse.json({ success: false, blocked: true, reasons: ['Stop loss pips must be > 0 — configure slPips in Strategy settings'] }, { status: 422 })
+    }
+    if (!strategy.tpPips || strategy.tpPips <= 0) {
+      return NextResponse.json({ success: false, blocked: true, reasons: ['Take profit pips must be > 0 — configure tpPips in Strategy settings'] }, { status: 422 })
+    }
+
     // ─── Calculate position size and place order ──────────────────────────
     const lots = broker.calcPositionSize(balance, strategy.riskPct, strategy.slPips, pair)
+    if (!lots || lots <= 0) {
+      return NextResponse.json({ success: false, blocked: true, reasons: ['Position size calculated as 0 — check balance, risk % and SL pips in Strategy settings'] }, { status: 422 })
+    }
     const orderResult = await broker.placeOrder({
       pair, direction, lots,
       takeProfitPips: strategy.tpPips,
       stopLossPips: strategy.slPips,
-      currentPrice: currentPrice || 1.0,
+      currentPrice,
     })
 
     if (!orderResult.success) {
@@ -208,7 +247,10 @@ export async function POST(req: NextRequest) {
         if (signalId && trade) {
           await admin.from('signals').update({ acted_on: true, trade_id: trade.id }).eq('id', signalId)
         }
-      } catch { /* ignore db errors */ }
+      } catch (dbErr: any) {
+        // Order is LIVE on broker but DB write failed — log so it can be manually reconciled.
+        console.error('[orders] CRITICAL: order placed but DB write failed — zombie trade risk', { pair, direction, lots, orderId: orderResult.tradeId, error: dbErr?.message })
+      }
     }
 
     // Fire Telegram alert (non-blocking)

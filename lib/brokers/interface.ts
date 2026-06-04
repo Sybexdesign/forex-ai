@@ -137,9 +137,13 @@ export function calcStandardPositionSize(
   slPips: number,
   pair: string
 ): number {
+  // Guard: slPips=0 causes division-by-zero → NaN → order with no stop loss
+  if (!slPips || slPips <= 0) return 0
   const riskAmount = balance * (riskPct / 100)
   const pipValPerLot = getPipValuePerLot(pair)
+  if (!pipValPerLot || pipValPerLot <= 0) return 0
   const lots = riskAmount / (slPips * pipValPerLot)
+  if (!isFinite(lots) || isNaN(lots)) return 0
   return +Math.max(0.01, Math.min(lots, 100)).toFixed(2)
 }
 
