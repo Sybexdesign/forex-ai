@@ -781,7 +781,8 @@ bool PlaceOrder(string symbol, string direction, double lots,
          return true;
       }
 
-      if(res.retcode != 10015 && res.retcode != 10030)
+      // 10013=INVALID (often fill-mode mismatch), 10015=no_money, 10030=unsupported_filling
+      if(res.retcode != 10015 && res.retcode != 10030 && res.retcode != 10013)
       {
          Print("SybexForexAI v9.0: order FAILED ", fullSym, " ", direction,
                " retcode=", res.retcode, " fill=", EnumToString(modes[f]));
