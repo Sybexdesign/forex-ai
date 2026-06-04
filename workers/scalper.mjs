@@ -51,6 +51,7 @@ function isMarketOpen() {
   if (day === 6) return false                                  // Saturday: always closed
   if (day === 0 && h < 22) return false                       // Sunday before 22:00
   if (day === 5 && (h > 22 || (h === 22 && m >= 0))) return false // Friday after 22:00
+  if (h === 22 && day !== 0) return false                      // Daily close 22:00–22:59 UTC (broker reopens 23:00)
   return true
 }
 
