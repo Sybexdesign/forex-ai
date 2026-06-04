@@ -89,6 +89,15 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   const [pfEnabled, setPfEnabled]     = useState(false)
   const [pfRiskCap, setPfRiskCap]     = useState<number | null>(null)  // null = not yet loaded
 
+  // Auto-trading
+  const [autoTradeEnabled, setAutoTradeEnabled]   = useState(false)
+  const [profitTargetPct, setProfitTargetPct]     = useState(75)
+  const [autoSections, setAutoSections]           = useState<Set<string>>(new Set(['scalp']))
+  const [autoPairs, setAutoPairs]                 = useState<Set<string>>(new Set(METALS_ONLY))
+  const autoScalpExecutedRef                      = useRef<Set<string>>(new Set())
+  const closingForTargetRef                       = useRef<Set<string>>(new Set())
+  const openTradesRef                             = useRef<any[]>([])
+
   const accountBalance = account?.balance || 10000
 
   const { enabled, setEnabled, scanning, lastScan, countdown, pendingSignals, diagnostics = [], error, runScan, rejectSignal, clearAll } = scanner
@@ -182,6 +191,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   }, [userId])
 
   useEffect(() => { loadOpenTrades() }, [loadOpenTrades])
+  useEffect(() => { openTradesRef.current = openTrades }, [openTrades])
 
   async function placeOrder(signal: ScanSignal) {
     // Always use live price at order time; fall back to scan-time price if feed unavailable
@@ -310,6 +320,33 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     }
   }
 
+  // Shared order placement for auto-trader — no UI loading state side-effects
+  async function autoPlaceOrder(sig: ScalpSignal, isMirror: boolean): Promise<boolean> {
+    const pip = getPipValue(sig.pair)
+    const slPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
+    const tpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
+    const direction = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
+    const prefix    = isMirror ? 'mirror' : 'scalp'
+    const body: Record<string, any> = {
+      pair: sig.pair, direction,
+      strategy:       { ...strategy, slPips, tpPips },
+      currentPrice:   sig.entry,
+      newsInWindow,
+      aiConfidence:   sig.confidence,
+      checklistScore: 5,
+      userId,
+      signalId:       `${prefix}-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+    }
+    if (isMirror) {
+      body.mirrorSl = 2 * sig.entry - sig.sl
+      body.mirrorTp = 2 * sig.entry - sig.tp
+    }
+    try {
+      const data = await authFetch('/api/orders', { method: 'POST', body: JSON.stringify(body) }).then(r => r.json())
+      return !!data.success && !data.blocked
+    } catch { return false }
+  }
+
   // Auto-execute: fire approved order as soon as signal arrives
   useEffect(() => {
     if (!autoExecute || !enabled) return
@@ -331,6 +368,63 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       }).catch(e => onToast('Auto error: ' + e.message, '#ff3056'))
     }
   }, [pendingSignals, autoExecute, enabled]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-trade: execute scalp/mirror signals when autoTradeEnabled
+  useEffect(() => {
+    if (!autoTradeEnabled) return
+    void (async () => {
+      for (const [pair, sig] of Object.entries(scalpSignals)) {
+        if (!sig || sig.direction === 'HOLD' || sig.blocked) continue
+        if (!autoPairs.has(pair)) continue
+        if (Date.now() > sig.expiresAt) continue
+        for (const section of ['scalp', 'mirror']) {
+          if (!autoSections.has(section)) continue
+          const key = `${section}-${pair}-${sig.fetchedAt}`
+          if (autoScalpExecutedRef.current.has(key)) continue
+          if (openTradesRef.current.length >= 2) continue
+          autoScalpExecutedRef.current.add(key)
+          const isMirror = section === 'mirror'
+          const dir = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
+          const ok = await autoPlaceOrder(sig, isMirror)
+          if (ok) {
+            onToast(`⚡ Auto: ${dir} ${pair} (${section === 'scalp' ? 'scalp' : 'mirror'})`, DIR_COLOR[dir] || '#00e5b4')
+            loadOpenTrades()
+            onRefreshTrades?.()
+            setTimeout(() => onRefreshAccount?.(), 1500)
+          }
+        }
+      }
+    })()
+  }, [scalpSignals, autoTradeEnabled]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Profit target monitoring: auto-close when currentProfit >= expectedProfit * target%
+  useEffect(() => {
+    if (!autoTradeEnabled) return
+    const id = setInterval(async () => {
+      await loadOpenTrades()
+      for (const trade of openTradesRef.current) {
+        if (closingForTargetRef.current.has(trade.id)) continue
+        const currentProfit = trade.unrealized_pl ?? 0
+        if (currentProfit <= 0) continue
+        const pip  = getPipValue(trade.pair)
+        const pvpl = getPipValuePerLot(trade.pair)
+        const tp   = trade.tp ?? 0
+        const entry = trade.entry_price ?? 0
+        const lots  = trade.lots ?? 0
+        if (!tp || !entry || !lots) continue
+        const expectedProfit = Math.abs(tp - entry) / pip * pvpl * lots
+        if (expectedProfit <= 0) continue
+        if (currentProfit >= expectedProfit * profitTargetPct / 100) {
+          closingForTargetRef.current.add(trade.id)
+          handleClose(trade)
+            .then(() => onToast(`⚡ Auto-closed ${trade.pair} @ ${profitTargetPct}% target (+$${currentProfit.toFixed(2)})`, '#00e5b4'))
+            .catch(() => {})
+            .finally(() => closingForTargetRef.current.delete(trade.id))
+        }
+      }
+    }, 5000)
+    return () => clearInterval(id)
+  }, [autoTradeEnabled, profitTargetPct]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleClose(trade: any) {
     setClosingId(trade.id)
@@ -364,6 +458,125 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+      {/* ── Auto Trading Control Panel ──────────────────────────────── */}
+      <div style={{
+        background: autoTradeEnabled ? 'rgba(0,229,180,0.05)' : 'rgba(255,255,255,0.02)',
+        border: `1px solid ${autoTradeEnabled ? 'rgba(0,229,180,0.3)' : 'rgba(255,255,255,0.07)'}`,
+        borderRadius: 5, padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12,
+      }}>
+        {/* Toggle row */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, color: autoTradeEnabled ? '#00e5b4' : 'var(--text-muted)' }}>
+              AUTO TRADING
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
+              {autoTradeEnabled
+                ? `Active · ${openTrades.length} / 2 trades open · target ${profitTargetPct}%`
+                : 'Configure below then enable'}
+            </div>
+          </div>
+          <button
+            onClick={() => setAutoTradeEnabled(v => !v)}
+            style={{
+              padding: '8px 22px', borderRadius: 4, border: 'none', cursor: 'pointer',
+              fontWeight: 700, fontSize: 13, letterSpacing: 1.5, flexShrink: 0,
+              background: autoTradeEnabled ? 'rgba(0,229,180,0.18)' : 'rgba(255,255,255,0.06)',
+              color: autoTradeEnabled ? '#00e5b4' : 'var(--text-muted)',
+            }}
+          >
+            {autoTradeEnabled ? '● ON' : '○ OFF'}
+          </button>
+        </div>
+
+        {/* Settings */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, opacity: autoTradeEnabled ? 1 : 0.7 }}>
+
+          {/* Profit Target */}
+          <div>
+            <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
+              PROFIT TARGET — auto-close when this % of expected TP is reached
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {[50, 65, 75, 100].map(pct => (
+                <button key={pct} onClick={() => setProfitTargetPct(pct)} style={{
+                  padding: '5px 14px', borderRadius: 3, border: 'none', cursor: 'pointer',
+                  fontWeight: 700, fontSize: 12,
+                  background: profitTargetPct === pct ? 'rgba(0,229,180,0.18)' : 'rgba(255,255,255,0.05)',
+                  color: profitTargetPct === pct ? '#00e5b4' : 'var(--text-muted)',
+                }}>{pct}%</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Signal Sections */}
+          <div>
+            <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
+              SIGNAL SECTIONS — choose which section to execute signals from
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {[{ key: 'scalp', label: 'SCALP SIGNALS' }, { key: 'mirror', label: 'MIRROR TRADE' }].map(({ key, label }) => {
+                const active = autoSections.has(key)
+                return (
+                  <button key={key} onClick={() => setAutoSections(prev => {
+                    const next = new Set(prev)
+                    active ? next.delete(key) : next.add(key)
+                    return next
+                  })} style={{
+                    padding: '5px 14px', borderRadius: 3, border: 'none', cursor: 'pointer',
+                    fontWeight: 700, fontSize: 11,
+                    background: active ? 'rgba(96,192,255,0.15)' : 'rgba(255,255,255,0.05)',
+                    color: active ? '#60c0ff' : 'var(--text-muted)',
+                  }}>{label}</button>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Pairs */}
+          <div>
+            <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
+              PAIRS — only execute signals for selected instruments
+            </div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {METALS_ONLY.map(pair => {
+                const active = autoPairs.has(pair)
+                const label  = pair === 'XAU/USD' ? 'Gold · XAU/USD' : 'Silver · XAG/USD'
+                return (
+                  <button key={pair} onClick={() => setAutoPairs(prev => {
+                    const next = new Set(prev)
+                    active ? next.delete(pair) : next.add(pair)
+                    return next
+                  })} style={{
+                    padding: '5px 14px', borderRadius: 3, border: 'none', cursor: 'pointer',
+                    fontWeight: 700, fontSize: 11,
+                    background: active ? 'rgba(255,200,0,0.12)' : 'rgba(255,255,255,0.05)',
+                    color: active ? '#ffc800' : 'var(--text-muted)',
+                  }}>{label}</button>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Max trades status */}
+          {autoTradeEnabled && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '7px 10px', borderRadius: 3,
+              background: openTrades.length >= 2 ? 'rgba(255,48,86,0.07)' : 'rgba(0,229,180,0.05)',
+              border: `1px solid ${openTrades.length >= 2 ? 'rgba(255,48,86,0.2)' : 'rgba(0,229,180,0.15)'}`,
+            }}>
+              <span style={{ fontSize: 12, color: openTrades.length >= 2 ? 'var(--color-sell)' : '#00e5b4', fontWeight: 700 }}>
+                {openTrades.length >= 2 ? '⚠ Max trades reached' : '✓ Ready'}
+              </span>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                {openTrades.length} / 2 active — new signals {openTrades.length >= 2 ? 'paused' : 'will execute'}
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* Live scalp signals — always-on direction panel for Gold and Silver */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
