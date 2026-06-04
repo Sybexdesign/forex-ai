@@ -485,20 +485,21 @@ void OnTimer()
    {
       for(int i = PositionsTotal()-1; i >= 0; i--)
       {
-         ulong  tkt    = PositionGetTicket(i);
+         ulong tkt = PositionGetTicket(i);
          if(tkt == 0) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
          double profit = PositionGetDouble(POSITION_PROFIT);
          if(profit >= g_profitTargetUsd)
          {
             string rawSym = StripSuffix(PositionGetString(POSITION_SYMBOL));
             int    rc     = 0;
+            Print("[profit-target] triggered ", rawSym, " #", tkt,
+                  " profit=$", DoubleToString(profit, 2),
+                  " >= target=$", DoubleToString(g_profitTargetUsd, 2));
             if(CloseByTicket(tkt, rawSym, rc))
-               Print("[profit-target] CLOSED ", rawSym, " #", tkt,
-                     " profit=$", DoubleToString(profit, 2),
-                     " >= target=$", DoubleToString(g_profitTargetUsd, 2));
+               Print("[profit-target] CLOSED ", rawSym, " #", tkt);
             else
-               Print("[profit-target] FAILED ", rawSym, " #", tkt,
-                     " profit=$", DoubleToString(profit, 2), " retcode=", rc);
+               Print("[profit-target] FAILED ", rawSym, " #", tkt, " retcode=", rc);
          }
       }
    }
@@ -573,17 +574,23 @@ string FetchPendingOrders()
    string resp = CharArrayToString(result);
 
    // v9.1: read profitTargetUsd from PULL response so target survives EA restart
-   double pt = JsonNum(resp, "profitTargetUsd");
-   if(pt > 0 && pt != g_profitTargetUsd)
+   // Only act when the key is actually present in the response (JsonNum returns 0
+   // for missing keys, which must not be confused with "app set target to 0").
+   bool hasPtKey = (StringFind(resp, "\"profitTargetUsd\":") >= 0);
+   if(hasPtKey)
    {
-      g_profitTargetUsd = pt;
-      Print("[profit-target] target updated from app: $", DoubleToString(pt, 2));
-   }
-   else if(pt == 0 && g_profitTargetUsd > 0 && ProfitTargetUsd == 0)
-   {
-      // App explicitly cleared the target (and no input override)
-      g_profitTargetUsd = 0;
-      Print("[profit-target] target cleared by app");
+      double pt = JsonNum(resp, "profitTargetUsd");
+      if(pt > 0 && pt != g_profitTargetUsd)
+      {
+         g_profitTargetUsd = pt;
+         Print("[profit-target] target updated from app: $", DoubleToString(pt, 2));
+      }
+      else if(pt == 0 && g_profitTargetUsd > 0 && ProfitTargetUsd == 0)
+      {
+         // App explicitly cleared the target (and no input override)
+         g_profitTargetUsd = 0;
+         Print("[profit-target] target cleared by app");
+      }
    }
 
    return resp;
@@ -799,28 +806,52 @@ bool CloseByTicket(ulong ticket, string symbol, int &retcode)
 {
    if(!PositionSelectByTicket(ticket)) return false;
 
-   string fullSym = symbol + SymbolSuffix;
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-   ZeroMemory(req);
-   ZeroMemory(res);
-
+   string             fullSym = symbol + SymbolSuffix;
    ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-   req.action       = TRADE_ACTION_DEAL;
-   req.symbol       = fullSym;
-   req.volume       = PositionGetDouble(POSITION_VOLUME);
-   req.type         = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-   req.price        = (posType == POSITION_TYPE_BUY)
-                      ? SymbolInfoDouble(fullSym, SYMBOL_BID)
-                      : SymbolInfoDouble(fullSym, SYMBOL_ASK);
-   req.deviation    = SlippagePoints;
-   req.magic        = MagicNumber;
-   req.position     = ticket;
-   req.type_filling = FillMode;
+   double             volume  = PositionGetDouble(POSITION_VOLUME);
 
-   bool ok = OrderSend(req, res);
-   retcode = (int)res.retcode;
-   return ok && res.retcode == 10009;
+   ENUM_ORDER_TYPE_FILLING modes[3];
+   modes[0] = FillMode;
+   modes[1] = ORDER_FILLING_FOK;
+   modes[2] = ORDER_FILLING_IOC;
+
+   for(int f = 0; f < 3; f++)
+   {
+      MqlTradeRequest req;
+      MqlTradeResult  res;
+      ZeroMemory(req);
+      ZeroMemory(res);
+
+      req.action       = TRADE_ACTION_DEAL;
+      req.symbol       = fullSym;
+      req.volume       = volume;
+      req.type         = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      req.price        = (posType == POSITION_TYPE_BUY)
+                         ? SymbolInfoDouble(fullSym, SYMBOL_BID)
+                         : SymbolInfoDouble(fullSym, SYMBOL_ASK);
+      req.deviation    = SlippagePoints;
+      req.magic        = MagicNumber;
+      req.position     = ticket;
+      req.type_filling = modes[f];
+
+      bool ok = OrderSend(req, res);
+      retcode = (int)res.retcode;
+
+      if(ok && res.retcode == 10009)
+      {
+         if(f > 0) Print("[close] used fallback fill mode ", EnumToString(modes[f]));
+         return true;
+      }
+
+      // 10013=INVALID (fill-mode mismatch), 10030=unsupported_filling — retry next mode
+      if(res.retcode != 10013 && res.retcode != 10030)
+      {
+         Print("[close] FAILED retcode=", res.retcode, " fill=", EnumToString(modes[f]));
+         return false;
+      }
+      Print("[close] fill mode ", EnumToString(modes[f]), " rejected (", res.retcode, ") -- trying next...");
+   }
+   return false;
 }
 
 //+------------------------------------------------------------------+
