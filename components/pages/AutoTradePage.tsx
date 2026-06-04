@@ -255,14 +255,15 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => { try { localStorage.setItem('at_sections',  JSON.stringify([...autoSections])) } catch {} }, [autoSections])
   useEffect(() => { try { localStorage.setItem('at_pairs',     JSON.stringify([...autoPairs]))    } catch {} }, [autoPairs])
 
-  // Sync fixed profit target to EA via broker config — EA enforces it natively in MT5
-  // without any browser dependency. Fires whenever the user changes the value.
+  // Sync computed profit target to EA — fires whenever either fixedProfitUsd or profitTargetPct changes.
+  // EA monitors floating profit against this exact dollar amount, so we send the resolved value.
   useEffect(() => {
+    const profitCloseAmount = fixedProfitUsd > 0 ? fixedProfitUsd * profitTargetPct / 100 : 0
     authFetch('/api/broker/profit-target', {
       method: 'POST',
-      body: JSON.stringify({ value: fixedProfitUsd }),
+      body: JSON.stringify({ value: profitCloseAmount }),
     }).catch(() => {})
-  }, [fixedProfitUsd])
+  }, [fixedProfitUsd, profitTargetPct])
 
   async function placeOrder(signal: ScanSignal) {
     // Always use live price at order time; fall back to scan-time price if feed unavailable
@@ -475,7 +476,9 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     })()
   }, [scalpSignals, autoTradeEnabled, maxConcurrentTrades]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Profit target monitoring — 2s interval, dual mode: fixed USD (priority) + % of expected TP
+  // Profit target monitoring — 2s interval
+  // Close threshold = fixedProfitUsd × profitTargetPct / 100
+  // e.g. $1.00 fixed × 50% = close at $0.50 floating profit
   //
   // Profit source priority:
   //   1. EA's actual unrealizedPL from account.openTrades (MT5 account-currency P&L,
@@ -492,12 +495,15 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       const trades = await loadOpenTrades()
 
       // Remove guard entries for trades that are no longer OPEN in DB
-      // This is the ONLY place we clear the guard — ensures no re-trigger until confirmed closed
       for (const guardId of [...closingForTargetRef.current]) {
         if (!trades.some((t: any) => t.id === guardId)) {
           closingForTargetRef.current.delete(guardId)
         }
       }
+
+      // No target configured — nothing to monitor
+      const profitCloseAmount = fixedProfitUsd > 0 ? fixedProfitUsd * profitTargetPct / 100 : 0
+      if (profitCloseAmount <= 0) return
 
       for (const trade of trades) {
         if (closingForTargetRef.current.has(trade.id)) continue
@@ -508,9 +514,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         const entry   = trade.entry_price ?? 0
         const lots    = trade.lots        ?? 0
 
-        // ── Get current floating profit ──────────────────────────────
-        // Prefer EA's live unrealizedPL (actual MT5 account P&L).
-        // Match by stripped symbol + direction since EA uses no-slash keys.
+        // Prefer EA's live unrealizedPL; fall back to computed from bid price
         let currentProfit: number | null = null
         const eaPos = (accountRef.current?.openTrades as any[] | undefined)?.find(p => {
           const sym = String(p.pair || p.symbol || '').replace('/', '')
@@ -519,7 +523,6 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         if (eaPos?.unrealizedPL != null) {
           currentProfit = Number(eaPos.unrealizedPL)
         } else if (entry && lots) {
-          // Fallback: compute from live bid price
           const liveBid = pricesRef.current[trade.pair]?.bid ?? pricesRef.current[pairKey]?.bid
           if (liveBid) {
             const pipsGained = trade.direction === 'BUY'
@@ -529,37 +532,17 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           }
         }
 
-        if (currentProfit == null) {
-          console.debug(`[profit-monitor] ${trade.pair}: no profit data (entry=${entry} lots=${lots} eaPos=${!!eaPos})`)
-          continue
-        }
-
-        console.debug(`[profit-monitor] ${trade.pair} ${trade.direction}: $${currentProfit.toFixed(2)} | fixed=${fixedProfitUsd > 0 ? '$'+fixedProfitUsd : 'off'} pct=${profitTargetPct}%`)
-
+        if (currentProfit == null) continue
         if (currentProfit <= 0) continue
 
-        // Priority 1: fixed USD target — higher priority than %
-        if (fixedProfitUsd > 0 && currentProfit >= fixedProfitUsd) {
-          const snap = { pair: trade.pair, profit: currentProfit, target: fixedProfitUsd }
-          console.log(`[profit-monitor] CLOSE ${snap.pair}: $${snap.profit.toFixed(2)} >= fixed $${snap.target}`)
+        console.debug(`[profit-monitor] ${trade.pair} ${trade.direction}: $${currentProfit.toFixed(2)} | target=$${profitCloseAmount.toFixed(2)} ($${fixedProfitUsd} × ${profitTargetPct}%)`)
+
+        if (currentProfit >= profitCloseAmount) {
+          const snap = { pair: trade.pair, profit: currentProfit, target: profitCloseAmount }
+          console.log(`[profit-monitor] CLOSE ${snap.pair}: $${snap.profit.toFixed(2)} >= $${snap.target.toFixed(2)}`)
           closingForTargetRef.current.add(trade.id)
           handleClose(trade)
-            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snap.pair} @ $${snap.target.toFixed(2)} fixed target (+$${snap.profit.toFixed(2)})`, '#00e5b4') })
-          continue
-        }
-
-        // Priority 2: % of expected TP profit
-        const tp = trade.tp_price ?? 0
-        if (!tp || !entry || !lots) continue
-        const expectedProfit = Math.abs(tp - entry) / pip * pvpl * lots
-        if (expectedProfit <= 0) continue
-
-        if (currentProfit >= expectedProfit * profitTargetPct / 100) {
-          const snap = { pair: trade.pair, profit: currentProfit, pct: profitTargetPct }
-          console.log(`[profit-monitor] CLOSE ${snap.pair}: $${snap.profit.toFixed(2)} >= ${snap.pct}% of $${expectedProfit.toFixed(2)}`)
-          closingForTargetRef.current.add(trade.id)
-          handleClose(trade)
-            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snap.pair} @ ${snap.pct}% target (+$${snap.profit.toFixed(2)})`, '#00e5b4') })
+            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snap.pair} @ $${snap.target.toFixed(2)} target (+$${snap.profit.toFixed(2)})`, '#00e5b4') })
         }
       }
     }, 2000)
@@ -615,7 +598,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             </div>
             <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
               {autoTradeEnabled
-                ? `Active · ${openTrades.length} / ${maxConcurrentTrades} trades open · ${fixedProfitUsd > 0 ? `$${fixedProfitUsd.toFixed(2)} fixed` : `${profitTargetPct}% target`}`
+                ? `Active · ${openTrades.length} / ${maxConcurrentTrades} trades open · ${fixedProfitUsd > 0 ? `close @ $${(fixedProfitUsd * profitTargetPct / 100).toFixed(2)}` : 'no target set'}`
                 : 'Configure below then enable'}
             </div>
           </div>
@@ -638,22 +621,9 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           {/* Profit Target */}
           <div>
             <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
-              PROFIT TARGET (%) — auto-close at this % of expected TP
+              FIXED USD TARGET — base close amount in dollars (0 = disabled)
             </div>
-            <div className="btn-pill-row" style={{ marginBottom: 10 }}>
-              {[50, 65, 75, 100].map(pct => (
-                <button key={pct} onClick={() => setProfitTargetPct(pct)} style={{
-                  padding: '5px 14px', borderRadius: 3, border: 'none', cursor: 'pointer',
-                  fontWeight: 700, fontSize: 12,
-                  background: profitTargetPct === pct ? 'rgba(0,229,180,0.18)' : 'rgba(255,255,255,0.05)',
-                  color: profitTargetPct === pct ? '#00e5b4' : 'var(--text-muted)',
-                }}>{pct}%</button>
-              ))}
-            </div>
-            <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
-              FIXED USD TARGET — close immediately at this profit (0 = disabled, overrides %)
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
               <span style={{ color: 'var(--text-muted)', fontSize: 13, fontWeight: 700 }}>$</span>
               <input
                 type="number" min="0" step="0.25"
@@ -673,9 +643,22 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
                 }}>✕ Clear</button>
               )}
             </div>
+            <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
+              PROFIT TARGET (%) — close at this % of the Fixed USD Target
+            </div>
+            <div className="btn-pill-row">
+              {[50, 65, 75, 100].map(pct => (
+                <button key={pct} onClick={() => setProfitTargetPct(pct)} style={{
+                  padding: '5px 14px', borderRadius: 3, border: 'none', cursor: 'pointer',
+                  fontWeight: 700, fontSize: 12,
+                  background: profitTargetPct === pct ? 'rgba(0,229,180,0.18)' : 'rgba(255,255,255,0.05)',
+                  color: profitTargetPct === pct ? '#00e5b4' : 'var(--text-muted)',
+                }}>{pct}%</button>
+              ))}
+            </div>
             {fixedProfitUsd > 0 && (
-              <div style={{ fontSize: 10, color: '#00e5b4', marginTop: 5 }}>
-                Active — any trade reaching +${fixedProfitUsd.toFixed(2)} closes immediately
+              <div style={{ fontSize: 10, color: '#00e5b4', marginTop: 6 }}>
+                Active — closes at +${(fixedProfitUsd * profitTargetPct / 100).toFixed(2)} (${fixedProfitUsd.toFixed(2)} × {profitTargetPct}%)
               </div>
             )}
           </div>
