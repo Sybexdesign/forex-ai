@@ -366,6 +366,10 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
       {/* Live scalp signals — always-on direction panel for Gold and Silver */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2, fontWeight: 700, paddingLeft: 2 }}>
+          SCALP SIGNALS
+        </div>
       <div className="scalp-signal-grid">
         {METALS_ONLY.map(pair => {
           const sig  = scalpSignals[pair]
@@ -509,6 +513,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             </div>
           )
         })}
+      </div>
       </div>
 
       {/* Mirror Trades — opposite-direction cards for Gold and Silver */}
