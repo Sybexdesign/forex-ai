@@ -622,13 +622,25 @@ async function runSweep() {
       const newCount = stale.count + 1
       stalePriceTrack.set(pair, { price: tick.price, count: newCount })
       if (newCount >= STALE_SKIP_COUNT) {
-        if (newCount === STALE_SKIP_COUNT) {
-          console.warn(`[stale] ${pair} price ${tick.price} unchanged for ${newCount} readings — MT5 EA frozen? Skipping signals.`)
+        // Alert on first detection, then every 30 sweeps (~5 min) while still frozen
+        const isFirstAlert  = newCount === STALE_SKIP_COUNT
+        const isRepeatAlert = newCount > STALE_SKIP_COUNT && (newCount - STALE_SKIP_COUNT) % 30 === 0
+        if (isFirstAlert || isRepeatAlert) {
+          const mins = Math.round(newCount * POLL_MS / 60_000)
+          console.warn(`[stale] ${pair} price ${tick.price} unchanged for ${newCount} sweeps (~${mins} min) — MT5 EA frozen?`)
           wlog('warn', `Stale price detected: ${pair} = ${tick.price} for ${newCount}+ sweeps — MT5 EA may be frozen`, { pair, session, metadata: { price: tick.price, staleCount: newCount } })
+          tgSend(`⚠️ <b>Stale Price Alert</b>\n\n${pair} = ${tick.price}\nUnchanged for ${newCount} sweeps (~${mins} min)\n\n🔌 MT5 EA may be frozen. Check MetaTrader connection.\n⏱ ${new Date().toUTCString()}`)
         }
         continue
       }
     } else {
+      // Price is moving again — if we were previously stale, send a recovery notice
+      const prev = stalePriceTrack.get(pair)
+      if (prev && prev.count >= STALE_SKIP_COUNT) {
+        console.log(`[stale] ${pair} price resumed after ${prev.count} stale sweeps`)
+        wlog('info', `Stale price cleared: ${pair} price resumed movement after ${prev.count} sweeps`, { pair, session, metadata: { price: tick.price, prevStaleCount: prev.count } })
+        tgSend(`✅ <b>Price Feed Resumed</b>\n\n${pair} is now updating again.\nWas frozen for ${prev.count} sweeps (~${Math.round(prev.count * POLL_MS / 60_000)} min).\n⏱ ${new Date().toUTCString()}`)
+      }
       stalePriceTrack.set(pair, { price: tick.price, count: 1 })
     }
 
