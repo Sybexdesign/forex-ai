@@ -38,6 +38,10 @@ input int    MinHoldSeconds      = 60;   // no BE / trail / decay until trade is
 input int    MaxSpreadPips       = 30;   // skip SL actions if spread exceeds this
 input bool   UseRolloverFilter   = true; // skip actions during broker rollover 21:55-22:05
 
+// v9.1 PROFIT TARGET — closes any position instantly once floating P&L >= this value.
+// 0 = disabled. App setting overrides this input dynamically via PULL response.
+input double ProfitTargetUsd     = 0;
+
 string SYMBOLS[] = {"EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","XAGUSD","USDCAD","USDCHF","NZDUSD","GBPJPY","EURJPY"};
 
 //--- Constants --------------------------------------------------------
@@ -45,9 +49,10 @@ string SYNC_URL = "https://lfurosnmkwvqtlifggaa.supabase.co/rest/v1/rpc/mt5_webh
 string ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxmdXJvc25ta3d2cXRsaWZnZ2FhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjQ4MzEsImV4cCI6MjA5MzMwMDgzMX0.ZWxFA-D57GqObQM_jSQ2PvNbqfxPOY4YBd__XZiFeWA";
 
 //--- Globals ----------------------------------------------------------
-int    g_totalSymbols  = 0;
-string g_completedJson = "[]";
-int    g_syncCounter   = 0;
+int    g_totalSymbols    = 0;
+string g_completedJson   = "[]";
+int    g_syncCounter     = 0;
+double g_profitTargetUsd = 0;  // updated from app PULL response; 0 = disabled
 int    g_syncEveryN    = 5;
 
 //+------------------------------------------------------------------+
@@ -452,6 +457,9 @@ int OnInit()
    ArrayResize(g_prevPos, 20);
    SnapshotOpenPositions();
 
+   // v9.1: seed profit target from input (app PULL will override dynamically)
+   g_profitTargetUsd = ProfitTargetUsd;
+
    EventSetTimer(OrderPollSeconds);
    Print("SybexForexAI v9.0 started | FillMode=", EnumToString(FillMode),
          " | OrderPoll=", OrderPollSeconds, "s | DataSync=", DataSyncSeconds, "s",
@@ -469,6 +477,31 @@ void OnTimer()
 {
    // ── Profit Protection (every OrderPollSeconds, no server round-trip)
    RunProfitProtection();
+
+   // ── v9.1 Profit Target: close any position whose floating P&L >= target ──
+   // Runs every OrderPollSeconds (default 2s) directly in MT5 — no browser,
+   // no network call, no app state required. Overrides any delayed app close.
+   if(g_profitTargetUsd > 0)
+   {
+      for(int i = PositionsTotal()-1; i >= 0; i--)
+      {
+         ulong  tkt    = PositionGetTicket(i);
+         if(tkt == 0) continue;
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         if(profit >= g_profitTargetUsd)
+         {
+            string rawSym = StripSuffix(PositionGetString(POSITION_SYMBOL));
+            int    rc     = 0;
+            if(CloseByTicket(tkt, rawSym, rc))
+               Print("[profit-target] CLOSED ", rawSym, " #", tkt,
+                     " profit=$", DoubleToString(profit, 2),
+                     " >= target=$", DoubleToString(g_profitTargetUsd, 2));
+            else
+               Print("[profit-target] FAILED ", rawSym, " #", tkt,
+                     " profit=$", DoubleToString(profit, 2), " retcode=", rc);
+         }
+      }
+   }
 
    // ── v9: detect positions that closed since last snapshot ────────
    // Must run before SnapshotOpenPositions to capture the disappearance
@@ -537,7 +570,23 @@ string FetchPendingOrders()
       Print("SybexForexAI v9.0: pull HTTP ", rc);
       return "";
    }
-   return CharArrayToString(result);
+   string resp = CharArrayToString(result);
+
+   // v9.1: read profitTargetUsd from PULL response so target survives EA restart
+   double pt = JsonNum(resp, "profitTargetUsd");
+   if(pt > 0 && pt != g_profitTargetUsd)
+   {
+      g_profitTargetUsd = pt;
+      Print("[profit-target] target updated from app: $", DoubleToString(pt, 2));
+   }
+   else if(pt == 0 && g_profitTargetUsd > 0 && ProfitTargetUsd == 0)
+   {
+      // App explicitly cleared the target (and no input override)
+      g_profitTargetUsd = 0;
+      Print("[profit-target] target cleared by app");
+   }
+
+   return resp;
 }
 
 //+------------------------------------------------------------------+

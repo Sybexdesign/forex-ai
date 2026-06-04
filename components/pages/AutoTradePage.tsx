@@ -255,6 +255,15 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => { try { localStorage.setItem('at_sections',  JSON.stringify([...autoSections])) } catch {} }, [autoSections])
   useEffect(() => { try { localStorage.setItem('at_pairs',     JSON.stringify([...autoPairs]))    } catch {} }, [autoPairs])
 
+  // Sync fixed profit target to EA via broker config — EA enforces it natively in MT5
+  // without any browser dependency. Fires whenever the user changes the value.
+  useEffect(() => {
+    authFetch('/api/broker/profit-target', {
+      method: 'POST',
+      body: JSON.stringify({ value: fixedProfitUsd }),
+    }).catch(() => {})
+  }, [fixedProfitUsd])
+
   async function placeOrder(signal: ScanSignal) {
     // Always use live price at order time; fall back to scan-time price if feed unavailable
     const livePrice = prices[signal.pair]?.bid || signal.currentPrice
