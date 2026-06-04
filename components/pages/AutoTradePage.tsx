@@ -93,6 +93,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   // Auto-trading
   const [autoTradeEnabled, setAutoTradeEnabled]   = useState(false)
   const [profitTargetPct, setProfitTargetPct]     = useState(75)
+  const [fixedProfitUsd, setFixedProfitUsd]       = useState(0)
   const [maxConcurrentTrades, setMaxConcurrentTrades] = useState(2)
   const [autoSections, setAutoSections]           = useState<Set<string>>(new Set(['scalp']))
   const [autoPairs, setAutoPairs]                 = useState<Set<string>>(new Set(METALS_ONLY))
@@ -433,7 +434,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     })()
   }, [scalpSignals, autoTradeEnabled, maxConcurrentTrades]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Profit target monitoring: auto-close when currentProfit >= expectedProfit * target%
+  // Profit target monitoring — 2s interval, dual mode: fixed USD (priority) + % of expected TP
   useEffect(() => {
     if (!autoTradeEnabled) return
     const id = setInterval(async () => {
@@ -441,22 +442,32 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       for (const trade of openTradesRef.current) {
         if (closingForTargetRef.current.has(trade.id)) continue
 
-        // Compute unrealized P/L from live prices — avoids depending on a DB column
-        // that MT5 native closes wouldn't update.
-        const pip  = getPipValue(trade.pair)
-        const pvpl = getPipValuePerLot(trade.pair)
+        const pip     = getPipValue(trade.pair)
+        const pvpl    = getPipValuePerLot(trade.pair)
         const liveBid = pricesRef.current[trade.pair]?.bid
         const entry   = trade.entry_price ?? 0
-        const tp      = trade.tp_price    ?? 0   // DB column is tp_price, not tp
+        const tp      = trade.tp_price    ?? 0
         const lots    = trade.lots        ?? 0
-        if (!entry || !tp || !lots || !liveBid) continue
+        if (!entry || !lots || !liveBid) continue
 
         const pipsGained = trade.direction === 'BUY'
           ? (liveBid - entry) / pip
-          : (entry   - liveBid) / pip
+          : (entry - liveBid) / pip
         const currentProfit = pipsGained * pvpl * lots
         if (currentProfit <= 0) continue
 
+        // Priority 1: fixed USD target (higher priority than %)
+        if (fixedProfitUsd > 0 && currentProfit >= fixedProfitUsd) {
+          closingForTargetRef.current.add(trade.id)
+          handleClose(trade)
+            .then(() => onToast(`⚡ Auto-closed ${trade.pair} @ $${fixedProfitUsd.toFixed(2)} fixed target (+$${currentProfit.toFixed(2)})`, '#00e5b4'))
+            .catch(() => {})
+            .finally(() => closingForTargetRef.current.delete(trade.id))
+          continue
+        }
+
+        // Priority 2: percentage of expected TP profit
+        if (!tp) continue
         const expectedProfit = Math.abs(tp - entry) / pip * pvpl * lots
         if (expectedProfit <= 0) continue
 
@@ -468,9 +479,9 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             .finally(() => closingForTargetRef.current.delete(trade.id))
         }
       }
-    }, 5000)
+    }, 2000)
     return () => clearInterval(id)
-  }, [autoTradeEnabled, profitTargetPct]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [autoTradeEnabled, profitTargetPct, fixedProfitUsd]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleClose(trade: any) {
     setClosingId(trade.id)
@@ -519,7 +530,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
             </div>
             <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
               {autoTradeEnabled
-                ? `Active · ${openTrades.length} / ${maxConcurrentTrades} trades open · target ${profitTargetPct}%`
+                ? `Active · ${openTrades.length} / ${maxConcurrentTrades} trades open · ${fixedProfitUsd > 0 ? `$${fixedProfitUsd.toFixed(2)} fixed` : `${profitTargetPct}% target`}`
                 : 'Configure below then enable'}
             </div>
           </div>
@@ -542,9 +553,9 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           {/* Profit Target */}
           <div>
             <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
-              PROFIT TARGET — auto-close when this % of expected TP is reached
+              PROFIT TARGET (%) — auto-close at this % of expected TP
             </div>
-            <div style={{ display: 'flex', gap: 6 }}>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
               {[50, 65, 75, 100].map(pct => (
                 <button key={pct} onClick={() => setProfitTargetPct(pct)} style={{
                   padding: '5px 14px', borderRadius: 3, border: 'none', cursor: 'pointer',
@@ -554,6 +565,36 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
                 }}>{pct}%</button>
               ))}
             </div>
+            <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
+              FIXED USD TARGET — close immediately at this profit (0 = disabled, overrides %)
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ color: 'var(--text-muted)', fontSize: 13, fontWeight: 700 }}>$</span>
+              <input
+                type="number" min="0" step="0.25"
+                value={fixedProfitUsd || ''}
+                placeholder="0.00"
+                onChange={e => setFixedProfitUsd(Math.max(0, parseFloat(e.target.value) || 0))}
+                style={{
+                  width: 90, background: 'rgba(255,255,255,0.05)',
+                  border: `1px solid ${fixedProfitUsd > 0 ? 'rgba(0,229,180,0.4)' : 'rgba(255,255,255,0.1)'}`,
+                  borderRadius: 3, padding: '5px 8px',
+                  color: fixedProfitUsd > 0 ? '#00e5b4' : 'var(--text-muted)',
+                  fontSize: 13, fontWeight: 700, outline: 'none',
+                }}
+              />
+              {fixedProfitUsd > 0 && (
+                <button onClick={() => setFixedProfitUsd(0)} style={{
+                  background: 'rgba(255,48,86,0.15)', color: '#ff3056', border: 'none',
+                  borderRadius: 3, padding: '4px 10px', cursor: 'pointer', fontSize: 12, fontWeight: 700,
+                }}>✕ Clear</button>
+              )}
+            </div>
+            {fixedProfitUsd > 0 && (
+              <div style={{ fontSize: 10, color: '#00e5b4', marginTop: 5 }}>
+                Active — any trade reaching +${fixedProfitUsd.toFixed(2)} closes immediately
+              </div>
+            )}
           </div>
 
           {/* Max Concurrent Trades */}
