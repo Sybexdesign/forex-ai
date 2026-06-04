@@ -223,8 +223,12 @@ export function manageTrades(
     }
 
     // ── 5. Profit decay exit ─────────────────────────────────────────────────
-    if (peakProfit > 0 && pos.profit < peakProfit * DECAY_THRESHOLD) {
-      log.push(`[tm] ${sym}#${key} DECAY-EXIT: profit=$${pos.profit.toFixed(2)} < 50% of peak $${peakProfit.toFixed(2)}`)
+    // Floor = 1.5 pips of profit (capped at $0.25) to survive execution slippage.
+    // A queued close takes ~2s to fill in MT5; without this floor a positive-profit
+    // trigger can fill negative after price moves during the execution delay.
+    const decayCloseFloor = Math.min(1.5 * pvpl * pos.lots, 0.25)
+    if (peakProfit > 0 && pos.profit < peakProfit * DECAY_THRESHOLD && pos.profit >= decayCloseFloor) {
+      log.push(`[tm] ${sym}#${key} DECAY-EXIT: profit=$${pos.profit.toFixed(2)} < 50% of peak $${peakProfit.toFixed(2)} (floor=$${decayCloseFloor.toFixed(2)})`)
       commands.push({
         id:        crypto.randomUUID(),
         type:      'close',
