@@ -90,13 +90,31 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   const [pfEnabled, setPfEnabled]     = useState(false)
   const [pfRiskCap, setPfRiskCap]     = useState<number | null>(null)  // null = not yet loaded
 
-  // Auto-trading
-  const [autoTradeEnabled, setAutoTradeEnabled]   = useState(false)
-  const [profitTargetPct, setProfitTargetPct]     = useState(75)
-  const [fixedProfitUsd, setFixedProfitUsd]       = useState(0)
-  const [maxConcurrentTrades, setMaxConcurrentTrades] = useState(2)
-  const [autoSections, setAutoSections]           = useState<Set<string>>(new Set(['scalp']))
-  const [autoPairs, setAutoPairs]                 = useState<Set<string>>(new Set(METALS_ONLY))
+  // Auto-trading — all settings persisted to localStorage so state survives reload/refresh
+  const [autoTradeEnabled, setAutoTradeEnabled] = useState<boolean>(() => {
+    try { return localStorage.getItem('at_enabled') === 'true' } catch { return false }
+  })
+  const [profitTargetPct, setProfitTargetPct] = useState<number>(() => {
+    try { return parseInt(localStorage.getItem('at_targetPct') || '75', 10) } catch { return 75 }
+  })
+  const [fixedProfitUsd, setFixedProfitUsd] = useState<number>(() => {
+    try { return parseFloat(localStorage.getItem('at_fixedUsd') || '0') } catch { return 0 }
+  })
+  const [maxConcurrentTrades, setMaxConcurrentTrades] = useState<number>(() => {
+    try { return parseInt(localStorage.getItem('at_maxTrades') || '2', 10) } catch { return 2 }
+  })
+  const [autoSections, setAutoSections] = useState<Set<string>>(() => {
+    try {
+      const s = localStorage.getItem('at_sections')
+      return s ? new Set(JSON.parse(s)) : new Set(['scalp'])
+    } catch { return new Set(['scalp']) }
+  })
+  const [autoPairs, setAutoPairs] = useState<Set<string>>(() => {
+    try {
+      const s = localStorage.getItem('at_pairs')
+      return s ? new Set(JSON.parse(s)) : new Set(METALS_ONLY)
+    } catch { return new Set(METALS_ONLY) }
+  })
   const autoScalpExecutedRef                      = useRef<Set<string>>(new Set())
   const closingForTargetRef                       = useRef<Set<string>>(new Set())
   const openTradesRef                             = useRef<any[]>([])
@@ -208,14 +226,17 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     return () => clearInterval(id)
   }, [fetchScalpSignalForPair])
 
-  const loadOpenTrades = useCallback(async () => {
-    if (!userId) return
+  const loadOpenTrades = useCallback(async (): Promise<any[]> => {
+    if (!userId) return openTradesRef.current
     setTradesLoading(true)
     try {
       const res = await fetch(`/api/trades?userId=${userId}&result=OPEN`, { cache: 'no-store' })
       const data = await res.json()
-      setOpenTrades(data.trades || [])
-    } catch { /* ignore */ } finally {
+      const trades: any[] = data.trades || []
+      setOpenTrades(trades)
+      openTradesRef.current = trades  // update ref immediately — don't wait for React re-render cycle
+      return trades
+    } catch { return openTradesRef.current } finally {
       setTradesLoading(false)
     }
   }, [userId])
@@ -223,6 +244,14 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => { loadOpenTrades() }, [loadOpenTrades])
   useEffect(() => { openTradesRef.current = openTrades }, [openTrades])
   useEffect(() => { pricesRef.current = prices }, [prices])
+
+  // Persist auto-trade settings to localStorage on every change
+  useEffect(() => { try { localStorage.setItem('at_enabled',   String(autoTradeEnabled))       } catch {} }, [autoTradeEnabled])
+  useEffect(() => { try { localStorage.setItem('at_targetPct', String(profitTargetPct))         } catch {} }, [profitTargetPct])
+  useEffect(() => { try { localStorage.setItem('at_fixedUsd',  String(fixedProfitUsd))          } catch {} }, [fixedProfitUsd])
+  useEffect(() => { try { localStorage.setItem('at_maxTrades', String(maxConcurrentTrades))     } catch {} }, [maxConcurrentTrades])
+  useEffect(() => { try { localStorage.setItem('at_sections',  JSON.stringify([...autoSections])) } catch {} }, [autoSections])
+  useEffect(() => { try { localStorage.setItem('at_pairs',     JSON.stringify([...autoPairs]))    } catch {} }, [autoPairs])
 
   async function placeOrder(signal: ScanSignal) {
     // Always use live price at order time; fall back to scan-time price if feed unavailable
@@ -405,10 +434,9 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => {
     if (!autoTradeEnabled) return
     void (async () => {
-      // Use a local counter so the max-2 guard is accurate within this async loop.
-      // openTradesRef is updated by loadOpenTrades() which is async; without a local
-      // counter each iteration would read the pre-update ref value and place too many orders.
-      let localOpenCount = openTradesRef.current.length
+      // Effective open count = DB open trades minus any currently being auto-closed.
+      // This prevents placing a new trade for a slot that's in the process of being freed.
+      let localOpenCount = openTradesRef.current.length - closingForTargetRef.current.size
       for (const [pair, sig] of Object.entries(scalpSignals)) {
         if (!sig || sig.direction === 'HOLD' || sig.blocked) continue
         if (!autoPairs.has(pair)) continue
@@ -435,16 +463,24 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   }, [scalpSignals, autoTradeEnabled, maxConcurrentTrades]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Profit target monitoring — 2s interval, dual mode: fixed USD (priority) + % of expected TP
+  //
+  // Critical fix: prices from MT5 EA are keyed WITHOUT slash (e.g. "XAUUSD") but trade.pair
+  // in the DB has a slash ("XAU/USD"). Always try both key forms so liveBid is never undefined.
+  //
+  // Critical fix: loadOpenTrades() now returns the fresh trades array directly and updates
+  // openTradesRef immediately — we use that return value, not the (potentially stale) ref.
   useEffect(() => {
     if (!autoTradeEnabled) return
     const id = setInterval(async () => {
-      await loadOpenTrades()
-      for (const trade of openTradesRef.current) {
+      const trades = await loadOpenTrades()  // returns fresh array, ref already updated
+      for (const trade of trades) {
         if (closingForTargetRef.current.has(trade.id)) continue
 
         const pip     = getPipValue(trade.pair)
         const pvpl    = getPipValuePerLot(trade.pair)
-        const liveBid = pricesRef.current[trade.pair]?.bid
+        // Try XAU/USD first, then XAUUSD (EA key format) — handles broker key mismatch
+        const pairKey = trade.pair.replace('/', '')
+        const liveBid = pricesRef.current[trade.pair]?.bid ?? pricesRef.current[pairKey]?.bid
         const entry   = trade.entry_price ?? 0
         const tp      = trade.tp_price    ?? 0
         const lots    = trade.lots        ?? 0
@@ -456,7 +492,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         const currentProfit = pipsGained * pvpl * lots
         if (currentProfit <= 0) continue
 
-        // Priority 1: fixed USD target (higher priority than %)
+        // Priority 1: fixed USD target — closes immediately, overrides % mode
         if (fixedProfitUsd > 0 && currentProfit >= fixedProfitUsd) {
           closingForTargetRef.current.add(trade.id)
           handleClose(trade)
@@ -481,7 +517,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       }
     }, 2000)
     return () => clearInterval(id)
-  }, [autoTradeEnabled, profitTargetPct, fixedProfitUsd]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [autoTradeEnabled, profitTargetPct, fixedProfitUsd, loadOpenTrades]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleClose(trade: any) {
     setClosingId(trade.id)
