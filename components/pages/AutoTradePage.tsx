@@ -542,9 +542,12 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
 
         console.debug(`[profit-monitor] ${trade.pair} ${trade.direction}: $${currentProfit.toFixed(2)} | target=$${profitCloseAmount.toFixed(2)} ($${fixedProfitUsd} × ${profitTargetPct}%)`)
 
-        if (currentProfit >= profitCloseAmount) {
-          const snap = { pair: trade.pair, profit: currentProfit, target: profitCloseAmount }
-          console.log(`[profit-monitor] CLOSE ${snap.pair}: $${snap.profit.toFixed(2)} >= $${snap.target.toFixed(2)}`)
+        // 10% buffer above nominal target — same cushion as the EA — so close fills
+        // comfortably above the target after browser→server→EA→broker execution delay.
+        const profitTrigger = profitCloseAmount * 1.10
+        if (currentProfit >= profitTrigger) {
+          const snap = { pair: trade.pair, profit: currentProfit, target: profitCloseAmount, trigger: profitTrigger }
+          console.log(`[profit-monitor] CLOSE ${snap.pair}: $${snap.profit.toFixed(2)} >= trigger $${snap.trigger.toFixed(2)} (nominal $${snap.target.toFixed(2)} +10%)`)
           closingForTargetRef.current.add(trade.id)
           handleClose(trade)
             .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snap.pair} @ $${snap.target.toFixed(2)} target (+$${snap.profit.toFixed(2)})`, '#00e5b4') })

@@ -43,11 +43,14 @@ input int    MaxSpreadPips       = 30;   // skip SL actions if spread exceeds th
 input bool   UseRolloverFilter   = true; // skip actions during broker rollover 21:55-22:05
 
 // v9.2 PROFIT TARGET — formula: profitCloseAmount = ProfitFixedUsd × (ProfitTargetPct / 100)
-// e.g. ProfitFixedUsd=1.00, ProfitTargetPct=50 → close at $0.50 floating profit.
-// Both values are also updated dynamically from app PULL response every 2s.
+// e.g. ProfitFixedUsd=1.00, ProfitTargetPct=50 → nominal close at $0.50.
+// ProfitBufferPct adds a slippage cushion: actual trigger = closeAmount × (1 + buffer/100)
+// e.g. buffer=10 → trigger at $0.55, ensuring close fills above $0.50 after execution delay.
+// Both USD/pct values are also updated dynamically from app PULL response every 1s.
 // 0 = disabled (ProfitFixedUsd=0 turns off the entire profit target system).
 input double ProfitFixedUsd      = 0;    // base fixed USD target
 input int    ProfitTargetPct     = 75;   // percentage of fixed target to close at
+input int    ProfitBufferPct     = 10;   // slippage buffer: trigger at closeAmount × (1 + buffer%)
 
 string SYMBOLS[] = {"EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","XAGUSD","USDCAD","USDCHF","NZDUSD","GBPJPY","EURJPY"};
 
@@ -494,14 +497,16 @@ void OnTimer()
    // ── Profit Protection (every OrderPollSeconds, no server round-trip)
    RunProfitProtection();
 
-   // ── v9.2 Profit Target: close any position whose floating P&L >= close threshold ──
-   // Formula: profitCloseAmount = profitFixedUsd × (profitTargetPct / 100)
-   // e.g. $1.00 fixed × 50% = close at $0.50 floating profit.
-   // Runs every OrderPollSeconds (default 2s) directly in MT5 — no browser dependency.
-   double profitCloseAmount = (g_profitFixedUsd > 0)
+   // ── v9.2 Profit Target: close any position whose floating P&L >= trigger threshold ──
+   // Formula: nominal   = profitFixedUsd × (profitTargetPct / 100)
+   //          trigger   = nominal × (1 + ProfitBufferPct / 100)   ← slippage cushion
+   // e.g. $1.00 × 50% = $0.50 nominal; +10% buffer → trigger at $0.55
+   // The buffer ensures the close fills comfortably above the target after execution delay.
+   double profitNominal = (g_profitFixedUsd > 0)
       ? g_profitFixedUsd * g_profitTargetPct / 100.0
       : 0.0;
-   if(profitCloseAmount > 0)
+   double profitTrigger = profitNominal * (1.0 + ProfitBufferPct / 100.0);
+   if(profitTrigger > 0)
    {
       for(int i = PositionsTotal()-1; i >= 0; i--)
       {
@@ -509,15 +514,15 @@ void OnTimer()
          if(tkt == 0) continue;
          if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
          double profit = PositionGetDouble(POSITION_PROFIT);
-         if(profit >= profitCloseAmount)
+         if(profit >= profitTrigger)
          {
             string rawSym = StripSuffix(PositionGetString(POSITION_SYMBOL));
             int    rc     = 0;
             Print("[profit-target] triggered ", rawSym, " #", tkt,
                   " profit=$", DoubleToString(profit, 2),
-                  " >= target=$", DoubleToString(profitCloseAmount, 2),
-                  " (fixed=$", DoubleToString(g_profitFixedUsd, 2),
-                  " x ", g_profitTargetPct, "%)");
+                  " >= trigger=$", DoubleToString(profitTrigger, 2),
+                  " (nominal=$", DoubleToString(profitNominal, 2),
+                  " +", ProfitBufferPct, "% buffer)");
             if(CloseByTicket(tkt, rawSym, rc))
                Print("[profit-target] CLOSED ", rawSym, " #", tkt);
             else
