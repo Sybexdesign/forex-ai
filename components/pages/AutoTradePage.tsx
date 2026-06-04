@@ -97,6 +97,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   const autoScalpExecutedRef                      = useRef<Set<string>>(new Set())
   const closingForTargetRef                       = useRef<Set<string>>(new Set())
   const openTradesRef                             = useRef<any[]>([])
+  const pricesRef                                 = useRef<Record<string, any>>(prices)
 
   const accountBalance = account?.balance || 10000
 
@@ -182,7 +183,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     if (!userId) return
     setTradesLoading(true)
     try {
-      const res = await fetch(`/api/trades?userId=${userId}&result=OPEN`)
+      const res = await fetch(`/api/trades?userId=${userId}&result=OPEN`, { cache: 'no-store' })
       const data = await res.json()
       setOpenTrades(data.trades || [])
     } catch { /* ignore */ } finally {
@@ -192,6 +193,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
 
   useEffect(() => { loadOpenTrades() }, [loadOpenTrades])
   useEffect(() => { openTradesRef.current = openTrades }, [openTrades])
+  useEffect(() => { pricesRef.current = prices }, [prices])
 
   async function placeOrder(signal: ScanSignal) {
     // Always use live price at order time; fall back to scan-time price if feed unavailable
@@ -373,6 +375,10 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => {
     if (!autoTradeEnabled) return
     void (async () => {
+      // Use a local counter so the max-2 guard is accurate within this async loop.
+      // openTradesRef is updated by loadOpenTrades() which is async; without a local
+      // counter each iteration would read the pre-update ref value and place too many orders.
+      let localOpenCount = openTradesRef.current.length
       for (const [pair, sig] of Object.entries(scalpSignals)) {
         if (!sig || sig.direction === 'HOLD' || sig.blocked) continue
         if (!autoPairs.has(pair)) continue
@@ -381,12 +387,13 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           if (!autoSections.has(section)) continue
           const key = `${section}-${pair}-${sig.fetchedAt}`
           if (autoScalpExecutedRef.current.has(key)) continue
-          if (openTradesRef.current.length >= 2) continue
+          if (localOpenCount >= 2) continue
           autoScalpExecutedRef.current.add(key)
           const isMirror = section === 'mirror'
           const dir = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
           const ok = await autoPlaceOrder(sig, isMirror)
           if (ok) {
+            localOpenCount++   // immediately count this placement; don't wait for DB refresh
             onToast(`⚡ Auto: ${dir} ${pair} (${section === 'scalp' ? 'scalp' : 'mirror'})`, DIR_COLOR[dir] || '#00e5b4')
             loadOpenTrades()
             onRefreshTrades?.()
@@ -404,16 +411,26 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       await loadOpenTrades()
       for (const trade of openTradesRef.current) {
         if (closingForTargetRef.current.has(trade.id)) continue
-        const currentProfit = trade.unrealized_pl ?? 0
-        if (currentProfit <= 0) continue
+
+        // Compute unrealized P/L from live prices — avoids depending on a DB column
+        // that MT5 native closes wouldn't update.
         const pip  = getPipValue(trade.pair)
         const pvpl = getPipValuePerLot(trade.pair)
-        const tp   = trade.tp ?? 0
-        const entry = trade.entry_price ?? 0
-        const lots  = trade.lots ?? 0
-        if (!tp || !entry || !lots) continue
+        const liveBid = pricesRef.current[trade.pair]?.bid
+        const entry   = trade.entry_price ?? 0
+        const tp      = trade.tp_price    ?? 0   // DB column is tp_price, not tp
+        const lots    = trade.lots        ?? 0
+        if (!entry || !tp || !lots || !liveBid) continue
+
+        const pipsGained = trade.direction === 'BUY'
+          ? (liveBid - entry) / pip
+          : (entry   - liveBid) / pip
+        const currentProfit = pipsGained * pvpl * lots
+        if (currentProfit <= 0) continue
+
         const expectedProfit = Math.abs(tp - entry) / pip * pvpl * lots
         if (expectedProfit <= 0) continue
+
         if (currentProfit >= expectedProfit * profitTargetPct / 100) {
           closingForTargetRef.current.add(trade.id)
           handleClose(trade)

@@ -1,4 +1,6 @@
 // app/api/close-trade/route.ts
+export const dynamic = 'force-dynamic'
+
 import { NextRequest, NextResponse } from 'next/server'
 import { getBroker } from '@/lib/brokers'
 import { getAdminClient } from '@/lib/supabase'

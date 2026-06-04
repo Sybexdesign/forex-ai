@@ -112,19 +112,56 @@ export async function POST(req: NextRequest) {
       pendingOrders = pendingOrders.filter((o: any) => !completedIds.has(o.id))
     }
 
-    // ── Process EA-reported open positions (if EA sends them) ─────────────
-    // EA can optionally send openPositions: [{ticket, symbol, type, lots, openPrice, sl, tp, profit}]
-    // We sync these back to our trades table so P/L is live
-    if (Array.isArray(openPositions) && openPositions.length > 0 && userId) {
-      for (const pos of openPositions) {
-        // Only update unrealized P/L — don't change result or prices
-        try {
-          await sb.from('trades')
-            .update({ unrealized_pl: pos.profit ?? 0 })
-            .eq('user_id', userId)
-            .eq('result', 'OPEN')
-            .eq('pair', mt5SymbolToPair(pos.symbol || ''))
-        } catch { /* ignore */ }
+    // ── Reconcile DB open trades against EA's actual open positions ──────────
+    // EA sends openPositions on every sync (empty array = no positions open).
+    // Compare against DB trades marked OPEN: any DB trade that no longer has
+    // a matching EA position was closed by MT5 (SL/TP hit or profit-protection)
+    // and must be marked CLOSED so the max-trade guard stays accurate.
+    if (Array.isArray(openPositions) && userId) {
+      const cutoff = new Date(Date.now() - 2 * 60_000).toISOString()
+      const { data: dbOpenTrades } = await sb
+        .from('trades')
+        .select('id, pair, direction, opened_at')
+        .eq('user_id', userId)
+        .eq('result', 'OPEN')
+        .lt('opened_at', cutoff)   // only touch trades > 2 min old (protect fresh fills)
+        .order('opened_at', { ascending: false })
+
+      if (dbOpenTrades && dbOpenTrades.length > 0) {
+        // Count live EA positions per pair+direction
+        const eaCount: Record<string, number> = {}
+        for (const pos of openPositions) {
+          const pair = mt5SymbolToPair(pos.symbol || '')
+          const isLong = pos.type === 0 || String(pos.type).toLowerCase().includes('buy')
+          const dir  = isLong ? 'BUY' : 'SELL'
+          const key  = `${pair}|${dir}`
+          eaCount[key] = (eaCount[key] || 0) + 1
+        }
+
+        // Group DB trades by pair+direction (newest first — slice from tail to keep newest)
+        const dbByKey: Record<string, string[]> = {}
+        for (const t of dbOpenTrades) {
+          const key = `${t.pair}|${t.direction}`
+          if (!dbByKey[key]) dbByKey[key] = []
+          dbByKey[key].push(t.id)
+        }
+
+        // Close any DB trade beyond the count the EA actually holds
+        const toClose: string[] = []
+        for (const [key, ids] of Object.entries(dbByKey)) {
+          const keep = eaCount[key] || 0
+          toClose.push(...ids.slice(keep))
+        }
+
+        if (toClose.length > 0) {
+          const nowStr = new Date().toISOString()
+          for (let i = 0; i < toClose.length; i += 100) {
+            await sb.from('trades')
+              .update({ result: 'CLOSED', closed_at: nowStr })
+              .in('id', toClose.slice(i, i + 100))
+          }
+          console.log(`[mt5-sync] Reconciled ${toClose.length} stale OPEN trade(s) → CLOSED`)
+        }
       }
     }
 

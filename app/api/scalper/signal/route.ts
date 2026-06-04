@@ -1,4 +1,6 @@
 // app/api/scalper/signal/route.ts
+export const dynamic = 'force-dynamic'
+
 import { NextRequest, NextResponse } from 'next/server'
 import Anthropic from '@anthropic-ai/sdk'
 import { getAdminClient } from '@/lib/supabase'

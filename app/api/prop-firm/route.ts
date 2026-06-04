@@ -1,4 +1,6 @@
 // app/api/prop-firm/route.ts — GET/POST prop-firm settings for the authenticated user
+export const dynamic = 'force-dynamic'
+
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { DEFAULT_PROP_FIRM } from '@/lib/propfirm'
