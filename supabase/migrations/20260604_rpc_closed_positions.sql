@@ -295,7 +295,8 @@ BEGIN
           count(*)::int                                                AS cnt
         FROM jsonb_array_elements(p_payload->'openPositions') ea
         WHERE (ea->>'symbol') IS NOT NULL
-        GROUP BY 1, 2
+        GROUP BY regexp_replace(upper(ea->>'symbol'), '[^A-Za-z]', '', 'g'),
+                 upper(COALESCE(ea->>'type', 'BUY'))
       ) e ON e.raw_sym  = d.raw_pair
          AND e.direction = d.direction
      WHERE t.id = d.id
