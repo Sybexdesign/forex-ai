@@ -119,6 +119,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   const closingForTargetRef                       = useRef<Set<string>>(new Set())
   const openTradesRef                             = useRef<any[]>([])
   const pricesRef                                 = useRef<Record<string, any>>(prices)
+  const accountRef                                = useRef<any>(null)
 
   const accountBalance = account?.balance || 10000
 
@@ -244,6 +245,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => { loadOpenTrades() }, [loadOpenTrades])
   useEffect(() => { openTradesRef.current = openTrades }, [openTrades])
   useEffect(() => { pricesRef.current = prices }, [prices])
+  useEffect(() => { accountRef.current = account }, [account])
 
   // Persist auto-trade settings to localStorage on every change
   useEffect(() => { try { localStorage.setItem('at_enabled',   String(autoTradeEnabled))       } catch {} }, [autoTradeEnabled])
@@ -464,55 +466,89 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
 
   // Profit target monitoring — 2s interval, dual mode: fixed USD (priority) + % of expected TP
   //
-  // Critical fix: prices from MT5 EA are keyed WITHOUT slash (e.g. "XAUUSD") but trade.pair
-  // in the DB has a slash ("XAU/USD"). Always try both key forms so liveBid is never undefined.
+  // Profit source priority:
+  //   1. EA's actual unrealizedPL from account.openTrades (MT5 account-currency P&L,
+  //      includes commission/swap, uses real contract spec — most accurate)
+  //   2. Computed from live bid + entry price via pip constants (fallback)
   //
-  // Critical fix: loadOpenTrades() now returns the fresh trades array directly and updates
-  // openTradesRef immediately — we use that return value, not the (potentially stale) ref.
+  // closingForTargetRef lifecycle:
+  //   ADD  when close is triggered
+  //   REMOVE only when the trade is gone from the open-trades list (confirmed gone from DB)
+  //   Never remove in .finally() — doing so causes re-trigger every 2s until EA closes
   useEffect(() => {
     if (!autoTradeEnabled) return
     const id = setInterval(async () => {
-      const trades = await loadOpenTrades()  // returns fresh array, ref already updated
+      const trades = await loadOpenTrades()
+
+      // Remove guard entries for trades that are no longer OPEN in DB
+      // This is the ONLY place we clear the guard — ensures no re-trigger until confirmed closed
+      for (const guardId of [...closingForTargetRef.current]) {
+        if (!trades.some((t: any) => t.id === guardId)) {
+          closingForTargetRef.current.delete(guardId)
+        }
+      }
+
       for (const trade of trades) {
         if (closingForTargetRef.current.has(trade.id)) continue
 
         const pip     = getPipValue(trade.pair)
         const pvpl    = getPipValuePerLot(trade.pair)
-        // Try XAU/USD first, then XAUUSD (EA key format) — handles broker key mismatch
         const pairKey = trade.pair.replace('/', '')
-        const liveBid = pricesRef.current[trade.pair]?.bid ?? pricesRef.current[pairKey]?.bid
         const entry   = trade.entry_price ?? 0
-        const tp      = trade.tp_price    ?? 0
         const lots    = trade.lots        ?? 0
-        if (!entry || !lots || !liveBid) continue
 
-        const pipsGained = trade.direction === 'BUY'
-          ? (liveBid - entry) / pip
-          : (entry - liveBid) / pip
-        const currentProfit = pipsGained * pvpl * lots
-        if (currentProfit <= 0) continue
+        // ── Get current floating profit ──────────────────────────────
+        // Prefer EA's live unrealizedPL (actual MT5 account P&L).
+        // Match by stripped symbol + direction since EA uses no-slash keys.
+        let currentProfit: number | null = null
+        const eaPos = (accountRef.current?.openTrades as any[] | undefined)?.find(p => {
+          const sym = String(p.pair || p.symbol || '').replace('/', '')
+          return sym === pairKey && p.direction === trade.direction
+        })
+        if (eaPos?.unrealizedPL != null) {
+          currentProfit = Number(eaPos.unrealizedPL)
+        } else if (entry && lots) {
+          // Fallback: compute from live bid price
+          const liveBid = pricesRef.current[trade.pair]?.bid ?? pricesRef.current[pairKey]?.bid
+          if (liveBid) {
+            const pipsGained = trade.direction === 'BUY'
+              ? (liveBid - entry) / pip
+              : (entry - liveBid) / pip
+            currentProfit = pipsGained * pvpl * lots
+          }
+        }
 
-        // Priority 1: fixed USD target — closes immediately, overrides % mode
-        if (fixedProfitUsd > 0 && currentProfit >= fixedProfitUsd) {
-          const snapshot = { pair: trade.pair, profit: currentProfit, target: fixedProfitUsd }
-          closingForTargetRef.current.add(trade.id)
-          handleClose(trade)
-            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snapshot.pair} @ $${snapshot.target.toFixed(2)} fixed target (+$${snapshot.profit.toFixed(2)})`, '#00e5b4') })
-            .finally(() => closingForTargetRef.current.delete(trade.id))
+        if (currentProfit == null) {
+          console.debug(`[profit-monitor] ${trade.pair}: no profit data (entry=${entry} lots=${lots} eaPos=${!!eaPos})`)
           continue
         }
 
-        // Priority 2: percentage of expected TP profit
-        if (!tp) continue
+        console.debug(`[profit-monitor] ${trade.pair} ${trade.direction}: $${currentProfit.toFixed(2)} | fixed=${fixedProfitUsd > 0 ? '$'+fixedProfitUsd : 'off'} pct=${profitTargetPct}%`)
+
+        if (currentProfit <= 0) continue
+
+        // Priority 1: fixed USD target — higher priority than %
+        if (fixedProfitUsd > 0 && currentProfit >= fixedProfitUsd) {
+          const snap = { pair: trade.pair, profit: currentProfit, target: fixedProfitUsd }
+          console.log(`[profit-monitor] CLOSE ${snap.pair}: $${snap.profit.toFixed(2)} >= fixed $${snap.target}`)
+          closingForTargetRef.current.add(trade.id)
+          handleClose(trade)
+            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snap.pair} @ $${snap.target.toFixed(2)} fixed target (+$${snap.profit.toFixed(2)})`, '#00e5b4') })
+          continue
+        }
+
+        // Priority 2: % of expected TP profit
+        const tp = trade.tp_price ?? 0
+        if (!tp || !entry || !lots) continue
         const expectedProfit = Math.abs(tp - entry) / pip * pvpl * lots
         if (expectedProfit <= 0) continue
 
         if (currentProfit >= expectedProfit * profitTargetPct / 100) {
-          const snapshot = { pair: trade.pair, profit: currentProfit, pct: profitTargetPct }
+          const snap = { pair: trade.pair, profit: currentProfit, pct: profitTargetPct }
+          console.log(`[profit-monitor] CLOSE ${snap.pair}: $${snap.profit.toFixed(2)} >= ${snap.pct}% of $${expectedProfit.toFixed(2)}`)
           closingForTargetRef.current.add(trade.id)
           handleClose(trade)
-            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snapshot.pair} @ ${snapshot.pct}% target (+$${snapshot.profit.toFixed(2)})`, '#00e5b4') })
-            .finally(() => closingForTargetRef.current.delete(trade.id))
+            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snap.pair} @ ${snap.pct}% target (+$${snap.profit.toFixed(2)})`, '#00e5b4') })
         }
       }
     }, 2000)

@@ -97,7 +97,7 @@ export function useAccount() {
 
   useEffect(() => {
     refresh()
-    const id = setInterval(refresh, 15000)
+    const id = setInterval(refresh, 3000)
     return () => clearInterval(id)
   }, [refresh])
 

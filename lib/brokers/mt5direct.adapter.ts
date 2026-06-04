@@ -244,16 +244,16 @@ export class Mt5DirectBroker implements IBroker {
 
     try {
       const sb = getAdminClient()
+
+      // Resolve the trade's pair → MT5 symbol (strip slash)
+      let symbol = ''
       const { data: row } = await sb
         .from('broker_configs')
-        .select('id, user_id, config')
+        .select('user_id')
         .eq('id', this.config._configId)
         .single()
 
-      if (!row) return { success: false, error: 'Broker config not found' }
-
-      let symbol = ''
-      if (row.user_id) {
+      if (row?.user_id) {
         const { data: trade } = await sb
           .from('trades')
           .select('pair')
@@ -268,15 +268,16 @@ export class Mt5DirectBroker implements IBroker {
         type:      'close',
         symbol,
         createdAt: new Date().toISOString(),
-        expiresAt: Math.floor(Date.now() / 1000) + 600,  // 10-min window (EA polls every 2s)
+        expiresAt: Math.floor(Date.now() / 1000) + 600,
       }
 
-      const pending = (row?.config?.pendingOrders || []) as typeof closeCommand[]
-      pending.push(closeCommand)
-      await sb
-        .from('broker_configs')
-        .update({ config: { ...row.config, pendingOrders: pending } })
-        .eq('id', this.config._configId)
+      // Use atomic RPC to append — avoids read-modify-write race with EA PUSH
+      // which also updates broker_configs.config (including pendingOrders).
+      const { error } = await sb.rpc('append_pending_order', {
+        p_config_id: this.config._configId,
+        p_order:     closeCommand,
+      })
+      if (error) throw new Error(error.message)
 
       return { success: true }
     } catch (e: any) {
