@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| SybexForexAI Balance Sync EA v9.0                                |
+//| SybexForexAI Balance Sync EA v9.2                                |
 //| Posts DIRECTLY to Supabase RPC -- bypasses Vercel entirely.      |
 //| v5 fix: ORDER_FILLING_RETURN (IOC caused all orders to reject).  |
 //| v6 fix: split fast order-poll (2s) from heavy data sync (10s)    |
@@ -16,9 +16,13 @@
 //|   and reports it in the next sync payload as closedPositions.    |
 //|   The server uses this to mark DB trades WIN/LOSS and record      |
 //|   pl_usd — fixing daily-loss tracking for auto-traded sessions.  |
+//| v9.2 update: Profit Target formula matching app logic            |
+//|   Formula: profitCloseAmount = ProfitFixedUsd × (ProfitTargetPct / 100)
+//|   EA now receives both components from PULL and computes the      |
+//|   close threshold itself — identical to app-side calculation.    |
 //+------------------------------------------------------------------+
 #property strict
-#property description "SybexForexAI v9.0 -- closed position P/L reporting"
+#property description "SybexForexAI v9.2 -- profit target formula"
 
 //--- Inputs -----------------------------------------------------------
 input string WebhookToken        = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
@@ -38,9 +42,12 @@ input int    MinHoldSeconds      = 60;   // no BE / trail / decay until trade is
 input int    MaxSpreadPips       = 30;   // skip SL actions if spread exceeds this
 input bool   UseRolloverFilter   = true; // skip actions during broker rollover 21:55-22:05
 
-// v9.1 PROFIT TARGET — closes any position instantly once floating P&L >= this value.
-// 0 = disabled. App setting overrides this input dynamically via PULL response.
-input double ProfitTargetUsd     = 0;
+// v9.2 PROFIT TARGET — formula: profitCloseAmount = ProfitFixedUsd × (ProfitTargetPct / 100)
+// e.g. ProfitFixedUsd=1.00, ProfitTargetPct=50 → close at $0.50 floating profit.
+// Both values are also updated dynamically from app PULL response every 2s.
+// 0 = disabled (ProfitFixedUsd=0 turns off the entire profit target system).
+input double ProfitFixedUsd      = 0;    // base fixed USD target
+input int    ProfitTargetPct     = 75;   // percentage of fixed target to close at
 
 string SYMBOLS[] = {"EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","XAGUSD","USDCAD","USDCHF","NZDUSD","GBPJPY","EURJPY"};
 
@@ -52,8 +59,9 @@ string ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIs
 int    g_totalSymbols    = 0;
 string g_completedJson   = "[]";
 int    g_syncCounter     = 0;
-double g_profitTargetUsd = 0;  // updated from app PULL response; 0 = disabled
-int    g_syncEveryN    = 5;
+double g_profitFixedUsd  = 0;   // updated from app PULL; base USD target
+int    g_profitTargetPct = 75;  // updated from app PULL; % of fixed target
+int    g_syncEveryN      = 5;
 
 //+------------------------------------------------------------------+
 //  v9: Closed Position Tracking                                      |
@@ -457,8 +465,9 @@ int OnInit()
    ArrayResize(g_prevPos, 20);
    SnapshotOpenPositions();
 
-   // v9.1: seed profit target from input (app PULL will override dynamically)
-   g_profitTargetUsd = ProfitTargetUsd;
+   // v9.2: seed profit target from inputs (app PULL overrides dynamically)
+   g_profitFixedUsd  = ProfitFixedUsd;
+   g_profitTargetPct = ProfitTargetPct;
 
    EventSetTimer(OrderPollSeconds);
    Print("SybexForexAI v9.0 started | FillMode=", EnumToString(FillMode),
@@ -478,10 +487,14 @@ void OnTimer()
    // ── Profit Protection (every OrderPollSeconds, no server round-trip)
    RunProfitProtection();
 
-   // ── v9.1 Profit Target: close any position whose floating P&L >= target ──
-   // Runs every OrderPollSeconds (default 2s) directly in MT5 — no browser,
-   // no network call, no app state required. Overrides any delayed app close.
-   if(g_profitTargetUsd > 0)
+   // ── v9.2 Profit Target: close any position whose floating P&L >= close threshold ──
+   // Formula: profitCloseAmount = profitFixedUsd × (profitTargetPct / 100)
+   // e.g. $1.00 fixed × 50% = close at $0.50 floating profit.
+   // Runs every OrderPollSeconds (default 2s) directly in MT5 — no browser dependency.
+   double profitCloseAmount = (g_profitFixedUsd > 0)
+      ? g_profitFixedUsd * g_profitTargetPct / 100.0
+      : 0.0;
+   if(profitCloseAmount > 0)
    {
       for(int i = PositionsTotal()-1; i >= 0; i--)
       {
@@ -489,13 +502,15 @@ void OnTimer()
          if(tkt == 0) continue;
          if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
          double profit = PositionGetDouble(POSITION_PROFIT);
-         if(profit >= g_profitTargetUsd)
+         if(profit >= profitCloseAmount)
          {
             string rawSym = StripSuffix(PositionGetString(POSITION_SYMBOL));
             int    rc     = 0;
             Print("[profit-target] triggered ", rawSym, " #", tkt,
                   " profit=$", DoubleToString(profit, 2),
-                  " >= target=$", DoubleToString(g_profitTargetUsd, 2));
+                  " >= target=$", DoubleToString(profitCloseAmount, 2),
+                  " (fixed=$", DoubleToString(g_profitFixedUsd, 2),
+                  " x ", g_profitTargetPct, "%)");
             if(CloseByTicket(tkt, rawSym, rc))
                Print("[profit-target] CLOSED ", rawSym, " #", tkt);
             else
@@ -573,24 +588,39 @@ string FetchPendingOrders()
    }
    string resp = CharArrayToString(result);
 
-   // v9.1: read profitTargetUsd from PULL response so target survives EA restart
-   // Only act when the key is actually present in the response (JsonNum returns 0
-   // for missing keys, which must not be confused with "app set target to 0").
-   bool hasPtKey = (StringFind(resp, "\"profitTargetUsd\":") >= 0);
-   if(hasPtKey)
+   // v9.2: read profit target components from PULL so EA uses the same formula as the app:
+   //   profitCloseAmount = profitFixedUsd × (profitTargetPct / 100)
+   // Only act when the keys are present — JsonNum returns 0 for absent keys, which must not
+   // be confused with "app explicitly set fixed USD to 0" (= target disabled).
+   bool hasFixedKey = (StringFind(resp, "\"profitFixedUsd\":") >= 0);
+   bool hasPctKey   = (StringFind(resp, "\"profitTargetPct\":") >= 0);
+   if(hasFixedKey)
    {
-      double pt = JsonNum(resp, "profitTargetUsd");
-      if(pt > 0 && pt != g_profitTargetUsd)
+      double newFixed = JsonNum(resp, "profitFixedUsd");
+      if(newFixed != g_profitFixedUsd)
       {
-         g_profitTargetUsd = pt;
-         Print("[profit-target] target updated from app: $", DoubleToString(pt, 2));
+         g_profitFixedUsd = newFixed;
+         Print("[profit-target] fixedUsd updated from app: $", DoubleToString(newFixed, 2));
       }
-      else if(pt == 0 && g_profitTargetUsd > 0 && ProfitTargetUsd == 0)
+   }
+   if(hasPctKey)
+   {
+      int newPct = (int)JsonNum(resp, "profitTargetPct");
+      if(newPct > 0 && newPct != g_profitTargetPct)
       {
-         // App explicitly cleared the target (and no input override)
-         g_profitTargetUsd = 0;
-         Print("[profit-target] target cleared by app");
+         g_profitTargetPct = newPct;
+         Print("[profit-target] targetPct updated from app: ", newPct, "%");
       }
+   }
+   // Log effective close threshold whenever either component changes
+   if(hasFixedKey || hasPctKey)
+   {
+      double eff = (g_profitFixedUsd > 0) ? g_profitFixedUsd * g_profitTargetPct / 100.0 : 0.0;
+      if(eff > 0)
+         Print("[profit-target] close threshold: $", DoubleToString(eff, 2),
+               " ($", DoubleToString(g_profitFixedUsd, 2), " x ", g_profitTargetPct, "%)");
+      else
+         Print("[profit-target] disabled (fixedUsd=0)");
    }
 
    return resp;

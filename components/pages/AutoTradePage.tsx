@@ -255,13 +255,18 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => { try { localStorage.setItem('at_sections',  JSON.stringify([...autoSections])) } catch {} }, [autoSections])
   useEffect(() => { try { localStorage.setItem('at_pairs',     JSON.stringify([...autoPairs]))    } catch {} }, [autoPairs])
 
-  // Sync computed profit target to EA — fires whenever either fixedProfitUsd or profitTargetPct changes.
-  // EA monitors floating profit against this exact dollar amount, so we send the resolved value.
+  // Sync profit target to EA — fires whenever either component changes.
+  // Sends both components (fixedUsd, targetPct) and the precomputed close amount so the EA
+  // can apply the formula itself: profitCloseAmount = fixedUsd × (targetPct / 100)
   useEffect(() => {
     const profitCloseAmount = fixedProfitUsd > 0 ? fixedProfitUsd * profitTargetPct / 100 : 0
     authFetch('/api/broker/profit-target', {
       method: 'POST',
-      body: JSON.stringify({ value: profitCloseAmount }),
+      body: JSON.stringify({
+        value:     profitCloseAmount,
+        fixedUsd:  fixedProfitUsd,
+        targetPct: profitTargetPct,
+      }),
     }).catch(() => {})
   }, [fixedProfitUsd, profitTargetPct])
 
