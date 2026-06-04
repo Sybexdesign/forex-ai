@@ -59,9 +59,11 @@ string ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIs
 int    g_totalSymbols    = 0;
 string g_completedJson   = "[]";
 int    g_syncCounter     = 0;
+int    g_pollCounter     = 0;   // counts 1s ticks; PULL runs every g_pollEveryN ticks
+int    g_pollEveryN      = 2;   // = OrderPollSeconds (recalc in OnInit)
 double g_profitFixedUsd  = 0;   // updated from app PULL; base USD target
 int    g_profitTargetPct = 75;  // updated from app PULL; % of fixed target
-int    g_syncEveryN      = 5;
+int    g_syncEveryN      = 10;  // = DataSyncSeconds (recalc in OnInit)
 
 //+------------------------------------------------------------------+
 //  v9: Closed Position Tracking                                      |
@@ -454,7 +456,12 @@ void RunProfitProtection()
 int OnInit()
 {
    g_totalSymbols = ArraySize(SYMBOLS);
-   g_syncEveryN   = MathMax(1, DataSyncSeconds / OrderPollSeconds);
+   // Timer fires every 1s. Profit target checks every tick.
+   // PULL runs every g_pollEveryN ticks (= OrderPollSeconds).
+   // Data sync runs every g_syncEveryN ticks (= DataSyncSeconds).
+   g_pollEveryN   = MathMax(1, OrderPollSeconds);
+   g_syncEveryN   = MathMax(1, DataSyncSeconds);
+   g_pollCounter  = 0;
    g_protCount    = 0;
    g_protCapacity = 0;
    ArrayResize(g_prot, 20);
@@ -469,8 +476,8 @@ int OnInit()
    g_profitFixedUsd  = ProfitFixedUsd;
    g_profitTargetPct = ProfitTargetPct;
 
-   EventSetTimer(OrderPollSeconds);
-   Print("SybexForexAI v9.0 started | FillMode=", EnumToString(FillMode),
+   EventSetTimer(1);  // 1s tick — profit target checks every second, not every 2s
+   Print("SybexForexAI v9.2 started | FillMode=", EnumToString(FillMode),
          " | OrderPoll=", OrderPollSeconds, "s | DataSync=", DataSyncSeconds, "s",
          " | Suffix='", SymbolSuffix, "'",
          " | MinHold=", MinHoldSeconds, "s",
@@ -523,17 +530,23 @@ void OnTimer()
    // Must run before SnapshotOpenPositions to capture the disappearance
    g_closedJson = BuildClosedPositionsJSON();
 
-   // ── Fast path: always check for pending orders ──────────────────
-   string resp = FetchPendingOrders();
-   if(StringLen(resp) > 10)
+   // ── Order poll: every OrderPollSeconds (not every 1s tick) ──────
+   // Profit target check above runs every tick; PULL is gated here.
+   g_pollCounter++;
+   if(g_pollCounter >= g_pollEveryN)
    {
-      int cnt = 0, sp = 0;
-      while(StringFind(resp, "\"id\":", sp) >= 0) { sp = StringFind(resp,"\"id\":",sp)+1; cnt++; }
-      if(cnt > 0)
+      g_pollCounter = 0;
+      string resp = FetchPendingOrders();
+      if(StringLen(resp) > 10)
       {
-         Print("SybexForexAI v9.0: ", cnt, " pending command(s) -- executing...");
-         g_completedJson = ExecuteOrders(resp);
-         Print("SybexForexAI v9.0: completedOrders=", g_completedJson);
+         int cnt = 0, sp = 0;
+         while(StringFind(resp, "\"id\":", sp) >= 0) { sp = StringFind(resp,"\"id\":",sp)+1; cnt++; }
+         if(cnt > 0)
+         {
+            Print("SybexForexAI v9.2: ", cnt, " pending command(s) -- executing...");
+            g_completedJson = ExecuteOrders(resp);
+            Print("SybexForexAI v9.2: completedOrders=", g_completedJson);
+         }
       }
    }
 
@@ -545,7 +558,7 @@ void OnTimer()
    if(g_syncCounter >= g_syncEveryN || ordersJustFilled || hadClosures)
    {
       if(hadClosures)
-         Print("SybexForexAI v9.0: reporting closed positions: ", g_closedJson);
+         Print("SybexForexAI v9.2: reporting closed positions: ", g_closedJson);
 
       g_syncCounter   = 0;
       SendDataToApp();
