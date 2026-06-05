@@ -221,12 +221,12 @@ export default function StrategyPage({ strategy, onSave }: StrategyPageProps) {
         <Panel title="TRADE PARAMETERS">
           <div style={{ padding: '14px 18px 4px' }}>
             <SliderRow
-              label="Take profit" value={local.tpPips} min={10} max={200} step={5} unit=" pips"
+              label="Take profit" value={local.tpPips} min={10} max={200} step={1} unit=" pips"
               onChange={v => set('tpPips', v)} color="#00ff87"
               description="Target pips per trade"
             />
             <SliderRow
-              label="Stop loss" value={local.slPips} min={5} max={80} step={5} unit=" pips"
+              label="Stop loss" value={local.slPips} min={5} max={80} step={1} unit=" pips"
               onChange={v => set('slPips', v)} color="#ff3056"
               description="Max loss pips before auto-close"
             />
