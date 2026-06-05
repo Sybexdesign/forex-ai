@@ -46,6 +46,7 @@ function Pager({ page, total, onPage }: { page: number; total: number; onPage: (
 
 interface AutoTradePageProps {
   strategy: StrategySettings
+  onSaveStrategy: (s: StrategySettings) => Promise<unknown> | void
   account: any
   onToast: (msg: string, color?: string) => void
   newsInWindow?: boolean
@@ -71,7 +72,7 @@ interface AutoTradePageProps {
   watchlist: string[]
 }
 
-export default function AutoTradePage({ strategy, account, onToast, newsInWindow = false, userId, prices = {}, onRefreshAccount, onRefreshTrades, scanner, timeframe, setTimeframe, watchlist: rawWatchlist }: AutoTradePageProps) {
+export default function AutoTradePage({ strategy, onSaveStrategy, account, onToast, newsInWindow = false, userId, prices = {}, onRefreshAccount, onRefreshTrades, scanner, timeframe, setTimeframe, watchlist: rawWatchlist }: AutoTradePageProps) {
   // Always restrict to metals — defensive filter in case AppShell passes extra pairs
   const watchlist = rawWatchlist.filter(p => METALS_ONLY.includes(p)).length
     ? rawWatchlist.filter(p => METALS_ONLY.includes(p))
@@ -100,9 +101,10 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   const [fixedProfitUsd, setFixedProfitUsd] = useState<number>(() => {
     try { return parseFloat(localStorage.getItem('at_fixedUsd') || '0') } catch { return 0 }
   })
-  const [maxConcurrentTrades, setMaxConcurrentTrades] = useState<number>(() => {
-    try { return parseInt(localStorage.getItem('at_maxTrades') || '2', 10) } catch { return 2 }
-  })
+  // Max concurrent trades is sourced from strategy.maxPositions (single source of truth,
+  // persisted to Supabase via /api/strategy). The button row below writes back via onSaveStrategy.
+  const maxConcurrentTrades = strategy.maxPositions
+  const setMaxConcurrentTrades = (n: number) => onSaveStrategy({ ...strategy, maxPositions: n })
   const [autoSections, setAutoSections] = useState<Set<string>>(() => {
     try {
       const s = localStorage.getItem('at_sections')
@@ -252,7 +254,6 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => { try { localStorage.setItem('at_enabled',   String(autoTradeEnabled))       } catch {} }, [autoTradeEnabled])
   useEffect(() => { try { localStorage.setItem('at_targetPct', String(profitTargetPct))         } catch {} }, [profitTargetPct])
   useEffect(() => { try { localStorage.setItem('at_fixedUsd',  String(fixedProfitUsd))          } catch {} }, [fixedProfitUsd])
-  useEffect(() => { try { localStorage.setItem('at_maxTrades', String(maxConcurrentTrades))     } catch {} }, [maxConcurrentTrades])
   useEffect(() => { try { localStorage.setItem('at_sections',  JSON.stringify([...autoSections])) } catch {} }, [autoSections])
   useEffect(() => { try { localStorage.setItem('at_pairs',     JSON.stringify([...autoPairs]))    } catch {} }, [autoPairs])
 
@@ -321,9 +322,11 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     try {
       const pip = getPipValue(sig.pair)
       // Derive SL/TP in pips from the signal's actual price levels so the broker
-      // places stops exactly where the card displayed them, and lot size matches.
-      const scalpSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
-      const scalpTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
+      // places stops where the card displayed them, but clamp by the user's
+      // configured strategy.slPips/tpPips so the AI can never widen the user's
+      // risk beyond their chosen cap.
+      const scalpSlPips = sig.sl !== sig.entry ? Math.min(Math.abs(sig.entry - sig.sl) / pip, strategy.slPips) : strategy.slPips
+      const scalpTpPips = sig.tp !== sig.entry ? Math.min(Math.abs(sig.entry - sig.tp) / pip, strategy.tpPips) : strategy.tpPips
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
@@ -366,8 +369,9 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
       const mirrorSl  = 2 * sig.entry - sig.sl
       const mirrorTp  = 2 * sig.entry - sig.tp
       const pip = getPipValue(sig.pair)
-      const slPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
-      const tpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
+      // Clamp derived pips by the user's strategy cap (see Fix 3 / handleScalpOrder).
+      const slPips = sig.sl !== sig.entry ? Math.min(Math.abs(sig.entry - sig.sl) / pip, strategy.slPips) : strategy.slPips
+      const tpPips = sig.tp !== sig.entry ? Math.min(Math.abs(sig.entry - sig.tp) / pip, strategy.tpPips) : strategy.tpPips
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
@@ -406,8 +410,9 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   // Shared order placement for auto-trader — no UI loading state side-effects
   async function autoPlaceOrder(sig: ScalpSignal, isMirror: boolean): Promise<boolean> {
     const pip = getPipValue(sig.pair)
-    const slPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
-    const tpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
+    // Clamp derived pips by the user's strategy cap (see Fix 3 / handleScalpOrder).
+    const slPips = sig.sl !== sig.entry ? Math.min(Math.abs(sig.entry - sig.sl) / pip, strategy.slPips) : strategy.slPips
+    const tpPips = sig.tp !== sig.entry ? Math.min(Math.abs(sig.entry - sig.tp) / pip, strategy.tpPips) : strategy.tpPips
     const direction = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
     const prefix    = isMirror ? 'mirror' : 'scalp'
     const body: Record<string, any> = {
@@ -471,6 +476,8 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         if (!sig || sig.direction === 'HOLD' || sig.blocked) continue
         if (!autoPairs.has(pair)) continue
         if (now > sig.expiresAt) continue
+        // Honour user's minimum signal strength — skip weak signals on the browser auto path too.
+        if (sig.confidence < strategy.minStrength) continue
         for (const section of ['scalp', 'mirror']) {
           if (!autoSections.has(section)) continue
           if (localOpenCount >= maxConcurrentTrades) continue
@@ -499,7 +506,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         }
       }
     })()
-  }, [scalpSignals, autoTradeEnabled, maxConcurrentTrades]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [scalpSignals, autoTradeEnabled, strategy.maxPositions, strategy.minStrength]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Profit target monitoring — 2s interval
   // Close threshold = fixedProfitUsd × profitTargetPct / 100

@@ -424,6 +424,7 @@ export default function AppShell() {
           {page === 'auto' && (
             <AutoTradePage
               strategy={strategy} account={account} onToast={addToast}
+              onSaveStrategy={handleSaveStrategy}
               newsInWindow={news?.hasHighImpactInWindow || false}
               userId={user?.id} prices={prices}
               onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades}

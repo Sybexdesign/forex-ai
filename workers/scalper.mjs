@@ -5,7 +5,7 @@
  * - 10-second polling across XAU/USD and XAG/USD (concurrent tick fetch + pre-filter)
  * - Breakout strategy 24/7 for metals — pre-filter (ADX>25 + BB squeeze) guards quality
  * - Two-stage scan: fast indicator pre-filter → Claude signal only when needed
- * - Risk guards: 1% max risk, 3% daily loss limit, MAX_CONCURRENT_TRADES (default 3) open positions
+ * - Risk guards: live strategy pulled every 5 min — riskPct, maxLoss, maxPositions, minStrength, SL/TP all driven from /api/strategy
  * - WORKER_MODE=paper  → Telegram alerts + Supabase log (no real orders)
  * - WORKER_MODE=live   → real OANDA orders + alerts + log
  * - 15-min alert cooldown per pair+direction
@@ -21,16 +21,34 @@ const SUPABASE_URL   = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPAB
 const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY
 const WORKER_MODE    = (process.env.WORKER_MODE || 'paper').toLowerCase() // 'paper' | 'live'
 const WORKER_USER_ID = process.env.WORKER_USER_ID  // optional: Supabase user ID for logging
-const MAX_CONCURRENT_TRADES = parseInt(process.env.MAX_CONCURRENT_TRADES || '3', 10)
 
 const POLL_MS          = 10_000       // 10 s per sweep
 const SIG_COOLDOWN_MS  = 60_000       // 1 min between Claude calls per pair
 const ALERT_COOL_MS    = 15 * 60_000  // 15 min per pair+direction alert
 const RISK_CACHE_MS    = 2  * 60_000  // 2 min account state cache
+const STRATEGY_REFRESH_MS = 5 * 60_000  // re-pull live strategy every 5 min
 const HEARTBEAT_MS     = 30 * 60_000
 const FETCH_TIMEOUT_MS = 45_000       // Claude API can take 10-15 s
 const MAX_SIG_BATCH    = 3            // max concurrent Claude calls per sweep
-const CONFIDENCE_MIN   = 70           // minimum confidence to alert/trade
+
+// Live strategy snapshot, refreshed every STRATEGY_REFRESH_MS from /api/strategy.
+// Defaults mirror DEFAULT_STRATEGY in lib/supabase.ts so the worker has sensible
+// values before the first fetch completes (and if the fetch ever fails).
+let liveStrategy = {
+  style: 'Day Trader',
+  riskPct: 1,
+  maxLoss: 3,
+  maxPositions: 2,
+  minStrength: 65,
+  tpPips: 50,
+  slPips: 25,
+  watchlist: ['XAU/USD', 'XAG/USD'],
+  sessionStart: 0,
+  sessionEnd: 24,
+  hardDailyStop: true,
+  hardNews: true,
+  demoLock: false,
+}
 
 // ── Pairs + Strategy Defaults ─────────────────────────────────────────────────
 
@@ -417,6 +435,19 @@ async function isHTFAligned(pair, direction) {
   }
 }
 
+async function loadStrategy() {
+  if (!WORKER_USER_ID) return  // no user → keep defaults
+  try {
+    const data = await apiFetch(`/api/strategy?userId=${encodeURIComponent(WORKER_USER_ID)}`)
+    if (data?.settings && typeof data.settings === 'object') {
+      liveStrategy = { ...liveStrategy, ...data.settings }
+      console.log(`[strategy] loaded — minStrength=${liveStrategy.minStrength}% riskPct=${liveStrategy.riskPct}% SL=${liveStrategy.slPips}p TP=${liveStrategy.tpPips}p maxPos=${liveStrategy.maxPositions}`)
+    }
+  } catch (e) {
+    console.warn('[strategy] fetch failed — using cached values:', e.message)
+  }
+}
+
 async function fetchRiskState() {
   if (cachedRisk && Date.now() - riskCachedAt < RISK_CACHE_MS) return cachedRisk
   const acct      = await apiFetch('/api/account')
@@ -432,20 +463,21 @@ async function fetchRiskState() {
 }
 
 async function placeOrder(pair, direction, signal) {
-  const slPips = toPips(pair, signal.entry - signal.sl)
-  const tpPips = toPips(pair, signal.tp   - signal.entry)
+  // Send the full live strategy so runRiskGuards() in lib/risk.ts can enforce
+  // maxPositions, maxLoss, hardDailyStop, hardNews, and session times — not just
+  // sizing/SL/TP. Sized off the user's configured riskPct, not a hardcoded 1%.
   return apiFetch('/api/orders', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({
       pair,
       direction,
-      strategy:            { riskPct: 1, slPips, tpPips },
+      strategy:            liveStrategy,
       aiConfidence:        signal.confidence,
       checklistScore:      (signal.reasons || []).length,
       currentPrice:        signal.entry,
       userId:              WORKER_USER_ID || undefined,
-      maxConcurrentTrades: MAX_CONCURRENT_TRADES,
+      maxConcurrentTrades: liveStrategy.maxPositions,
     }),
   })
 }
@@ -534,7 +566,7 @@ async function processSignal(pair, tick, strategy, session, direction) {
     }).catch(() => {})
   }
 
-  if (dir === 'HOLD' || conf < CONFIDENCE_MIN) return
+  if (dir === 'HOLD' || conf < liveStrategy.minStrength) return
 
   // Hard block: never act on simulated data in live mode
   if (tick.simulated) {
@@ -573,8 +605,8 @@ async function processSignal(pair, tick, strategy, session, direction) {
             haltNotified = true
             await tgSend('🛑 <b>Daily loss limit reached (3%)</b> — trading halted for today.\nWorker still scanning and alerting in paper mode.')
           }
-        } else if (risk.openCount >= MAX_CONCURRENT_TRADES) {
-          console.log(`[risk] ${risk.openCount}/${MAX_CONCURRENT_TRADES} trades open — skipping order`)
+        } else if (risk.openCount >= liveStrategy.maxPositions) {
+          console.log(`[risk] ${risk.openCount}/${liveStrategy.maxPositions} trades open — skipping order`)
         } else {
           try {
             const result = await placeOrder(pair, dir, signal)
@@ -815,7 +847,10 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   console.log(`[worker] Mode   : ${WORKER_MODE.toUpperCase()}`)
   console.log(`[worker] Target : ${BASE_URL}`)
   console.log(`[worker] Pairs  : ${PAIRS.join(' | ')}`)
-  console.log(`[worker] Poll   : ${POLL_MS / 1000}s | Alert threshold: ≥${CONFIDENCE_MIN}%`)
+  // Initial strategy pull before the first sweep so the very first signal honours user settings
+  await loadStrategy()
+  setInterval(loadStrategy, STRATEGY_REFRESH_MS)
+  console.log(`[worker] Poll   : ${POLL_MS / 1000}s | Alert threshold: ≥${liveStrategy.minStrength}%`)
 
   scheduleMidnightRestart()
   setInterval(sendHeartbeat, HEARTBEAT_MS)
@@ -826,11 +861,11 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
     `Interval : 10 seconds`,
     `Pairs    : ${PAIRS.join(', ')}`,
     `Strategy : session-aware rotation`,
-    `Threshold: confidence ≥ ${CONFIDENCE_MIN}%`,
+    `Threshold: confidence ≥ ${liveStrategy.minStrength}%`,
     `⏱ ${new Date().toUTCString()}`,
   ].join('\n')
   await tgSend(startMsg)
-  wlog('info', `Worker started — mode: ${WORKER_MODE.toUpperCase()}`, { metadata: { mode: WORKER_MODE, pairs: PAIRS, threshold: CONFIDENCE_MIN } })
+  wlog('info', `Worker started — mode: ${WORKER_MODE.toUpperCase()}`, { metadata: { mode: WORKER_MODE, pairs: PAIRS, threshold: liveStrategy.minStrength } })
 
   // Main polling loop — honours 10-second interval accounting for sweep duration
   while (running) {
