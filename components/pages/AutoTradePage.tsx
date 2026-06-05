@@ -286,6 +286,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
         userId,
         signalId: signal.id,
         signalTimestamp: signal.scannedAt,
+        maxConcurrentTrades,
       }),
     })
     return res.json()
@@ -335,6 +336,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           userId,
           signalId:        `scalp-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
           signalTimestamp: new Date(sig.fetchedAt).toISOString(),
+          maxConcurrentTrades,
         }),
       }).then(r => r.json())
 
@@ -379,6 +381,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
           signalId:       `mirror-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
           mirrorSl,
           mirrorTp,
+          maxConcurrentTrades,
         }),
       }).then(r => r.json())
 
