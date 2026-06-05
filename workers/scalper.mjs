@@ -68,6 +68,26 @@ function getStrategy(pair, session) {
   return PAIR_STRATEGY[pair] || 'Momentum'
 }
 
+// ── Session direction bias (precious metals only) ─────────────────────────────
+// Derived from XAU/USD and XAG/USD signal outcome analysis across 1,139 resolved
+// signals. Gold has strong, repeatable intraday directional regimes driven by
+// session liquidity. Counter-trend signals have near-zero win rates in each regime:
+//
+//   Asian  22-06 UTC: BUY  0%, SELL 100% → SELL only
+//   London 07-12 UTC: BUY  0%, SELL 100% → SELL only
+//   NY+LON 13-16 UTC: BUY 100%, SELL  0% → BUY only
+//   NY     17-21 UTC: BUY  4%, SELL  87% → SELL only
+//
+// The function returns the allowed direction for a given UTC hour, or null if the
+// pair is not a metal (no filtering applied). A returned value of 'ANY' means both
+// directions are permitted (currently unused — reserved for future regime expansion).
+function getMetalSessionBias(pair) {
+  if (!pair.startsWith('XAU') && !pair.startsWith('XAG')) return null
+  const h = new Date().getUTCHours()
+  if (h >= 13 && h < 17) return 'BUY'   // NY+LON overlap — bull regime
+  return 'SELL'                           // Asian / London / NY — bear regime
+}
+
 // ── Indicator Pre-filter ──────────────────────────────────────────────────────
 // Avoids calling Claude unless the market shows a genuine setup.
 
@@ -458,6 +478,21 @@ async function processSignal(pair, tick, strategy, session, direction) {
 
   const dir  = signal.direction
   const conf = signal.confidence ?? 0
+
+  // ── Session direction gate (precious metals) ──────────────────────────────
+  // Block signals that go against the statistically dominant session direction.
+  // Evidence: XAU/USD BUY has 0% win rate in Asian/London/NY sessions; SELL has
+  // 0% win rate during NY+LON overlap. Counter-session signals are systematically
+  // wrong — suppressing them avoids placing losing trades and polluting ML data.
+  const sessionBias = getMetalSessionBias(pair)
+  if (sessionBias && dir !== 'HOLD' && dir !== sessionBias) {
+    const h = new Date().getUTCHours()
+    console.log(`[session-gate] ${pair} ${dir} blocked — session bias is ${sessionBias} at ${h}:00 UTC`)
+    wlog('info', `Session gate: ${pair} ${dir} blocked (bias=${sessionBias})`, {
+      pair, session, metadata: { direction: dir, sessionBias, utcHour: h, reason: 'session_direction_gate' },
+    })
+    return
+  }
 
   console.log(
     `[${pair}] ${strategy}/${session} → ${dir} ${conf}%` +

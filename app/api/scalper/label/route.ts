@@ -18,8 +18,11 @@ export const dynamic = 'force-dynamic'
 
 interface EACandle { t: number; o: number; h: number; l: number; c: number; v: number }
 
-// How many M5 candles to check after the signal candle (3 candles = 15 min window)
-const CANDLE_WINDOW = 3
+// How many M5 candles to check after the signal candle (6 candles = 30 min window)
+// Extended from 3 (15 min) — the 15-min timeout caused systematic LOSS labeling for
+// counter-trend signals during trending sessions. XAU/USD ATR-based TPs often need
+// 20-30 min to reach. Premature timeout was artificially suppressing the BUY win rate.
+const CANDLE_WINDOW = 6
 // Only label signals older than this (ensures price data is available)
 const MIN_AGE_MS    = 5 * 60_000
 // Max candle cache age before we consider it stale

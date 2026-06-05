@@ -88,15 +88,29 @@ print(f"✓ Removed {removed} contaminated signals (inverted-direction era)")
 print(f"✓ Clean training set: {len(all_rows)} rows (May 15 + June 1 14:00+)")
 
 def add_session_feature(row: dict) -> dict:
-    """Add hour_utc and is_session_active features derived from created_at."""
+    """
+    Add 4-bucket session one-hot features derived from created_at UTC hour.
+    Session regimes derived from XAU/USD win-rate audit (1,139 resolved signals):
+      Asian  22-06 UTC: BUY 0%,  SELL 100% — bear regime
+      London 07-12 UTC: BUY 0%,  SELL 100% — bear regime
+      NY+LON 13-16 UTC: BUY 100%, SELL 0%  — bull regime
+      NY     17-21 UTC: BUY 4%,  SELL 87%  — bear regime
+    Binary in_session was too coarse to capture these distinct regimes.
+    """
     try:
         dt   = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
         hour = dt.astimezone(timezone.utc).hour
-        row['_hour']   = hour
-        row['_in_session'] = 1 if (hour < 5 or hour >= 19) else 0  # active = 19-04 UTC
+        row['_hour'] = hour
     except Exception:
-        row['_hour']   = 12
-        row['_in_session'] = 0
+        hour = 12
+        row['_hour'] = 12
+
+    row['_session_asian']  = 1 if (hour >= 22 or hour < 7)  else 0
+    row['_session_london'] = 1 if (7  <= hour < 13)         else 0
+    row['_session_nylon']  = 1 if (13 <= hour < 17)         else 0
+    row['_session_ny']     = 1 if (17 <= hour < 22)         else 0
+    # Keep legacy in_session for backwards compat with existing model (will be ignored if not in features)
+    row['_in_session'] = 1 if (hour < 5 or hour >= 19) else 0
     return row
 
 all_rows = [add_session_feature(r) for r in all_rows]
@@ -172,7 +186,11 @@ def extract_features(row):
         'bb_position':       (price - bb_lower) / bb_range if bb_range > 0 else 0.5,
         'adx_trending':      1 if (snap.get('adx', 20) or 20) > 25 else 0,
         'pressure_imbalance':buy_pres - 0.5,
-        'in_session':        row.get('_in_session', 0),
+        # 4-bucket session one-hot (replaces binary in_session)
+        'session_asian':     row.get('_session_asian', 0),
+        'session_london':    row.get('_session_london', 0),
+        'session_nylon':     row.get('_session_nylon', 0),
+        'session_ny':        row.get('_session_ny', 0),
         'confidence':        row.get('confidence', 50) or 50,
         'direction_buy':     1 if row.get('direction') == 'BUY' else 0,
     }

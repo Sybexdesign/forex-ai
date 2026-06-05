@@ -229,6 +229,11 @@ def extract_features(req: PredictRequest) -> dict:
         except Exception:
             pass
 
+    session_asian  = 1 if (hour >= 22 or hour < 7)  else 0
+    session_london = 1 if (7  <= hour < 13)          else 0
+    session_nylon  = 1 if (13 <= hour < 17)          else 0
+    session_ny     = 1 if (17 <= hour < 22)          else 0
+
     ema20     = ind.get('ema20', price) or price
     ema50     = ind.get('ema50', price) or price
     macd_hist = ind.get('macdHistogram', 0) or 0
@@ -257,7 +262,11 @@ def extract_features(req: PredictRequest) -> dict:
         'bb_position':       (price - bb_lower) / bb_range if bb_range > 0 else 0.5,
         'adx_trending':      1 if (ind.get('adx', 20) or 20) > 25 else 0,
         'pressure_imbalance':buy_pres - 0.5,
-        'in_session':        1 if (hour < 5 or hour >= 19) else 0,
+        # 4-bucket session one-hot — must match train.py exactly
+        'session_asian':     session_asian,
+        'session_london':    session_london,
+        'session_nylon':     session_nylon,
+        'session_ny':        session_ny,
         'confidence':        req.confidence or 50,
         'direction_buy':     1 if req.direction == 'BUY' else 0,
     }
