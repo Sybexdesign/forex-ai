@@ -65,6 +65,10 @@ export class Mt5DirectBroker implements IBroker {
       openTradeCount: 0,
       currency:       this.config.currency || 'USD',
       nav:            equity,
+      // Surface the EA's last-push timestamp so callers can detect a disconnected EA.
+      // EA pushes balance every ~30s; anything older than BALANCE_TTL (5 min) means
+      // the EA is likely down or MT5 is closed and trades MUST NOT be placed.
+      lastSyncAt:     this.config.updatedAt,
     }
   }
 

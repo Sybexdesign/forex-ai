@@ -27,6 +27,13 @@ export interface AccountSummary {
   openTradeCount: number
   currency: string
   nav: number
+  /**
+   * ISO timestamp of the most recent broker-side data push that produced this balance.
+   * Set by adapters whose balance is pushed asynchronously (e.g. MT5 Direct EA webhook).
+   * Live-API adapters (OANDA, Capital) may omit this — the balance is always fresh.
+   * Callers can use it to detect a disconnected source and block trading on stale data.
+   */
+  lastSyncAt?: string
 }
 
 export interface OpenTrade {

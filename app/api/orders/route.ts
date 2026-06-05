@@ -53,6 +53,7 @@ export async function POST(req: NextRequest) {
     let tradingDays = 0
     let maxDailyPLEver = 0
     let brokerSynced = false
+    let lastSyncAt: string | undefined
 
     try {
       const [trades, account] = await Promise.all([broker.getOpenTrades(), broker.getAccountSummary()])
@@ -60,7 +61,25 @@ export async function POST(req: NextRequest) {
       balance      = account.balance
       equity       = account.nav ?? account.balance
       brokerSynced = balance > 0
+      lastSyncAt   = account.lastSyncAt
     } catch { /* use defaults if broker fails */ }
+
+    // ─── Broker data staleness guard (MT5 Direct / Exness) ───────────────
+    // Adapters that receive balance asynchronously via webhook (the MT5 EA pushes
+    // every ~30s) populate lastSyncAt. If the most recent push is >5 min old the
+    // EA is almost certainly disconnected — block the order rather than trade on
+    // a stale balance that doesn't reflect the live account.
+    if (lastSyncAt) {
+      const syncAgeMs = Date.now() - new Date(lastSyncAt).getTime()
+      const STALE_THRESHOLD_MS = 5 * 60_000
+      if (syncAgeMs > STALE_THRESHOLD_MS) {
+        const ageMin = Math.round(syncAgeMs / 60_000)
+        const reason = `Broker data stale — last EA sync ${ageMin} min ago (threshold ${STALE_THRESHOLD_MS / 60_000} min). Check MT5/EA is running before trading.`
+        console.warn(`[orders] STALE BROKER DATA — ${broker.name} last sync ${ageMin} min ago, blocking ${pair} ${direction}`)
+        await alertOrderBlocked({ pair, direction, reason })
+        return NextResponse.json({ success: false, blocked: true, reasons: [reason] }, { status: 422 })
+      }
+    }
 
     // ─── Account protection: equity ratio guard ───────────────────────────
     // Block new trades if floating losses have consumed more than 25% of balance.
@@ -215,6 +234,15 @@ export async function POST(req: NextRequest) {
     const lots = broker.calcPositionSize(balance, strategy.riskPct, strategy.slPips, pair)
     if (!lots || lots <= 0) {
       return NextResponse.json({ success: false, blocked: true, reasons: ['Position size calculated as 0 — check balance, risk % and SL pips in Strategy settings'] }, { status: 422 })
+    }
+    // Explicit pre-fire log so it's impossible to miss when a real order is about
+    // to hit a live account. Same line format on demo so the operator can grep
+    // either trail. ACCOUNT_TYPE comes from env — set ACCOUNT_TYPE=live in prod.
+    const accountType = (process.env.ACCOUNT_TYPE || 'demo').toLowerCase()
+    if (accountType === 'live') {
+      console.warn(`[orders] LIVE ORDER placing — pair=${pair} direction=${direction} lots=${lots} sl=${strategy.slPips}p tp=${strategy.tpPips}p balance=$${balance.toFixed(2)} broker=${broker.name}`)
+    } else {
+      console.log(`[orders] DEMO order placing — pair=${pair} direction=${direction} lots=${lots} sl=${strategy.slPips}p tp=${strategy.tpPips}p balance=$${balance.toFixed(2)} broker=${broker.name}`)
     }
     const orderResult = await broker.placeOrder({
       pair, direction, lots,

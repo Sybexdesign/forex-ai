@@ -1,6 +1,7 @@
 // app/api/broker-config/route.ts — CRUD for per-user broker configurations
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
+import { resetBroker } from '@/lib/brokers'
 
 function userClient(token: string) {
   return createClient(
@@ -51,6 +52,10 @@ export async function POST(req: NextRequest) {
     if (config && !hasOnlyMasked(config)) updatePayload.config = config
     const { data, error } = await sb.from('broker_configs').update(updatePayload).eq('id', id).select().single()
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+    // Drop the env-default broker singleton on any active-flag change so subsequent
+    // tokenless requests rebuild fresh and never serve the old account's cached
+    // adapter instance. (The JWT path already rebuilds per request.)
+    if (is_active !== undefined) resetBroker()
     return NextResponse.json({ config: data })
   }
 
@@ -59,6 +64,7 @@ export async function POST(req: NextRequest) {
     user_id: user.id, broker_type, label, config: config || {}, is_active: is_active ?? false,
   }).select().single()
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+  if (is_active) resetBroker()
   return NextResponse.json({ config: data })
 }
 

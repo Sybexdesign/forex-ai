@@ -21,6 +21,12 @@ const SUPABASE_URL   = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPAB
 const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY
 const WORKER_MODE    = (process.env.WORKER_MODE || 'paper').toLowerCase() // 'paper' | 'live'
 const WORKER_USER_ID = process.env.WORKER_USER_ID  // optional: Supabase user ID for logging
+// Explicit demo/live tag for the connected account. The worker honours WORKER_MODE
+// to decide whether to actually place orders, but ACCOUNT_TYPE is a separate operator
+// signal showing whether the broker_configs row targets a demo or live account.
+// Surfaced in every order log + startup banner so it's impossible to accidentally
+// route live signals to a live account thinking it was demo.
+const ACCOUNT_TYPE = (process.env.ACCOUNT_TYPE || 'demo').toLowerCase()
 // User-impersonation JWT (sub = WORKER_USER_ID, role = 'authenticated'). When set,
 // every apiFetch sends it as Authorization: Bearer …, so /api/account and /api/orders
 // resolve the correct per-user broker_configs row via getBroker(authToken) in
@@ -31,7 +37,7 @@ const WORKER_SERVICE_JWT = process.env.WORKER_SERVICE_JWT
 const POLL_MS          = 10_000       // 10 s per sweep
 const SIG_COOLDOWN_MS  = 60_000       // 1 min between Claude calls per pair
 const ALERT_COOL_MS    = 15 * 60_000  // 15 min per pair+direction alert
-const RISK_CACHE_MS    = 2  * 60_000  // 2 min account state cache
+const RISK_CACHE_MS    = 30_000       // 30 s — matches EA balance push cadence so the daily-loss halt and openCount stay close to live; also invalidated on order/outcome/broker-switch
 const STRATEGY_REFRESH_MS = 5 * 60_000  // re-pull live strategy every 5 min
 const HEARTBEAT_MS     = 30 * 60_000
 const FETCH_TIMEOUT_MS = 45_000       // Claude API can take 10-15 s
@@ -467,6 +473,7 @@ async function loadStrategy() {
 }
 
 async function fetchRiskState() {
+  // Serve cache unless TTL expired OR broker identity changed (account switch).
   if (cachedRisk && Date.now() - riskCachedAt < RISK_CACHE_MS) return cachedRisk
   const acct      = await apiFetch('/api/account')
   const balance   = acct.balance   || 0
@@ -475,7 +482,14 @@ async function fetchRiskState() {
   const dailyLossPct = (balance > 0 && realizedPL < 0)
     ? Math.abs(realizedPL) / balance
     : 0
-  cachedRisk   = { balance, openCount, dailyLossPct }
+  // Detect broker switch: if the active broker name changed (user flipped is_active
+  // in broker_configs), drop any stale derived state. balance and openCount come
+  // from the new broker fresh, but log so the operator sees it.
+  if (cachedRisk && cachedRisk.broker && acct.broker && cachedRisk.broker !== acct.broker) {
+    console.log(`[risk] broker switch detected — was '${cachedRisk.broker}' now '${acct.broker}' — cache reset`)
+    wlog('info', `Broker switch: ${cachedRisk.broker} → ${acct.broker} · balance now ${balance}`, { metadata: { from: cachedRisk.broker, to: acct.broker, balance } })
+  }
+  cachedRisk   = { balance, openCount, dailyLossPct, broker: acct.broker }
   riskCachedAt = Date.now()
   return cachedRisk
 }
@@ -617,11 +631,18 @@ async function processSignal(pair, tick, strategy, session, direction) {
       try { risk = await fetchRiskState() } catch { /* skip order on error */ }
 
       if (risk) {
-        if (risk.dailyLossPct >= 0.03) {
+        // Daily loss halt is balance-relative. The threshold is liveStrategy.maxLoss
+        // (a percentage from /api/strategy, e.g. 3 = 3%), applied to the LIVE balance
+        // pulled fresh by fetchRiskState. dailyLossPct itself is realizedPL / balance,
+        // so changing account size scales the threshold automatically.
+        const maxLossFrac = (liveStrategy.maxLoss || 3) / 100
+        if (risk.dailyLossPct >= maxLossFrac) {
           tradingHalted = true
           if (!haltNotified) {
             haltNotified = true
-            await tgSend('🛑 <b>Daily loss limit reached (3%)</b> — trading halted for today.\nWorker still scanning and alerting in paper mode.')
+            const lossUSD = (risk.dailyLossPct * risk.balance).toFixed(2)
+            const limitUSD = (maxLossFrac * risk.balance).toFixed(2)
+            await tgSend(`🛑 <b>Daily loss limit reached (${liveStrategy.maxLoss}%)</b> — trading halted for today.\nLoss: $${lossUSD} / Limit: $${limitUSD} of $${risk.balance.toFixed(2)} balance.\nWorker still scanning and alerting in paper mode.`)
           }
         } else if (risk.openCount >= liveStrategy.maxPositions) {
           console.log(`[risk] ${risk.openCount}/${liveStrategy.maxPositions} trades open — skipping order`)
@@ -632,9 +653,9 @@ async function processSignal(pair, tick, strategy, session, direction) {
               placed = true
               stats.trades++
               // Invalidate the risk cache — openCount just increased; serving the
-              // 2-min stale value lets the next signal slip past the maxPositions gate.
+              // stale value lets the next signal slip past the maxPositions gate.
               cachedRisk = null
-              console.log(`[order] ✓ ${pair} ${dir} → trade ${result.tradeId} @ ${result.filledPrice}`)
+              console.log(`[order] ✓ [${ACCOUNT_TYPE.toUpperCase()}] ${pair} ${dir} → trade ${result.tradeId} @ ${result.filledPrice} lots=${result.lots}`)
               wlog('order', `${dir} order placed`, { pair, session, metadata: { direction: dir, success: true, tradeId: result.tradeId, filledPrice: result.filledPrice, lots: result.lots } })
             } else {
               console.log(`[order] blocked: ${(result.reasons || []).join(', ')}`)
@@ -866,6 +887,7 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
 ;(async () => {
   console.log(`[worker] SybexForexAI background scanner`)
   console.log(`[worker] Mode   : ${WORKER_MODE.toUpperCase()}`)
+  console.log(`[worker] Account: ${ACCOUNT_TYPE.toUpperCase()}${ACCOUNT_TYPE === 'live' ? '  ⚠ LIVE — orders affect real money' : ''}`)
   console.log(`[worker] Target : ${BASE_URL}`)
   console.log(`[worker] Pairs  : ${PAIRS.join(' | ')}`)
   console.log(`[worker] Auth   : ${WORKER_SERVICE_JWT ? `JWT (${WORKER_SERVICE_JWT.length} chars) — per-user broker_configs` : 'NONE — env-default broker (multi-account disabled)'}`)
