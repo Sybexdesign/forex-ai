@@ -21,6 +21,12 @@ const SUPABASE_URL   = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPAB
 const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY
 const WORKER_MODE    = (process.env.WORKER_MODE || 'paper').toLowerCase() // 'paper' | 'live'
 const WORKER_USER_ID = process.env.WORKER_USER_ID  // optional: Supabase user ID for logging
+// User-impersonation JWT (sub = WORKER_USER_ID, role = 'authenticated'). When set,
+// every apiFetch sends it as Authorization: Bearer …, so /api/account and /api/orders
+// resolve the correct per-user broker_configs row via getBroker(authToken) in
+// lib/brokers/index.ts. Without it, those routes fall back to the env-default
+// broker singleton, which has no per-user balance and effectively blocks live orders.
+const WORKER_SERVICE_JWT = process.env.WORKER_SERVICE_JWT
 
 const POLL_MS          = 10_000       // 10 s per sweep
 const SIG_COOLDOWN_MS  = 60_000       // 1 min between Claude calls per pair
@@ -384,8 +390,16 @@ function formatAlert(pair, strategy, session, signal, mode) {
 // ── API Helpers ───────────────────────────────────────────────────────────────
 
 async function apiFetch(path, options = {}) {
+  // Always send the worker's user-impersonation JWT (when configured) so server
+  // routes that call getBroker(authToken) resolve the correct per-user
+  // broker_configs row instead of falling to the env-default singleton.
+  const headers = { ...(options.headers || {}) }
+  if (WORKER_SERVICE_JWT && !headers.Authorization && !headers.authorization) {
+    headers.Authorization = `Bearer ${WORKER_SERVICE_JWT}`
+  }
   const res = await fetch(`${BASE_URL}${path}`, {
     ...options,
+    headers,
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   })
   if (!res.ok) throw new Error(`${path} HTTP ${res.status}`)
@@ -847,6 +861,23 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   console.log(`[worker] Mode   : ${WORKER_MODE.toUpperCase()}`)
   console.log(`[worker] Target : ${BASE_URL}`)
   console.log(`[worker] Pairs  : ${PAIRS.join(' | ')}`)
+  console.log(`[worker] Auth   : ${WORKER_SERVICE_JWT ? `JWT (${WORKER_SERVICE_JWT.length} chars) — per-user broker_configs` : 'NONE — env-default broker (multi-account disabled)'}`)
+  if (WORKER_MODE === 'live' && !WORKER_SERVICE_JWT) {
+    console.warn('[worker] ⚠ WORKER_SERVICE_JWT not set — live orders will use env-default broker, not the per-user MT5/OANDA account. Set WORKER_SERVICE_JWT to enable per-user routing.')
+  }
+  // Preflight: hit /api/account once so the operator sees immediately whether the
+  // JWT resolves to the expected broker_configs row. If the JWT is missing/invalid
+  // this surfaces at startup instead of failing silently on the first live order.
+  try {
+    const acct = await apiFetch('/api/account')
+    console.log(`[worker] Broker : ${acct.broker || 'unknown'} · balance=${acct.balance ?? 'n/a'} ${acct.currency || ''} · openTrades=${(acct.openTrades || []).length}`)
+    wlog('info', `Broker resolved at startup: ${acct.broker || 'unknown'}`, { metadata: { broker: acct.broker, balance: acct.balance, currency: acct.currency, hasJwt: !!WORKER_SERVICE_JWT } })
+    if (WORKER_MODE === 'live' && /simulation/i.test(acct.broker || '')) {
+      console.warn('[worker] ⚠ Broker resolved to Simulation in live mode — orders will be blocked. Check WORKER_SERVICE_JWT and the active broker_configs row.')
+    }
+  } catch (e) {
+    console.warn(`[worker] Preflight /api/account failed: ${e.message} — worker will continue but per-user broker routing may not be active`)
+  }
   // Initial strategy pull before the first sweep so the very first signal honours user settings
   await loadStrategy()
   setInterval(loadStrategy, STRATEGY_REFRESH_MS)
