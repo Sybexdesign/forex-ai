@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
-"""ml/train.py — Train XGBoost on Supabase signal data"""
+"""
+ml/train.py — Train XGBoost on Supabase signal data + optional synthetic signals.
+
+Usage:
+    python train.py                                        # Supabase only
+    python train.py --synthetic data/synthetic_signals.csv # merge synthetic data
+    python train.py --synthetic-only data/synthetic_signals.csv  # skip Supabase
+
+Generate synthetic signals first:
+    python generate_signals.py --days 365
+"""
 
 import os
+import sys
 import json
+import argparse
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -13,6 +25,15 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env.local'))
 load_dotenv()
+
+# ─── CLI args ─────────────────────────────────────────────────────────────────
+
+parser = argparse.ArgumentParser(description='Train XGBoost scalper model')
+parser.add_argument('--synthetic', default='',
+                    help='Path to synthetic_signals.csv from generate_signals.py (merged with Supabase)')
+parser.add_argument('--synthetic-only', default='',
+                    help='Use ONLY synthetic data (skip Supabase fetch)')
+args = parser.parse_args()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -33,28 +54,26 @@ ALL_PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD',
 
 # ─── Fetch data ───────────────────────────────────────────────────────────────
 
-print("📡 Fetching signals from Supabase...")
-sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-all_rows = []
-page_size = 1000
-offset    = 0
-while True:
-    resp = (
-        sb.table('signals')
-          .select('indicator_snapshot, direction, confidence, outcome, pair, timeframe, created_at')
-          .in_('outcome', ['WIN', 'LOSS'])
-          .range(offset, offset + page_size - 1)
-          .execute()
-    )
-    rows = resp.data
-    if not rows:
-        break
-    all_rows.extend(rows)
-    offset += page_size
-    print(f"  Fetched {len(all_rows)} rows...")
-
-print(f"✓ Total rows with WIN/LOSS outcome: {len(all_rows)}")
+if not args.synthetic_only:
+    page_size = 1000
+    offset    = 0
+    while True:
+        resp = (
+            sb.table('signals')
+              .select('indicator_snapshot, direction, confidence, outcome, pair, timeframe, created_at')
+              .in_('outcome', ['WIN', 'LOSS'])
+              .range(offset, offset + page_size - 1)
+              .execute()
+        )
+        rows = resp.data
+        if not rows:
+            break
+        all_rows.extend(rows)
+        offset += page_size
+        print(f"  Fetched {len(all_rows)} rows...")
+    print(f"✓ Supabase rows with WIN/LOSS outcome: {len(all_rows)}")
+else:
+    print("⏭  Supabase fetch skipped (--synthetic-only mode)")
 
 # Only train on signals from periods where the direction logic was correct.
 # Dates with >50% WIN rate are considered clean; all others are contaminated
@@ -72,6 +91,8 @@ def _parse_ts(ts: str) -> datetime:
     return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
 
 def _is_clean(ts_str: str) -> bool:
+    # Synthetic signals are always clean — they don't carry the inversion-era bug
+    # Supabase signals are restricted to confirmed-clean periods only
     dt = _parse_ts(ts_str)
     date = dt.date()
     from datetime import date as ddate
@@ -79,13 +100,51 @@ def _is_clean(ts_str: str) -> bool:
         return True
     if date == ddate(2026, 6, 1) and dt.hour >= 14:
         return True
+    # Accept any signal from June 2 onwards (post-fix era)
+    if dt >= datetime(2026, 6, 2, 0, 0, tzinfo=timezone.utc):
+        return True
     return False
 
 before = len(all_rows)
 all_rows = [r for r in all_rows if _is_clean(r['created_at'])]
 removed = before - len(all_rows)
-print(f"✓ Removed {removed} contaminated signals (inverted-direction era)")
-print(f"✓ Clean training set: {len(all_rows)} rows (May 15 + June 1 14:00+)")
+print(f"✓ Removed {removed} contaminated Supabase signals (inverted-direction era)")
+print(f"✓ Clean Supabase set: {len(all_rows)} rows (May 15 + June 1 14:00+)")
+
+# ─── Merge synthetic signals ──────────────────────────────────────────────────
+# Synthetic rows from generate_signals.py have the same schema as Supabase rows.
+# indicator_snapshot is stored as a JSON string in the CSV; parse it back to dict.
+
+synthetic_path = args.synthetic or args.synthetic_only
+if synthetic_path:
+    if not os.path.exists(synthetic_path):
+        print(f"✗ Synthetic file not found: {synthetic_path}")
+        sys.exit(1)
+    syn_df = pd.read_csv(synthetic_path)
+    syn_rows = []
+    for _, row in syn_df.iterrows():
+        snap = row.get('indicator_snapshot', '{}')
+        if isinstance(snap, str):
+            try:
+                snap = json.loads(snap)
+            except Exception:
+                snap = {}
+        syn_rows.append({
+            'indicator_snapshot': snap,
+            'direction':          row.get('direction', 'HOLD'),
+            'confidence':         int(row.get('confidence', 50)),
+            'outcome':            row.get('outcome', 'LOSS'),
+            'pair':               row.get('pair', 'XAU/USD'),
+            'timeframe':          'synthetic',
+            'created_at':         row.get('created_at', '2026-01-01T00:00:00+00:00'),
+        })
+    print(f"✓ Synthetic signals loaded: {len(syn_rows)} rows from {synthetic_path}")
+    all_rows.extend(syn_rows)
+    print(f"✓ Combined training set: {len(all_rows)} rows "
+          f"(Supabase + synthetic)")
+else:
+    print("  ℹ  No synthetic data — training on Supabase signals only")
+    print("     Tip: python generate_signals.py --days 365 to add 50k+ historical bars")
 
 def add_session_feature(row: dict) -> dict:
     """
