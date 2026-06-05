@@ -74,8 +74,12 @@ const PAIR_STRATEGY = {
 // ── Session Detection ─────────────────────────────────────────────────────────
 // Market week: Sunday 22:00 UTC → Friday 22:00 UTC
 
-function isMarketOpen() {
-  const d   = new Date()
+// Both helpers accept an optional Date so callers can thread a single instant
+// through one sweep. Calling new Date() separately inside each one allowed the
+// same sweep to straddle an hour boundary (e.g. isMarketOpen saw h=20 while the
+// log line printed at h=21) — the sweep header could then show [New York] at
+// exactly 21:00:00 UTC even though the daily close window had begun.
+function isMarketOpen(d = new Date()) {
   const day = d.getUTCDay()   // 0=Sun 6=Sat
   const h   = d.getUTCHours()
   const m   = d.getUTCMinutes()
@@ -86,8 +90,13 @@ function isMarketOpen() {
   return true
 }
 
-function getSession() {
-  const h = new Date().getUTCHours()
+function getSession(d = new Date()) {
+  // The daily close window (21:00–21:59 UTC) is always CLOSED regardless of
+  // the named-session band it sits inside — callers normally check isMarketOpen
+  // first, but this defensive early-return makes the label correct even when
+  // getSession is invoked standalone (e.g. by the heartbeat or per-pair logs).
+  if (!isMarketOpen(d)) return 'CLOSED'
+  const h = d.getUTCHours()
   if (h >= 22 || h < 7)  return 'Asian'    // 22:00–07:00 UTC  – ranging
   if (h >= 7  && h < 13) return 'London'   // 07:00–13:00 UTC  – trending
   if (h >= 13 && h < 16) return 'Overlap'  // 13:00–16:00 UTC  – highest volatility
@@ -680,8 +689,13 @@ async function processSignal(pair, tick, strategy, session, direction) {
 async function runSweep() {
   stats.sweeps++
 
-  const marketOpen = isMarketOpen()
-  const session    = marketOpen ? getSession() : 'CLOSED'
+  // Snapshot the sweep instant once and pass it to every time-dependent helper.
+  // Calling new Date() inside each (isMarketOpen, getSession, log timestamp) used
+  // to let the same sweep straddle an hour boundary — most visibly at exactly
+  // 21:00:00 UTC where the daily close window starts.
+  const sweepAt    = new Date()
+  const marketOpen = isMarketOpen(sweepAt)
+  const session    = marketOpen ? getSession(sweepAt) : 'CLOSED'
 
   // Ping Supabase every 6 sweeps (~1 min) regardless of market state
   // so the Worker Logs page shows the worker is alive during weekends too
@@ -703,7 +717,7 @@ async function runSweep() {
     return
   }
 
-  const now = new Date().toISOString().slice(11, 19)
+  const now = sweepAt.toISOString().slice(11, 19)
   console.log(`── sweep #${stats.sweeps}  ${now} UTC  [${session}] ──`)
 
   // Phase 1: fetch all ticks concurrently
