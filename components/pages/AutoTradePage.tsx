@@ -116,6 +116,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     } catch { return new Set(METALS_ONLY) }
   })
   const autoScalpExecutedRef                      = useRef<Set<string>>(new Set())
+  const lastAutoPlacedRef                         = useRef<Map<string, number>>(new Map())  // key=section-pair → last placement ms
   const closingForTargetRef                       = useRef<Set<string>>(new Set())
   const openTradesRef                             = useRef<any[]>([])
   const pricesRef                                 = useRef<Record<string, any>>(prices)
@@ -435,6 +436,7 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
     if (!autoExecute || !enabled) return
     for (const signal of pendingSignals) {
       if (autoExecutedRef.current.has(signal.id)) continue
+      if (openTradesRef.current.length >= maxConcurrentTrades) break  // pre-check before API call
       autoExecutedRef.current.add(signal.id)
       placeOrder(signal).then(data => {
         if (data.blocked) {
@@ -456,24 +458,39 @@ export default function AutoTradePage({ strategy, account, onToast, newsInWindow
   useEffect(() => {
     if (!autoTradeEnabled) return
     void (async () => {
+      const now = Date.now()
+      // Prune stale fetchedAt keys from dedup set (older than 10 min) to prevent unbounded growth
+      for (const k of [...autoScalpExecutedRef.current]) {
+        const ts = parseInt(k.split('-').pop() ?? '0', 10)
+        if (now - ts > 10 * 60_000) autoScalpExecutedRef.current.delete(k)
+      }
+
       // Effective open count = DB open trades minus any currently being auto-closed.
-      // This prevents placing a new trade for a slot that's in the process of being freed.
       let localOpenCount = openTradesRef.current.length - closingForTargetRef.current.size
       for (const [pair, sig] of Object.entries(scalpSignals)) {
         if (!sig || sig.direction === 'HOLD' || sig.blocked) continue
         if (!autoPairs.has(pair)) continue
-        if (Date.now() > sig.expiresAt) continue
+        if (now > sig.expiresAt) continue
         for (const section of ['scalp', 'mirror']) {
           if (!autoSections.has(section)) continue
+          if (localOpenCount >= maxConcurrentTrades) continue
+
+          // Per-pair+section cooldown: don't re-place within the signal's 3-min validity window.
+          // Prevents hammering the API every 15s when signals refresh with a new fetchedAt.
+          const cooldownKey = `${section}-${pair}`
+          const lastPlaced  = lastAutoPlacedRef.current.get(cooldownKey) ?? 0
+          if (now - lastPlaced < SCALP_EXPIRY_MS) continue
+
           const key = `${section}-${pair}-${sig.fetchedAt}`
           if (autoScalpExecutedRef.current.has(key)) continue
-          if (localOpenCount >= maxConcurrentTrades) continue
           autoScalpExecutedRef.current.add(key)
+
           const isMirror = section === 'mirror'
           const dir = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
           const ok = await autoPlaceOrder(sig, isMirror)
           if (ok) {
-            localOpenCount++   // immediately count this placement; don't wait for DB refresh
+            localOpenCount++
+            lastAutoPlacedRef.current.set(cooldownKey, now)  // record placement time
             onToast(`⚡ Auto: ${dir} ${pair} (${section === 'scalp' ? 'scalp' : 'mirror'})`, DIR_COLOR[dir] || '#00e5b4')
             loadOpenTrades()
             onRefreshTrades?.()
