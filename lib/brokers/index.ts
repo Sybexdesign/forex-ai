@@ -102,7 +102,7 @@ async function instantiateBroker(key: string, config?: Record<string, string>): 
   switch (key) {
     case 'oanda': {
       const { OandaBroker } = await import('./oanda.adapter')
-      return new OandaBroker()
+      return new OandaBroker(config || {})
     }
     case 'alpaca': {
       const { AlpacaBroker } = await import('./alpaca.adapter')
@@ -141,17 +141,23 @@ export async function getBroker(authToken?: string): Promise<IBroker> {
         global: { headers: { Authorization: `Bearer ${authToken}` } },
         auth: { autoRefreshToken: false, persistSession: false },
       })
+      // .limit(1).maybeSingle() — returns null cleanly when the user has no active
+      // broker_configs row, instead of .single() throwing on 0 rows. The unique partial
+      // index broker_configs_one_active_per_user (migration 20260606) prevents >1 row
+      // per user, but .limit(1) is defensive in case the index is missing in older DBs.
       const { data } = await userClient
         .from('broker_configs')
         .select('id, broker_type, config')
         .eq('is_active', true)
-        .single()
+        .limit(1)
+        .maybeSingle()
       if (data) {
         const broker = await instantiateBroker(data.broker_type, { ...data.config, _configId: data.id })
         console.log(`[broker] User config: ${broker.name}`)
         return broker
       }
-    } catch { /* fall through to default */ }
+      // No active row for this user — fall through to _defaultBroker
+    } catch { /* fall through to default on DB/network error */ }
   }
 
   if (_defaultBroker) return _defaultBroker

@@ -329,6 +329,10 @@ async function checkPendingOutcomes(ticksByPair) {
 
     if (outcome) {
       pendingSignals.delete(id)
+      // Invalidate the risk cache — a position just closed so openCount is now lower.
+      // Without this, the next signal would still see the pre-close count for up to 2 min
+      // and could be incorrectly throttled by the maxPositions gate.
+      cachedRisk = null
       await sbUpdate('signals', id, { outcome })
       console.log(`[outcome] ${sig.pair} ${sig.direction} → ${outcome} (${id.slice(0, 8)})`)
       wlog('info', `Signal outcome: ${sig.pair} ${sig.direction} → ${outcome}`, {
@@ -627,6 +631,9 @@ async function processSignal(pair, tick, strategy, session, direction) {
             if (result.success) {
               placed = true
               stats.trades++
+              // Invalidate the risk cache — openCount just increased; serving the
+              // 2-min stale value lets the next signal slip past the maxPositions gate.
+              cachedRisk = null
               console.log(`[order] ✓ ${pair} ${dir} → trade ${result.tradeId} @ ${result.filledPrice}`)
               wlog('order', `${dir} order placed`, { pair, session, metadata: { direction: dir, success: true, tradeId: result.tradeId, filledPrice: result.filledPrice, lots: result.lots } })
             } else {

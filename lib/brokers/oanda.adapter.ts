@@ -2,9 +2,12 @@
 import type { IBroker, Price, Candle, AccountSummary, OpenTrade, OrderRequest, OrderResult, CloseResult } from './interface'
 import { calcStandardPositionSize, getPipValue } from './interface'
 
-const BASE_URL = process.env.OANDA_BASE_URL || 'https://api-fxpractice.oanda.com'
-const API_KEY  = process.env.OANDA_API_KEY  || ''
-const ACCOUNT  = process.env.OANDA_ACCOUNT_ID || ''
+interface OandaConfig {
+  apiKey?:    string
+  accountId?: string
+  baseUrl?:   string
+  _configId?: string
+}
 
 const INSTRUMENT_MAP: Record<string, string> = {
   'EUR/USD': 'EUR_USD', 'GBP/USD': 'GBP_USD', 'USD/JPY': 'USD_JPY',
@@ -18,28 +21,40 @@ const TF_MAP: Record<string, string> = {
   '1H': 'H1', '4H': 'H4', 'Daily': 'D', 'Weekly': 'W',
 }
 
-async function fetch_(path: string, opts?: RequestInit) {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    ...opts,
-    headers: {
-      'Authorization': `Bearer ${API_KEY}`,
-      'Content-Type': 'application/json',
-      'Accept-Datetime-Format': 'UNIX',
-      ...opts?.headers,
-    },
-  })
-  if (!res.ok) throw new Error(`OANDA ${res.status}: ${await res.text()}`)
-  return res.json()
-}
-
 export class OandaBroker implements IBroker {
   name = 'OANDA'
   supportedPairs = Object.keys(INSTRUMENT_MAP)
   supportsLivePositions = true
 
+  private apiKey:    string
+  private accountId: string
+  private baseUrl:   string
+
+  // Credentials come from broker_configs.config (per-user). Env vars are kept only
+  // as a fallback for unauthenticated/dev/cron paths where no DB row is available.
+  constructor(config: OandaConfig = {}) {
+    this.apiKey    = config.apiKey    || process.env.OANDA_API_KEY    || ''
+    this.accountId = config.accountId || process.env.OANDA_ACCOUNT_ID || ''
+    this.baseUrl   = config.baseUrl   || process.env.OANDA_BASE_URL   || 'https://api-fxpractice.oanda.com'
+  }
+
+  private async fetch_(path: string, opts?: RequestInit) {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      ...opts,
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+        'Accept-Datetime-Format': 'UNIX',
+        ...opts?.headers,
+      },
+    })
+    if (!res.ok) throw new Error(`OANDA ${res.status}: ${await res.text()}`)
+    return res.json()
+  }
+
   async getPrices(pairs: string[]): Promise<Price[]> {
     const instruments = pairs.map(p => INSTRUMENT_MAP[p] || p.replace('/', '_')).join(',')
-    const data = await fetch_(`/v3/accounts/${ACCOUNT}/pricing?instruments=${instruments}`)
+    const data = await this.fetch_(`/v3/accounts/${this.accountId}/pricing?instruments=${instruments}`)
     return (data.prices || []).map((p: any) => {
       const bid = parseFloat(p.bids[0]?.price || 0)
       const ask = parseFloat(p.asks[0]?.price || 0)
@@ -51,7 +66,7 @@ export class OandaBroker implements IBroker {
   async getCandles(pair: string, timeframe: string, count = 200): Promise<Candle[]> {
     const instrument = INSTRUMENT_MAP[pair] || pair.replace('/', '_')
     const granularity = TF_MAP[timeframe] || 'H1'
-    const data = await fetch_(`/v3/instruments/${instrument}/candles?count=${count}&granularity=${granularity}&price=M`)
+    const data = await this.fetch_(`/v3/instruments/${instrument}/candles?count=${count}&granularity=${granularity}&price=M`)
     return (data.candles || []).filter((c: any) => c.complete).map((c: any) => ({
       time: c.time,
       open: parseFloat(c.mid.o), high: parseFloat(c.mid.h),
@@ -61,7 +76,7 @@ export class OandaBroker implements IBroker {
   }
 
   async getAccountSummary(): Promise<AccountSummary> {
-    const data = await fetch_(`/v3/accounts/${ACCOUNT}/summary`)
+    const data = await this.fetch_(`/v3/accounts/${this.accountId}/summary`)
     const a = data.account
     return {
       balance: parseFloat(a.balance), unrealizedPL: parseFloat(a.unrealizedPL),
@@ -71,7 +86,7 @@ export class OandaBroker implements IBroker {
   }
 
   async getOpenTrades(): Promise<OpenTrade[]> {
-    const data = await fetch_(`/v3/accounts/${ACCOUNT}/openTrades`)
+    const data = await this.fetch_(`/v3/accounts/${this.accountId}/openTrades`)
     return (data.trades || []).map((t: any) => {
       const units = parseInt(t.currentUnits)
       const pair = Object.keys(INSTRUMENT_MAP).find(k => INSTRUMENT_MAP[k] === t.instrument) || t.instrument
@@ -100,7 +115,7 @@ export class OandaBroker implements IBroker {
       : +(req.currentPrice + req.stopLossPips * pip).toFixed(5)
 
     try {
-      const data = await fetch_(`/v3/accounts/${ACCOUNT}/orders`, {
+      const data = await this.fetch_(`/v3/accounts/${this.accountId}/orders`, {
         method: 'POST',
         body: JSON.stringify({
           order: {
@@ -125,7 +140,7 @@ export class OandaBroker implements IBroker {
 
   async closeTrade(tradeId: string): Promise<CloseResult> {
     try {
-      const data = await fetch_(`/v3/accounts/${ACCOUNT}/trades/${tradeId}/close`, {
+      const data = await this.fetch_(`/v3/accounts/${this.accountId}/trades/${tradeId}/close`, {
         method: 'PUT', body: JSON.stringify({}),
       })
       return { success: true, pl: parseFloat(data.orderFillTransaction?.pl || '0') }
