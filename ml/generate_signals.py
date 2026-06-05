@@ -33,8 +33,15 @@ warnings.filterwarnings('ignore')
 DATA_DIR   = os.path.join(os.path.dirname(__file__), 'data')
 os.makedirs(DATA_DIR, exist_ok=True)
 
-OANDA_KEY  = os.environ.get('OANDA_API_KEY', '')
+_raw_oanda_key = os.environ.get('OANDA_API_KEY', '')
+# Treat placeholder values as missing
+OANDA_KEY  = _raw_oanda_key if (
+    _raw_oanda_key and not _raw_oanda_key.lower().startswith('your_')
+) else ''
 OANDA_URL  = (os.environ.get('OANDA_BASE_URL') or 'https://api-fxtrade.oanda.com').rstrip('/')
+
+AV_KEY     = os.environ.get('ALPHA_VANTAGE_KEY', '')
+AV_KEY     = AV_KEY if (AV_KEY and not AV_KEY.lower().startswith('your_')) else ''
 
 # Signal/label constants — must match label/route.ts and signal/route.ts
 CANDLE_WINDOW = 6          # 30-min label window (matches updated CANDLE_WINDOW)
@@ -133,7 +140,11 @@ def fetch_m5_oanda(pair: str, days: int) -> Optional[pd.DataFrame]:
 
 
 def fetch_m5_yfinance(pair: str, days: int) -> Optional[pd.DataFrame]:
-    """Fetch M5 data from yfinance — limited to last 60 days."""
+    """
+    Fetch M5 data from yfinance — limited to last 60 days.
+    Uses Ticker.history() which is less aggressively rate-limited than yf.download().
+    Retries up to 3 times with backoff on rate-limit errors.
+    """
     try:
         import yfinance as yf
     except ImportError:
@@ -147,18 +158,104 @@ def fetch_m5_yfinance(pair: str, days: int) -> Optional[pd.DataFrame]:
 
     capped = min(days, 59)
     print(f"  yfinance ▸ {sym} M5  ({capped}d, capped at 60d free limit)")
+
+    for attempt in range(1, 4):
+        try:
+            ticker = yf.Ticker(sym)
+            raw = ticker.history(period=f'{capped}d', interval='5m', auto_adjust=True)
+            if raw is None or raw.empty:
+                raise ValueError("empty result")
+            df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+            df.columns = [c.lower() for c in df.columns]
+            df.index = pd.to_datetime(df.index, utc=True)
+            df = df.sort_index().dropna()
+            print(f"  ✓  {len(df):,} M5 candles  ({df.index[0].date()} → {df.index[-1].date()})")
+            return df
+        except Exception as e:
+            msg = str(e).lower()
+            if 'rate' in msg or '429' in msg or 'too many' in msg:
+                wait = 20 * attempt
+                print(f"  ⚠  yfinance rate-limited (attempt {attempt}/3) — waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"  ✗  yfinance failed: {e}")
+                return None
+    print("  ✗  yfinance: all retries exhausted")
+    return None
+
+
+def fetch_m5_alpha_vantage(pair: str, days: int) -> Optional[pd.DataFrame]:
+    """
+    Fetch M5 intraday data from Alpha Vantage FX_INTRADAY endpoint.
+    Free tier: 25 calls/day, ~last 30 days with outputsize=full.
+    Supports XAU (gold) and XAG (silver) as from_symbol.
+    """
+    if not AV_KEY:
+        print("  ✗  ALPHA_VANTAGE_KEY not set or is placeholder")
+        return None
+
     try:
-        raw = yf.download(sym, period=f'{capped}d', interval='5m', auto_adjust=True, progress=False)
-        if raw is None or raw.empty:
+        import requests
+    except ImportError:
+        return None
+
+    AV_MAP = {'XAU/USD': ('XAU', 'USD'), 'XAG/USD': ('XAG', 'USD')}
+    syms = AV_MAP.get(pair)
+    if not syms:
+        return None
+
+    from_sym, to_sym = syms
+    print(f"  Alpha Vantage ▸ {from_sym}/{to_sym} M5  (outputsize=full, ~30d)")
+
+    url = 'https://www.alphavantage.co/query'
+    params = {
+        'function':    'FX_INTRADAY',
+        'from_symbol': from_sym,
+        'to_symbol':   to_sym,
+        'interval':    '5min',
+        'outputsize':  'full',
+        'apikey':      AV_KEY,
+        'datatype':    'json',
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if 'Note' in data:
+            print(f"  ⚠  Alpha Vantage rate limit: {data['Note'][:80]}")
             return None
-        df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-        df.columns = [c.lower() for c in df.columns]
-        df.index = pd.to_datetime(df.index, utc=True)
-        df = df.sort_index().dropna()
+        if 'Information' in data:
+            print(f"  ⚠  Alpha Vantage info: {data['Information'][:80]}")
+            return None
+        if 'Error Message' in data:
+            print(f"  ✗  Alpha Vantage error: {data['Error Message'][:80]}")
+            return None
+
+        ts_key = 'Time Series FX (5min)'
+        raw = data.get(ts_key, {})
+        if not raw:
+            print(f"  ✗  Alpha Vantage returned no time series data")
+            return None
+
+        rows = []
+        for ts_str, bar in raw.items():
+            rows.append({
+                'time':   pd.Timestamp(ts_str, tz='America/New_York').tz_convert('UTC'),
+                'open':   float(bar['1. open']),
+                'high':   float(bar['2. high']),
+                'low':    float(bar['3. low']),
+                'close':  float(bar['4. close']),
+                'volume': 0,
+            })
+
+        df = pd.DataFrame(rows).sort_values('time').set_index('time')
+        df = df.dropna()
         print(f"  ✓  {len(df):,} M5 candles  ({df.index[0].date()} → {df.index[-1].date()})")
         return df
+
     except Exception as e:
-        print(f"  ✗  yfinance failed: {e}")
+        print(f"  ✗  Alpha Vantage failed: {e}")
         return None
 
 
@@ -430,6 +527,8 @@ def run(pairs: list, days: int, source: str, out_path: str):
             df = fetch_m5_oanda(pair, days)
         if df is None or df.empty:
             df = fetch_m5_yfinance(pair, days)
+        if df is None or df.empty:
+            df = fetch_m5_alpha_vantage(pair, days)
         if df is None or df.empty:
             print(f"  ✗  No data for {pair} — skipping")
             continue

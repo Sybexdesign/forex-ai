@@ -5,7 +5,7 @@
  * - 10-second polling across XAU/USD and XAG/USD (concurrent tick fetch + pre-filter)
  * - Breakout strategy 24/7 for metals — pre-filter (ADX>25 + BB squeeze) guards quality
  * - Two-stage scan: fast indicator pre-filter → Claude signal only when needed
- * - Risk guards: 1% max risk, 3% daily loss limit, max 3 concurrent trades
+ * - Risk guards: 1% max risk, 3% daily loss limit, MAX_CONCURRENT_TRADES (default 3) open positions
  * - WORKER_MODE=paper  → Telegram alerts + Supabase log (no real orders)
  * - WORKER_MODE=live   → real OANDA orders + alerts + log
  * - 15-min alert cooldown per pair+direction
@@ -21,6 +21,7 @@ const SUPABASE_URL   = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPAB
 const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY
 const WORKER_MODE    = (process.env.WORKER_MODE || 'paper').toLowerCase() // 'paper' | 'live'
 const WORKER_USER_ID = process.env.WORKER_USER_ID  // optional: Supabase user ID for logging
+const MAX_CONCURRENT_TRADES = parseInt(process.env.MAX_CONCURRENT_TRADES || '3', 10)
 
 const POLL_MS          = 10_000       // 10 s per sweep
 const SIG_COOLDOWN_MS  = 60_000       // 1 min between Claude calls per pair
@@ -439,11 +440,12 @@ async function placeOrder(pair, direction, signal) {
     body:    JSON.stringify({
       pair,
       direction,
-      strategy:      { riskPct: 1, slPips, tpPips },
-      aiConfidence:  signal.confidence,
-      checklistScore: (signal.reasons || []).length,
-      currentPrice:  signal.entry,
-      userId:        WORKER_USER_ID || undefined,
+      strategy:            { riskPct: 1, slPips, tpPips },
+      aiConfidence:        signal.confidence,
+      checklistScore:      (signal.reasons || []).length,
+      currentPrice:        signal.entry,
+      userId:              WORKER_USER_ID || undefined,
+      maxConcurrentTrades: MAX_CONCURRENT_TRADES,
     }),
   })
 }
@@ -571,8 +573,8 @@ async function processSignal(pair, tick, strategy, session, direction) {
             haltNotified = true
             await tgSend('🛑 <b>Daily loss limit reached (3%)</b> — trading halted for today.\nWorker still scanning and alerting in paper mode.')
           }
-        } else if (risk.openCount >= 3) {
-          console.log(`[risk] ${risk.openCount}/3 trades open — skipping order`)
+        } else if (risk.openCount >= MAX_CONCURRENT_TRADES) {
+          console.log(`[risk] ${risk.openCount}/${MAX_CONCURRENT_TRADES} trades open — skipping order`)
         } else {
           try {
             const result = await placeOrder(pair, dir, signal)
