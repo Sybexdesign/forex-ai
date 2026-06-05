@@ -56,12 +56,13 @@ export interface ManageResult {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const MAX_HOLD_MS     = 10 * 60_000  // 10-minute scalp window
-const MIN_PROFIT_R    = 0.3          // must reach 0.3R within MAX_HOLD_MS
-const BE_TRIGGER_R    = 0.5          // move SL to break-even when profit hits 0.5R
-const PARTIAL_LOCK_R  = 1.0          // lock SL at +0.5R level when profit hits 1R
-const TRAIL_ATR_MULT  = 0.5          // SL = price ± ATR * 0.5 (trailing)
-const DECAY_THRESHOLD = 0.5          // close if profit falls below 50% of peak
+const MAX_HOLD_MS     = 20 * 60_000  // 20-minute scalp window
+const MIN_PROFIT_R    = 0.2          // must reach 0.2R within MAX_HOLD_MS
+const BE_TRIGGER_R    = 1.0          // move SL to break-even when profit hits 1R (was 0.5R — was causing 73% of wins to exit at $0–3 via premature BE)
+const PARTIAL_LOCK_R  = 1.5          // lock SL at +0.75R level when profit hits 1.5R (was 1.0R)
+const TRAIL_ATR_MULT  = 1.0          // SL = price ± ATR * 1.0 (wider trail gives room to run)
+const DECAY_THRESHOLD = 0.4          // close if profit falls below 40% of peak (was 50%)
+const MAX_LOSS_R      = -1.5         // emergency close if loss exceeds 1.5× initial risk
 const ATR_PERIOD      = 14
 const CMD_TTL_S       = 120          // pending command expires after 2 minutes
 
@@ -142,6 +143,23 @@ export function manageTrades(
     const { peakProfit } = state
     const currentR = pos.profit / initialRiskUsd
 
+    // ── 0. Hard catastrophic-loss cutoff ─────────────────────────────────────
+    // Emergency close when MT5 SL fails to execute (bad tick, broker lag, XAG gap).
+    // Fires before any other rule so we exit immediately regardless of state.
+    if (currentR < MAX_LOSS_R) {
+      log.push(`[tm] ${sym}#${key} EMERGENCY-CLOSE: R=${currentR.toFixed(2)} < ${MAX_LOSS_R} — runaway loss`)
+      commands.push({
+        id:        crypto.randomUUID(),
+        type:      'close',
+        symbol:    sym,
+        ticket:    pos.ticket,
+        createdAt: new Date(now).toISOString(),
+        expiresAt: nowSec + CMD_TTL_S,
+      })
+      nextState[key] = state
+      continue
+    }
+
     // ATR from M5 candles for the trailing stop
     const m5 = candleCache[`${sym}_M5`]
     const atr = m5 ? calcATR(m5.candles) : 0
@@ -152,7 +170,7 @@ export function manageTrades(
 
     let newSl: number | null = null
 
-    // ── 1. Break-even at +0.5R ───────────────────────────────────────────────
+    // ── 1. Break-even at +1R ────────────────────────────────────────────────
     if (!state.beApplied && currentR >= BE_TRIGGER_R) {
       const beImproves = dir === 'BUY' ? originalEntry > pos.sl : originalEntry < pos.sl
       if (beImproves) {
@@ -162,7 +180,7 @@ export function manageTrades(
       }
     }
 
-    // ── 2. Partial profit lock at +1R (SL advances to +0.5R level) ──────────
+    // ── 2. Partial profit lock at +1.5R (SL advances to +0.75R level) ───────
     if (!state.partialLocked && currentR >= PARTIAL_LOCK_R) {
       state.partialLocked = true
       const lockSl = dir === 'BUY'
