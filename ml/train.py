@@ -52,6 +52,9 @@ PIP_VALUES = {
 ALL_PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD',
              'USD/CHF', 'NZD/USD', 'XAU/USD', 'XAG/USD']
 
+sb       = create_client(SUPABASE_URL, SUPABASE_KEY)
+all_rows = []
+
 # ─── Fetch data ───────────────────────────────────────────────────────────────
 
 if not args.synthetic_only:
