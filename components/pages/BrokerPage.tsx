@@ -23,6 +23,12 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
   const [testResult, setTestResult] = useState<string | null>(null)
   const [showSecrets, setShowSecrets] = useState(false)
   const [changingBroker, setChangingBroker] = useState(false)
+  // Account-switch modal state. id = the broker_configs row being activated.
+  // label = display name shown in the modal. openCount is pre-checked here and
+  // surfaced (currently always 0 by the time the modal opens, but the field is
+  // kept so the modal still shows the safety check happened).
+  const [switchModal, setSwitchModal] = useState<{ id: string; label: string; broker: string; openCount: number } | null>(null)
+  const [confirmingSwitch, setConfirmingSwitch] = useState(false)
 
   const load = useCallback(() => {
     authFetch('/api/broker-config').then(r => r.json()).then(d => {
@@ -76,30 +82,32 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
     load()
   }
 
+  // Step 1 of switch: pre-flight check + open the confirmation modal.
+  // The server-side guard at /api/broker-config still re-checks open positions
+  // when confirmSwitch() POSTs, so this is just for UX (instant error rather
+  // than a 409 round-trip).
   async function setActive(id: string) {
-    // Pre-flight: block the switch entirely if open positions exist. The server
-    // re-checks too (returns 409 with code 'OPEN_POSITIONS_EXIST') so we're
-    // covered against a position opening between this check and the POST.
+    const target = configs.find(c => c.id === id)
+    if (!target) return
+    let openCount = 0
     try {
       const acctRes = await authFetch('/api/account')
       const acct    = await acctRes.json()
-      const openN   = Array.isArray(acct.openTrades) ? acct.openTrades.length : 0
-      if (openN > 0) {
-        onToast?.(`Close ${openN} open trade${openN === 1 ? '' : 's'} before switching accounts`, '#ff3056')
-        return
-      }
-    } catch { /* fall through; server-side guard is the safety net */ }
+      openCount     = Array.isArray(acct.openTrades) ? acct.openTrades.length : 0
+    } catch { /* server-side guard will catch it */ }
 
-    // Warning confirmation — switching restarts the broker resolver and the worker
-    // will reconnect on its next poll (≤30s). Mirror Trade pauses until then.
-    const ok = window.confirm(
-      'Switch active broker?\n\n' +
-      'This will restart the broker connection. Mirror Trade will pause for up to 30 seconds while the worker reconnects.\n\n' +
-      'Continue?'
-    )
-    if (!ok) return
+    if (openCount > 0) {
+      onToast?.(`Close ${openCount} open trade${openCount === 1 ? '' : 's'} before switching accounts`, '#ff3056')
+      return
+    }
+    setSwitchModal({ id, label: target.label, broker: target.broker_type.toUpperCase(), openCount })
+  }
 
-    let switchedToBroker: string | undefined
+  // Step 2: user pressed Confirm in the modal. Activate + schedule health check.
+  async function confirmSwitch() {
+    if (!switchModal) return
+    setConfirmingSwitch(true)
+    const { id, label: targetLabel } = switchModal
     try {
       const res = await authFetch('/api/broker-config', {
         method: 'POST',
@@ -107,26 +115,27 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
       })
       const d = await res.json()
       if (!res.ok || d.error) {
-        // Server-side open-positions guard fires here as fallback
         if (d.code === 'OPEN_POSITIONS_EXIST') {
           onToast?.(`Close ${d.openCount ?? '?'} open trade${d.openCount === 1 ? '' : 's'} before switching accounts`, '#ff3056')
         } else {
           onToast?.('Switch failed: ' + (d.error || res.status), '#ff3056')
         }
+        setSwitchModal(null)
         return
       }
-      switchedToBroker = configs.find(c => c.id === id)?.label
       onToast?.(`Account switched — worker reconnecting…`, '#00e5b4')
+      setSwitchModal(null)
       load()
       onBrokerSaved?.()
     } catch (e: any) {
       onToast?.('Switch failed: ' + e.message, '#ff3056')
+      setSwitchModal(null)
       return
+    } finally {
+      setConfirmingSwitch(false)
     }
 
-    // Post-switch health check: poll worker status + account at +30s. Confirms the
-    // worker has rebuilt its broker connection against the new active row and the
-    // EA/broker is reachable. Non-blocking — UI returns immediately.
+    // Post-switch health check: poll worker status + account at +30s.
     setTimeout(async () => {
       try {
         const [statusRes, acctRes] = await Promise.all([
@@ -139,7 +148,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
           const balStr = `${acct.currency || 'USD'} ${Number(acct.balance).toFixed(2)}`
           onToast?.(`✓ Worker connected to ${acct.broker} — balance ${balStr}`, '#00ff87')
         } else if (status?.isAlive) {
-          onToast?.(`⚠ Worker alive but broker balance is $0 — check EA / credentials for ${switchedToBroker || 'new account'}`, '#ffb800')
+          onToast?.(`⚠ Worker alive but broker balance is $0 — check EA / credentials for ${targetLabel}`, '#ffb800')
         } else {
           const since = status?.lastSeenAgeS != null ? `${Math.round(status.lastSeenAgeS / 60)}m ago` : 'unknown'
           onToast?.(`⚠ Worker last seen ${since} — may need restart on host`, '#ffb800')
@@ -460,6 +469,120 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
           >
             CHANGE BROKER
           </button>
+        </div>
+      )}
+
+      {/* ── Account-switch confirmation modal ──────────────────────────────── */}
+      {switchModal && (
+        <div
+          style={{
+            position: 'fixed', inset: 0,
+            background: 'rgba(0,0,0,0.8)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 9000,
+          }}
+          onClick={e => {
+            // Click backdrop = cancel (unless mid-flight)
+            if (e.target === e.currentTarget && !confirmingSwitch) setSwitchModal(null)
+          }}
+        >
+          <div className="panel" style={{
+            width: 460, maxWidth: '90vw', padding: 0,
+            borderColor: 'var(--border-bright)',
+            background: 'var(--bg-panel, #0a131f)',
+          }}>
+            {/* Header */}
+            <div style={{
+              padding: '14px 20px',
+              borderBottom: '1px solid var(--border)',
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+            }}>
+              <span style={{
+                fontFamily: 'Rajdhani', fontWeight: 700, fontSize: 16,
+                color: '#ffb800', letterSpacing: 1.5,
+              }}>
+                ⚠ SWITCH ACTIVE BROKER
+              </span>
+              <button
+                onClick={() => !confirmingSwitch && setSwitchModal(null)}
+                disabled={confirmingSwitch}
+                style={{
+                  background: 'none', border: 'none',
+                  color: 'var(--text-muted)', cursor: confirmingSwitch ? 'not-allowed' : 'pointer',
+                  fontSize: 18, padding: 0, lineHeight: 1,
+                }}
+              >✕</button>
+            </div>
+
+            {/* Body */}
+            <div style={{ padding: '20px 22px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <div style={{
+                padding: '10px 14px', borderRadius: 3,
+                background: 'rgba(0,128,255,0.06)',
+                border: '1px solid rgba(0,128,255,0.18)',
+                fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6,
+              }}>
+                Switching the active broker restarts the broker connection. The
+                background worker will reconnect on its next poll (≤30&nbsp;seconds).
+                <b style={{ color: '#ffb800' }}> Mirror&nbsp;Trade will pause until then.</b>
+              </div>
+
+              <div style={{
+                display: 'grid', gridTemplateColumns: 'auto 1fr', columnGap: 18, rowGap: 8,
+                fontSize: 12,
+              }}>
+                <span style={{ color: 'var(--text-muted)' }}>New account</span>
+                <span style={{ fontWeight: 700, color: '#90b0d0' }}>
+                  {switchModal.label}
+                  <span style={{ marginLeft: 8, fontSize: 10, color: 'var(--text-muted)', background: 'var(--border)', padding: '1px 6px', borderRadius: 2 }}>
+                    {switchModal.broker}
+                  </span>
+                </span>
+
+                <span style={{ color: 'var(--text-muted)' }}>Open positions</span>
+                <span style={{ fontWeight: 700, color: switchModal.openCount === 0 ? '#00ff87' : '#ff6060' }}>
+                  {switchModal.openCount === 0
+                    ? '✓ none — safe to switch'
+                    : `✕ ${switchModal.openCount} open — must close first`}
+                </span>
+
+                <span style={{ color: 'var(--text-muted)' }}>Worker pause</span>
+                <span style={{ color: '#ffb800', fontWeight: 700 }}>up to 30 s</span>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div style={{
+              padding: '12px 22px 16px',
+              borderTop: '1px solid var(--border)',
+              display: 'flex', justifyContent: 'flex-end', gap: 8,
+            }}>
+              <button
+                onClick={() => !confirmingSwitch && setSwitchModal(null)}
+                disabled={confirmingSwitch}
+                className="btn btn-ghost"
+                style={{ fontSize: 12, padding: '8px 18px', letterSpacing: 1 }}
+              >
+                CANCEL
+              </button>
+              <button
+                onClick={confirmSwitch}
+                disabled={confirmingSwitch || switchModal.openCount > 0}
+                style={{
+                  fontSize: 12, padding: '8px 22px', letterSpacing: 1, borderRadius: 3,
+                  fontWeight: 700, cursor: confirmingSwitch || switchModal.openCount > 0 ? 'not-allowed' : 'pointer',
+                  background: confirmingSwitch || switchModal.openCount > 0
+                    ? 'rgba(255,184,0,0.08)'
+                    : 'rgba(255,184,0,0.18)',
+                  color: confirmingSwitch || switchModal.openCount > 0 ? 'rgba(255,184,0,0.5)' : '#ffb800',
+                  border: '1px solid rgba(255,184,0,0.35)',
+                }}
+              >
+                {confirmingSwitch ? 'SWITCHING…' : 'CONFIRM SWITCH'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
