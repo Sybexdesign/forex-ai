@@ -52,6 +52,28 @@ export interface ManageResult {
   tradeState: Record<string, TradeState>
   commands:   ManagementCommand[]
   log:        string[]
+  /**
+   * Risk events emitted this tick — hard-cap or emergency-1.5R closes.
+   * mt5-sync routes these to Telegram. Empty array = nothing breaching.
+   */
+  riskEvents: Array<{
+    reason:  'hard-cap' | 'emergency-1.5R'
+    pair:    string
+    ticket:  number | string
+    pl:      number
+    cap?:    number
+  }>
+}
+
+/**
+ * Optional risk context. When provided, manageTrades applies a hard USD floor:
+ * close any position whose unrealised P/L drops below -(balance × riskPct/100 × 2).
+ * This is a belt-and-braces second layer on top of the -1.5R MAX_LOSS_R check —
+ * catches cases where MT5 SL gap-throughs make the R-based check fire late.
+ */
+export interface RiskContext {
+  accountBalance: number   // live balance from broker (USD)
+  riskPct:        number   // user's risk per trade (%) e.g. 0.5
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -98,13 +120,21 @@ export function manageTrades(
   latestPrices:  Record<string, { bid: number; ask: number }>,
   candleCache:   Record<string, { candles: EACandle[]; updatedAt: string }>,
   prevState:     Record<string, TradeState>,
+  riskCtx?:      RiskContext,
 ): ManageResult {
   const now      = Date.now()
   const nowSec   = Math.floor(now / 1000)
   const commands: ManagementCommand[] = []
   const log:      string[] = []
+  const riskEvents: ManageResult['riskEvents'] = []
   const nextState: Record<string, TradeState> = {}
   const openTickets = new Set(openPositions.map(p => String(p.ticket)))
+
+  // Hard USD cap = balance × riskPct/100 × 2 (i.e. 2× the user's per-trade risk).
+  // Computed once per tick; falsy/zero when riskCtx is not provided, which disables the check.
+  const hardCapUsd = (riskCtx && riskCtx.accountBalance > 0 && riskCtx.riskPct > 0)
+    ? riskCtx.accountBalance * (riskCtx.riskPct / 100) * 2
+    : 0
 
   for (const pos of openPositions) {
     const key   = String(pos.ticket)
@@ -143,9 +173,29 @@ export function manageTrades(
     const { peakProfit } = state
     const currentR = pos.profit / initialRiskUsd
 
-    // ── 0. Hard catastrophic-loss cutoff ─────────────────────────────────────
+    // ── 0a. Hard USD cap (Fix 8) ─────────────────────────────────────────────
+    // Belt-and-braces above MAX_LOSS_R. Catches gap-through cases where the
+    // R-based check fires late because the MT5 SL was already breached at a
+    // worse price than expected. Cap = balance × riskPct/100 × 2 (2× target risk).
+    // Only enabled when riskCtx is provided by the caller.
+    if (hardCapUsd > 0 && pos.profit < -hardCapUsd) {
+      log.push(`[tm] ${sym}#${key} HARD-CAP-CLOSE: pl=$${pos.profit.toFixed(2)} < -$${hardCapUsd.toFixed(2)} (2× user risk)`)
+      commands.push({
+        id:        crypto.randomUUID(),
+        type:      'close',
+        symbol:    sym,
+        ticket:    pos.ticket,
+        createdAt: new Date(now).toISOString(),
+        expiresAt: nowSec + CMD_TTL_S,
+      })
+      riskEvents.push({ reason: 'hard-cap', pair, ticket: pos.ticket, pl: pos.profit, cap: hardCapUsd })
+      nextState[key] = state
+      continue
+    }
+
+    // ── 0b. Hard catastrophic-loss cutoff (R-based) ──────────────────────────
     // Emergency close when MT5 SL fails to execute (bad tick, broker lag, XAG gap).
-    // Fires before any other rule so we exit immediately regardless of state.
+    // Fires before all rule-1-5 logic so we exit immediately regardless of state.
     if (currentR < MAX_LOSS_R) {
       log.push(`[tm] ${sym}#${key} EMERGENCY-CLOSE: R=${currentR.toFixed(2)} < ${MAX_LOSS_R} — runaway loss`)
       commands.push({
@@ -156,6 +206,7 @@ export function manageTrades(
         createdAt: new Date(now).toISOString(),
         expiresAt: nowSec + CMD_TTL_S,
       })
+      riskEvents.push({ reason: 'emergency-1.5R', pair, ticket: pos.ticket, pl: pos.profit })
       nextState[key] = state
       continue
     }
@@ -269,5 +320,5 @@ export function manageTrades(
     }
   }
 
-  return { tradeState: nextState, commands, log }
+  return { tradeState: nextState, commands, log, riskEvents }
 }

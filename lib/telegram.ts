@@ -196,6 +196,33 @@ export async function alertOrderFailed(opts: {
   await send(text)
 }
 
+// Risk-management breach: hard-dollar cap, -1.5R emergency close, post-close >1R.
+// Always delivered to admin chat (no cooldown — these are critical safety events).
+export async function alertRiskBreach(opts: {
+  pair: string
+  ticket?: number | string
+  pl: number
+  cap?: number      // expected cap (USD) — informational
+  reason: 'hard-cap' | 'emergency-1.5R' | 'post-close-1R'
+}) {
+  const titles: Record<typeof opts.reason, string> = {
+    'hard-cap':         '🚨 HARD CAP BREACHED',
+    'emergency-1.5R':   '🛑 EMERGENCY CLOSE -1.5R',
+    'post-close-1R':    '⚠️ LOSS EXCEEDED 1R',
+  }
+  const plStr = opts.pl >= 0 ? `+$${opts.pl.toFixed(2)}` : `-$${Math.abs(opts.pl).toFixed(2)}`
+  const lines = [
+    `${titles[opts.reason]} — ${opts.pair}`,
+    ``,
+    `P&amp;L: <code>${plStr}</code>`,
+    opts.cap !== undefined ? `Cap:  <code>-$${opts.cap.toFixed(2)}</code>` : null,
+    opts.ticket !== undefined ? `Ticket: <code>${opts.ticket}</code>` : null,
+    ``,
+    `⏱ ${new Date().toUTCString()}`,
+  ].filter(Boolean).join('\n')
+  await send(lines)
+}
+
 export async function alertTradeClosed(opts: {
   pair: string
   direction: 'BUY' | 'SELL'

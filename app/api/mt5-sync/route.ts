@@ -5,6 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 import { manageTrades } from '@/lib/trade-manager'
+import { alertRiskBreach } from '@/lib/telegram'
 
 export const dynamic = 'force-dynamic'
 
@@ -112,6 +113,19 @@ export async function POST(req: NextRequest) {
       pendingOrders = pendingOrders.filter((o: any) => !completedIds.has(o.id))
     }
 
+    // ── Load user strategy for risk context (Fix 8) ──────────────────────
+    // Needed for the hard-USD-cap inside manageTrades AND for the post-close
+    // >1R Telegram alert below. Fetched once per sync; tolerates missing row.
+    const { data: stratRow } = await sb.from('strategies').select('settings').eq('user_id', userId).single()
+    const riskPct = +(stratRow?.settings?.riskPct ?? 0.5)
+    const oneRusd = balance > 0 && riskPct > 0 ? balance * (riskPct / 100) : 0
+    // Snapshot of last-tick positions BEFORE we overwrite row.config — needed to
+    // recover the EA's last-known unrealised P/L for trades that disappeared this tick.
+    const prevPositionsByTicket: Record<string, any> = {}
+    for (const p of (row.config?.openPositions || [])) {
+      if (p?.ticket !== undefined) prevPositionsByTicket[String(p.ticket)] = p
+    }
+
     // ── Reconcile DB open trades against EA's actual open positions ──────────
     // EA sends openPositions on every sync (empty array = no positions open).
     // Compare against DB trades marked OPEN: any DB trade that no longer has
@@ -121,7 +135,7 @@ export async function POST(req: NextRequest) {
       const cutoff = new Date(Date.now() - 2 * 60_000).toISOString()
       const { data: dbOpenTrades } = await sb
         .from('trades')
-        .select('id, pair, direction, opened_at')
+        .select('id, pair, direction, opened_at, oanda_trade_id')
         .eq('user_id', userId)
         .eq('result', 'OPEN')
         .lt('opened_at', cutoff)   // only touch trades > 2 min old (protect fresh fills)
@@ -139,28 +153,44 @@ export async function POST(req: NextRequest) {
         }
 
         // Group DB trades by pair+direction (newest first — slice from tail to keep newest)
-        const dbByKey: Record<string, string[]> = {}
+        const dbByKey: Record<string, { id: string; oanda_trade_id?: string; pair: string }[]> = {}
         for (const t of dbOpenTrades) {
           const key = `${t.pair}|${t.direction}`
           if (!dbByKey[key]) dbByKey[key] = []
-          dbByKey[key].push(t.id)
+          dbByKey[key].push({ id: t.id, oanda_trade_id: (t as any).oanda_trade_id, pair: t.pair })
         }
 
         // Close any DB trade beyond the count the EA actually holds
-        const toClose: string[] = []
-        for (const [key, ids] of Object.entries(dbByKey)) {
+        const toClose: { id: string; oanda_trade_id?: string; pair: string }[] = []
+        for (const [key, rows] of Object.entries(dbByKey)) {
           const keep = eaCount[key] || 0
-          toClose.push(...ids.slice(keep))
+          toClose.push(...rows.slice(keep))
         }
 
         if (toClose.length > 0) {
           const nowStr = new Date().toISOString()
-          for (let i = 0; i < toClose.length; i += 100) {
+          const ids = toClose.map(t => t.id)
+          for (let i = 0; i < ids.length; i += 100) {
             await sb.from('trades')
               .update({ result: 'CLOSED', closed_at: nowStr })
-              .in('id', toClose.slice(i, i + 100))
+              .in('id', ids.slice(i, i + 100))
           }
           console.log(`[mt5-sync] Reconciled ${toClose.length} stale OPEN trade(s) → CLOSED`)
+
+          // Fix 8 — post-close >1R Telegram alert. Use EA's last-known unrealised P/L
+          // from the previous-tick snapshot. If the trade vanished with a loss exceeding
+          // 1R of the user's risk, surface it so operator sees broker-side SL hits.
+          if (oneRusd > 0) {
+            for (const t of toClose) {
+              const lastPos = t.oanda_trade_id ? prevPositionsByTicket[String(t.oanda_trade_id)] : null
+              const lastPl  = lastPos && typeof lastPos.profit === 'number' ? lastPos.profit : null
+              if (lastPl !== null && lastPl < -oneRusd) {
+                alertRiskBreach({
+                  pair: t.pair, ticket: t.oanda_trade_id, pl: lastPl, cap: oneRusd, reason: 'post-close-1R',
+                }).catch(() => {})
+              }
+            }
+          }
         }
       }
     }
@@ -213,14 +243,25 @@ export async function POST(req: NextRequest) {
     let tradeState: Record<string, any> = row.config?.tradeState || {}
 
     if (activePositions.length > 0) {
-      const { tradeState: nextState, commands, log } = manageTrades(
+      const { tradeState: nextState, commands, log, riskEvents } = manageTrades(
         activePositions,
         latestPrices,
         candleCache,
         tradeState,
+        // Fix 8 — pass live balance + user's riskPct so trade-manager can enforce
+        // the absolute USD cap (= balance × riskPct/100 × 2).
+        { accountBalance: balance, riskPct },
       )
       tradeState = nextState
       for (const line of log) console.log(line)
+
+      // Fix 8 — fire Telegram alerts for any hard-cap or emergency-1.5R breach.
+      // Non-blocking; failures are logged inside lib/telegram.
+      for (const evt of riskEvents) {
+        alertRiskBreach({
+          pair: evt.pair, ticket: evt.ticket, pl: evt.pl, cap: evt.cap, reason: evt.reason,
+        }).catch(() => {})
+      }
 
       for (const cmd of commands) {
         // Dedup: don't queue the same action for the same ticket twice
