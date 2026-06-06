@@ -289,6 +289,14 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
         signalId: signal.id,
         signalTimestamp: signal.scannedAt,
         maxConcurrentTrades,
+        // Audit metadata — scan path uses strategy.slPips/tpPips directly (no clamp),
+        // so source == clamped values. Confidence and signal id come from the scan signal.
+        source:            'scan',
+        source_sl_pips:    strategy.slPips,
+        source_tp_pips:    strategy.tpPips,
+        signal_at:         signal.scannedAt,
+        signal_confidence: signal.confidence,
+        signal_id_ref:     signal.id?.toString(),
       }),
     })
     return res.json()
@@ -321,12 +329,14 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
     setPlacingScalp(sig.pair)
     try {
       const pip = getPipValue(sig.pair)
-      // Derive SL/TP in pips from the signal's actual price levels so the broker
-      // places stops where the card displayed them, but clamp by the user's
-      // configured strategy.slPips/tpPips so the AI can never widen the user's
-      // risk beyond their chosen cap.
-      const scalpSlPips = sig.sl !== sig.entry ? Math.min(Math.abs(sig.entry - sig.sl) / pip, strategy.slPips) : strategy.slPips
-      const scalpTpPips = sig.tp !== sig.entry ? Math.min(Math.abs(sig.entry - sig.tp) / pip, strategy.tpPips) : strategy.tpPips
+      // Derive SL/TP from the signal's price levels, then clamp by the user's
+      // strategy ceiling. The pre-clamp values are passed to the API as
+      // source_sl_pips/source_tp_pips so the clamp-impact audit can reconstruct
+      // whether the user's 18/36 cap was overriding the source's intent.
+      const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
+      const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
+      const scalpSlPips   = Math.min(derivedSlPips, strategy.slPips)
+      const scalpTpPips   = Math.min(derivedTpPips, strategy.tpPips)
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
@@ -341,6 +351,12 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
           signalId:        `scalp-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
           signalTimestamp: new Date(sig.fetchedAt).toISOString(),
           maxConcurrentTrades,
+          source:            'scalp',
+          source_sl_pips:    derivedSlPips,
+          source_tp_pips:    derivedTpPips,
+          signal_at:         new Date(sig.fetchedAt).toISOString(),
+          signal_confidence: sig.confidence,
+          signal_id_ref:     `scalp-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
         }),
       }).then(r => r.json())
 
@@ -369,9 +385,11 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
       const mirrorSl  = 2 * sig.entry - sig.sl
       const mirrorTp  = 2 * sig.entry - sig.tp
       const pip = getPipValue(sig.pair)
-      // Clamp derived pips by the user's strategy cap (see Fix 3 / handleScalpOrder).
-      const slPips = sig.sl !== sig.entry ? Math.min(Math.abs(sig.entry - sig.sl) / pip, strategy.slPips) : strategy.slPips
-      const tpPips = sig.tp !== sig.entry ? Math.min(Math.abs(sig.entry - sig.tp) / pip, strategy.tpPips) : strategy.tpPips
+      // Capture pre-clamp values for clamp-impact audit (see Fix 3 / handleScalpOrder).
+      const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
+      const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
+      const slPips        = Math.min(derivedSlPips, strategy.slPips)
+      const tpPips        = Math.min(derivedTpPips, strategy.tpPips)
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
@@ -387,6 +405,12 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
           mirrorSl,
           mirrorTp,
           maxConcurrentTrades,
+          source:            'mirror',
+          source_sl_pips:    derivedSlPips,
+          source_tp_pips:    derivedTpPips,
+          signal_at:         new Date(sig.fetchedAt).toISOString(),
+          signal_confidence: sig.confidence,
+          signal_id_ref:     `mirror-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
         }),
       }).then(r => r.json())
 
@@ -410,11 +434,14 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   // Shared order placement for auto-trader — no UI loading state side-effects
   async function autoPlaceOrder(sig: ScalpSignal, isMirror: boolean): Promise<boolean> {
     const pip = getPipValue(sig.pair)
-    // Clamp derived pips by the user's strategy cap (see Fix 3 / handleScalpOrder).
-    const slPips = sig.sl !== sig.entry ? Math.min(Math.abs(sig.entry - sig.sl) / pip, strategy.slPips) : strategy.slPips
-    const tpPips = sig.tp !== sig.entry ? Math.min(Math.abs(sig.entry - sig.tp) / pip, strategy.tpPips) : strategy.tpPips
+    // Capture pre-clamp values for clamp-impact audit (see Fix 3 / handleScalpOrder).
+    const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
+    const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
+    const slPips        = Math.min(derivedSlPips, strategy.slPips)
+    const tpPips        = Math.min(derivedTpPips, strategy.tpPips)
     const direction = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
     const prefix    = isMirror ? 'mirror' : 'scalp'
+    const signalRef = `${prefix}-${sig.pair.replace('/', '')}-${sig.fetchedAt}`
     const body: Record<string, any> = {
       pair: sig.pair, direction,
       strategy:             { ...strategy, slPips, tpPips },
@@ -423,8 +450,14 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
       aiConfidence:         sig.confidence,
       checklistScore:       5,
       userId,
-      signalId:             `${prefix}-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+      signalId:             signalRef,
       maxConcurrentTrades,  // server enforces the same limit as the UI
+      source:               isMirror ? 'mirror' : 'scalp',
+      source_sl_pips:       derivedSlPips,
+      source_tp_pips:       derivedTpPips,
+      signal_at:            new Date(sig.fetchedAt).toISOString(),
+      signal_confidence:    sig.confidence,
+      signal_id_ref:        signalRef,
     }
     if (isMirror) {
       body.mirrorSl = 2 * sig.entry - sig.sl

@@ -507,6 +507,13 @@ async function placeOrder(pair, direction, signal) {
   // Send the full live strategy so runRiskGuards() in lib/risk.ts can enforce
   // maxPositions, maxLoss, hardDailyStop, hardNews, and session times — not just
   // sizing/SL/TP. Sized off the user's configured riskPct, not a hardcoded 1%.
+  // The worker derives its SL/TP from the AI signal's price levels (not from
+  // strategy), so source_sl_pips/tp_pips are computed here for audit attribution.
+  const pip = pipSize(pair)
+  const sourceSlPips = signal.sl  && signal.entry ? Math.abs(signal.entry - signal.sl) / pip : null
+  const sourceTpPips = signal.tp  && signal.entry ? Math.abs(signal.tp   - signal.entry) / pip : null
+  const nowIso       = new Date().toISOString()
+  const signalRef    = `worker-${pair.replace('/', '')}-${Date.now()}`
   return apiFetch('/api/orders', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -519,6 +526,13 @@ async function placeOrder(pair, direction, signal) {
       currentPrice:        signal.entry,
       userId:              WORKER_USER_ID || undefined,
       maxConcurrentTrades: liveStrategy.maxPositions,
+      // Audit attribution — see 20260606_trades_source_tracking migration.
+      source:              'worker',
+      source_sl_pips:      sourceSlPips,
+      source_tp_pips:      sourceTpPips,
+      signal_at:           nowIso,
+      signal_confidence:   signal.confidence,
+      signal_id_ref:       signalRef,
     }),
   })
 }

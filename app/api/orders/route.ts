@@ -31,7 +31,16 @@ function dbToSettings(d: any): PropFirmSettings {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-    const { pair, direction, strategy, userId, signalId, newsInWindow, newsEvent, aiConfidence, checklistScore, currentPrice, maxConcurrentTrades, signalTimestamp } = body
+    const {
+      pair, direction, strategy, userId, signalId,
+      newsInWindow, newsEvent, aiConfidence, checklistScore,
+      currentPrice, maxConcurrentTrades, signalTimestamp,
+      // Source-tracking fields (added by 20260606_trades_source_tracking migration).
+      // Optional — present on every code path after this change but absent on legacy
+      // callers; defaulted to safe values on insert.
+      source, source_sl_pips, source_tp_pips,
+      signal_at, signal_confidence, signal_id_ref,
+    } = body
 
     const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
     const broker = await getBroker(authToken)
@@ -270,9 +279,24 @@ export async function POST(req: NextRequest) {
           lots, result: 'OPEN', rules_followed: true,
           checklist_score: checklistScore,
           ai_confidence: aiConfidence,
+          // Source attribution — see 20260606_trades_source_tracking migration.
+          // Callers must send `source`; we default to 'manual' for safety so any
+          // legacy/unknown caller is still attributable.
+          source:            source || 'manual',
+          source_sl_pips:    source_sl_pips ?? null,
+          source_tp_pips:    source_tp_pips ?? null,
+          signal_at:         signal_at ?? null,
+          signal_confidence: signal_confidence ?? null,
+          signal_id_ref:     signal_id_ref ?? (typeof signalId === 'string' ? signalId : null),
         }).select().single()
 
-        if (signalId && trade) {
+        // Only attempt the signals-table update when signalId is a real UUID — the
+        // browser scalp/mirror paths use synthetic strings (e.g. mirror-XAUUSD-…) which
+        // Postgres rejected silently against the uuid PK, breaking every signal↔trade
+        // link historically. signal_id_ref on the trade row carries the synthetic id
+        // for those paths.
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+        if (signalId && trade && typeof signalId === 'string' && UUID_RE.test(signalId)) {
           await admin.from('signals').update({ acted_on: true, trade_id: trade.id }).eq('id', signalId)
         }
       } catch (dbErr: any) {
