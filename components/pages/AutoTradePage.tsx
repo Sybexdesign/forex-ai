@@ -15,6 +15,7 @@ const DIR_COLOR: Record<string, string> = { BUY: 'var(--color-buy)', SELL: 'var(
 const PAGE_SIZE = 5
 const SCALP_REFRESH_MS = 15_000  // refresh scalp signals every 15 seconds
 const SCALP_EXPIRY_MS  = 3 * 60_000  // 3-minute signal validity
+const PAIR_COOLDOWN_MS = 5 * 60_000  // minimum gap between two auto-trades on the same pair (any section) — caps the 30-60/hour overtrading
 
 interface ScalpSignal {
   pair: string
@@ -119,6 +120,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   })
   const autoScalpExecutedRef                      = useRef<Set<string>>(new Set())
   const lastAutoPlacedRef                         = useRef<Map<string, number>>(new Map())  // key=section-pair → last placement ms
+  const lastPairPlacedRef                         = useRef<Map<string, number>>(new Map())  // key=pair → last placement ms across ALL sections (5-min cooldown)
   const closingForTargetRef                       = useRef<Set<string>>(new Set())
   const openTradesRef                             = useRef<any[]>([])
   const pricesRef                                 = useRef<Record<string, any>>(prices)
@@ -495,6 +497,14 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   // Auto-trade: execute scalp/mirror signals when autoTradeEnabled
   useEffect(() => {
     if (!autoTradeEnabled) return
+    // Asian/Close session block (20:00–23:59 UTC). Historical data showed this window
+    // produced 84% of total losses across 90 trades at 54.4% win rate (-$354 net).
+    // Browser auto-execution pauses here; manual trades from the cards remain possible.
+    const utcHour = new Date().getUTCHours()
+    if (utcHour >= 20 && utcHour <= 23) {
+      console.log(`[auto] Asian/Close session ${utcHour}:00 UTC — mirror/scalp execution paused (block window 20:00–23:59 UTC)`)
+      return
+    }
     void (async () => {
       const now = Date.now()
       // Prune stale fetchedAt keys from dedup set (older than 10 min) to prevent unbounded growth
@@ -511,6 +521,16 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
         if (now > sig.expiresAt) continue
         // Honour user's minimum signal strength — skip weak signals on the browser auto path too.
         if (sig.confidence < strategy.minStrength) continue
+        // 5-min per-pair cooldown across ALL sections (scalp + mirror). Prevents
+        // back-to-back trades on the same pair when two consecutive signals only
+        // 15s apart both pass the gate. Historical data showed 30-60 trades/hour;
+        // a healthy XAU scalp cadence is 4-8/hour.
+        const lastPairTrade = lastPairPlacedRef.current.get(pair) ?? 0
+        if (now - lastPairTrade < PAIR_COOLDOWN_MS) {
+          const remainingS = Math.round((PAIR_COOLDOWN_MS - (now - lastPairTrade)) / 1000)
+          console.log(`[auto] ${pair} pair cooldown active — ${remainingS}s remaining`)
+          continue
+        }
         for (const section of ['scalp', 'mirror']) {
           if (!autoSections.has(section)) continue
           if (localOpenCount >= maxConcurrentTrades) continue
@@ -530,7 +550,8 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
           const ok = await autoPlaceOrder(sig, isMirror)
           if (ok) {
             localOpenCount++
-            lastAutoPlacedRef.current.set(cooldownKey, now)  // record placement time
+            lastAutoPlacedRef.current.set(cooldownKey, now)  // record placement time (per-section)
+            lastPairPlacedRef.current.set(pair, now)          // and per-pair (5-min cross-section cooldown)
             onToast(`⚡ Auto: ${dir} ${pair} (${section === 'scalp' ? 'scalp' : 'mirror'})`, DIR_COLOR[dir] || '#00e5b4')
             loadOpenTrades()
             onRefreshTrades?.()
@@ -649,8 +670,56 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
 
   const fmtCountdown = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 
+  // Session status — recomputed every render (scalpTick fires once per second).
+  // Mirrors the block window inside the auto-trade useEffect so the UI matches behaviour.
+  const _scalpTickRef = scalpTick  // reference so React tracks re-renders
+  void _scalpTickRef
+  const _utcNow   = new Date()
+  const _utcHour  = _utcNow.getUTCHours()
+  const _utcLabel = _utcNow.toISOString().slice(11, 19)
+  const sessionLabel =
+    _utcHour >= 7  && _utcHour <= 11 ? 'London'
+    : _utcHour >= 12 && _utcHour <= 15 ? 'London-NY Overlap'
+    : _utcHour >= 16 && _utcHour <= 19 ? 'New York'
+    : _utcHour >= 20 && _utcHour <= 23 ? 'Asian / Daily Close'
+    : 'Off Hours (Asian)'
+  const sessionBlocked = _utcHour >= 20 && _utcHour <= 23
+  const sessionColor   = sessionBlocked ? '#ff3056'
+    : (_utcHour >= 12 && _utcHour <= 15) ? '#00e5b4'   // best window
+    : '#0080ff'
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+      {/* ── Session Status Banner — surfaces the Asian/Close auto block ─── */}
+      <div style={{
+        background:   sessionBlocked ? 'rgba(255,48,86,0.08)' : `${sessionColor}12`,
+        border:       `1px solid ${sessionBlocked ? 'rgba(255,48,86,0.35)' : `${sessionColor}40`}`,
+        borderRadius: 5,
+        padding:      '10px 14px',
+        display:      'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{
+            fontSize: 10, fontWeight: 700, letterSpacing: 1.5,
+            color: sessionColor,
+            padding: '3px 8px', borderRadius: 3,
+            background: `${sessionColor}22`,
+          }}>
+            {sessionLabel.toUpperCase()}
+          </span>
+          <span className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+            {_utcLabel} UTC
+          </span>
+        </div>
+        <div style={{ fontSize: 11, fontWeight: 700, color: sessionBlocked ? '#ff3056' : '#00e5b4' }}>
+          {autoTradeEnabled
+            ? (sessionBlocked
+                ? '⏸ AUTO-EXECUTION PAUSED — Asian/Close block (20:00–23:59 UTC)'
+                : '▶ AUTO-EXECUTION ACTIVE')
+            : '○ Auto-trading off'}
+        </div>
+      </div>
 
       {/* ── Auto Trading Control Panel ──────────────────────────────── */}
       <div style={{

@@ -51,7 +51,7 @@ let liveStrategy = {
   riskPct: 1,
   maxLoss: 3,
   maxPositions: 2,
-  minStrength: 65,
+  minStrength: 80,    // raised from 65 — see lib/supabase.ts (DEFAULT_STRATEGY)
   tpPips: 50,
   slPips: 25,
   watchlist: ['XAU/USD', 'XAG/USD'],

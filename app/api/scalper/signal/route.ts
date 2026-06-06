@@ -74,7 +74,11 @@ Respond ONLY with valid JSON — no markdown, no prose.`,
   'Scalp': `You are a precision scalp trader for precious metals (XAU/USD, XAG/USD).
 Generate a 1–5 minute directional scalp signal.
 
-CRITICAL: You MUST return BUY or SELL. Only return HOLD in an exact tie (extremely rare).
+CRITICAL: If ADX(14) is below 20, you MUST return HOLD — this indicates a ranging
+market unsuitable for scalping. ADX between 20-24 is a weak trend; cap confidence
+at 65 and only proceed if the 5-vote consensus is 4/5 or stronger.
+
+CRITICAL: If ADX is ≥20 you MUST return BUY or SELL. Only return HOLD in an exact tie (extremely rare).
 
 Score 5 momentum factors and pick the majority direction:
 1. RSI(14) > 50 → bullish | RSI(14) < 50 → bearish
@@ -134,7 +138,18 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
       }
     }
   } else if (strategy === 'Scalp') {
-    // 5-vote majority: always commits to a direction
+    // ADX hard-filter: under 20 = ranging market, scalping in chop is the largest
+    // single cause of small wins with large losses (audit Fix 2). Suppress entirely.
+    if (t.adx < 20) {
+      return {
+        direction: 'HOLD' as Direction,
+        confidence: 0,
+        reasons: [`ADX ${t.adx.toFixed(1)} < 20 — ranging market, scalp suppressed`],
+        entry: t.price, sl: t.price, tp: t.price,
+        risk_note: `Rule-based (ADX filtered). ADX must be ≥20 for scalp entries.`,
+      }
+    }
+    // 5-vote majority: commits to a direction when ADX confirms a trend exists.
     const bbMid = (t.bbUpper + t.bbLower) / 2
     const votes = [
       t.rsi14 > 50 ? 1 : -1,          // RSI > 50 = bullish momentum
@@ -152,6 +167,32 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
     } else {
       score = 45 - edge * 8   // 3/5→37, 4/5→29, 5/5→21
       reasons.push(`Scalp: ${bearVotes}/5 bearish indicators`)
+    }
+    // Conflict-aware confidence penalty (audit Fix 5). A 4/5 with a real dissenting
+    // indicator (not near-threshold) is genuinely mixed signal; a 3/5 with any
+    // near-threshold marker is even weaker evidence. Penalty applies on top of edge.
+    const rsiNear = t.rsi14 >= 48 && t.rsi14 <= 52
+    const bpNear  = t.buyPressure >= 0.45 && t.buyPressure <= 0.55
+    const emaWeak = t.atr > 0 ? Math.abs(t.ema9 - t.ema21) < t.atr * 0.15 : false
+    const dissenters = Math.min(bullVotes, bearVotes)
+    const nearThresholdMarkers = (rsiNear ? 1 : 0) + (bpNear ? 1 : 0) + (emaWeak ? 1 : 0)
+    if (dissenters >= 1) {
+      if (nearThresholdMarkers === 0) {
+        // Genuine conflict — every indicator is decisive but they disagree
+        score = bullVotes >= bearVotes ? score - 10 : score + 10  // pull toward neutral
+        reasons.push(`Conflict penalty −10: ${dissenters} decisive dissenter${dissenters > 1 ? 's' : ''}`)
+      } else {
+        // Near-threshold weak evidence
+        score = bullVotes >= bearVotes ? score - 15 : score + 15
+        reasons.push(`Near-threshold penalty −15: ${nearThresholdMarkers} marginal indicator${nearThresholdMarkers > 1 ? 's' : ''}`)
+      }
+    }
+    // Weak-trend cap: 20 ≤ ADX < 25 means trend is developing but not confirmed.
+    // Hold confidence to 65 max so the minStrength gate filters weaker setups.
+    if (t.adx >= 20 && t.adx < 25) {
+      const capped = bullVotes >= bearVotes ? Math.min(score, 65) : Math.max(score, 35)
+      if (capped !== score) reasons.push(`ADX ${t.adx.toFixed(1)} — weak trend, confidence capped`)
+      score = capped
     }
     if (t.rsi14 > 50) reasons.push(`RSI ${t.rsi14.toFixed(1)} — bullish momentum`) ; else reasons.push(`RSI ${t.rsi14.toFixed(1)} — bearish momentum`)
     if (t.ema9 > t.ema21) reasons.push('EMA9 > EMA21 — bullish trend') ; else reasons.push('EMA9 < EMA21 — bearish trend')
@@ -352,6 +393,16 @@ Return JSON only:
       }
     }
 
+    // ── ADX hard-gate — Scalp only ────────────────────────────────────────
+    // Belt-and-braces: the AI prompt says HOLD when ADX<20, but enforce it here
+    // so the contract is server-guaranteed regardless of model behaviour.
+    if (strategy === 'Scalp' && result.direction !== 'HOLD' && t.adx < 20) {
+      console.log(`[scalper/signal] ADX gate: ADX=${t.adx.toFixed(1)} < 20 → forcing HOLD (was ${result.direction})`)
+      result.direction = 'HOLD' as Direction
+      result.confidence = 0
+      result.reasons = [`ADX ${t.adx.toFixed(1)} < 20 — ranging market, scalp suppressed`, ...(result.reasons || []).slice(0, 3)]
+    }
+
     // ── Directional discipline — Scalp only ───────────────────────────────
     // Prevents the AI from reversing a 4/5 or 5/5 indicator consensus.
     // Near-threshold readings (RSI 48-52, BP 45-55%, tiny EMA gap) are
@@ -372,6 +423,17 @@ Return JSON only:
           ...(result.reasons || []).slice(0, 3),
           `Directional guard: AI ${aiDir} conflicts with ${voteStr} — converted to HOLD`,
         ]
+      }
+    }
+
+    // ── Weak-trend confidence cap — Scalp only ─────────────────────────────
+    // 20 ≤ ADX < 25 = trend exists but isn't confirmed. Cap confidence at 65
+    // so anything below strategy.minStrength is suppressed by the order gate.
+    if (strategy === 'Scalp' && result.direction !== 'HOLD' && t.adx >= 20 && t.adx < 25) {
+      if (typeof result.confidence === 'number' && result.confidence > 65) {
+        console.log(`[scalper/signal] Weak-trend cap: ADX=${t.adx.toFixed(1)} → confidence ${result.confidence}→65`)
+        result.confidence = 65
+        result.reasons = [...(result.reasons || []).slice(0, 3), `ADX ${t.adx.toFixed(1)} — weak trend, confidence capped at 65`]
       }
     }
 

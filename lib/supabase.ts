@@ -73,7 +73,7 @@ export const DEFAULT_STRATEGY: StrategySettings = {
   riskPct: 1,
   maxLoss: 3,
   maxPositions: 2,
-  minStrength: 65,
+  minStrength: 80,    // raised from 65 — audit shows 80-85% band is the only one with strong R:R + positive net P/L
   tpPips: 50,
   slPips: 25,
   watchlist: ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'XAU/USD', 'XAG/USD'],
