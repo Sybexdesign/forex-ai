@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { resetBroker } from '@/lib/brokers'
+import { getAdminClient } from '@/lib/supabase'
 
 function userClient(token: string) {
   return createClient(
@@ -41,15 +42,42 @@ export async function POST(req: NextRequest) {
   const { data: { user } } = await sb.auth.getUser()
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
+  // Account-switch safety: when activating a NEW row (or any change to is_active=true),
+  // block if the user has any OPEN trades. Switching with open positions risks
+  // orphaning them against the wrong broker_configs balance/credentials.
+  // (trades.status doesn't exist — the open-state column is `result`.)
+  if (is_active) {
+    const admin = getAdminClient()
+    const { count: openCount } = await admin
+      .from('trades')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', user.id)
+      .eq('result', 'OPEN')
+    if (typeof openCount === 'number' && openCount > 0) {
+      return NextResponse.json({
+        error: `Cannot switch accounts — ${openCount} open position${openCount === 1 ? '' : 's'} exist. Close all trades first.`,
+        code: 'OPEN_POSITIONS_EXIST',
+        openCount,
+      }, { status: 409 })
+    }
+  }
+
   // If setting active, deactivate all others first
   if (is_active) {
     await sb.from('broker_configs').update({ is_active: false }).eq('user_id', user.id)
   }
 
+  // Common timestamp for the activation stamp so worker + UI see the same value.
+  const switchedAt = new Date().toISOString()
+
   if (id) {
     // Update existing — only update config if new values provided (don't overwrite masked)
-    const updatePayload: any = { label, is_active, updated_at: new Date().toISOString() }
+    const updatePayload: any = { label, is_active, updated_at: switchedAt }
     if (config && !hasOnlyMasked(config)) updatePayload.config = config
+    // Stamp last_switched_at only on the row being activated; deactivations are not
+    // worth signalling, and re-saving an already-active row without flipping the
+    // flag shouldn't reset the worker.
+    if (is_active === true) updatePayload.last_switched_at = switchedAt
     const { data, error } = await sb.from('broker_configs').update(updatePayload).eq('id', id).select().single()
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
     // Drop the env-default broker singleton on any active-flag change so subsequent
@@ -60,9 +88,11 @@ export async function POST(req: NextRequest) {
   }
 
   // Insert new
-  const { data, error } = await sb.from('broker_configs').insert({
+  const insertPayload: any = {
     user_id: user.id, broker_type, label, config: config || {}, is_active: is_active ?? false,
-  }).select().single()
+  }
+  if (is_active === true) insertPayload.last_switched_at = switchedAt
+  const { data, error } = await sb.from('broker_configs').insert(insertPayload).select().single()
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
   if (is_active) resetBroker()
   return NextResponse.json({ config: data })

@@ -77,13 +77,77 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
   }
 
   async function setActive(id: string) {
-    await authFetch('/api/broker-config', {
-      method: 'POST',
-      body: JSON.stringify({ id, is_active: true }),
-    })
-    onToast?.('Active broker updated', '#00ff87')
-    load()
-    onBrokerSaved?.()
+    // Pre-flight: block the switch entirely if open positions exist. The server
+    // re-checks too (returns 409 with code 'OPEN_POSITIONS_EXIST') so we're
+    // covered against a position opening between this check and the POST.
+    try {
+      const acctRes = await authFetch('/api/account')
+      const acct    = await acctRes.json()
+      const openN   = Array.isArray(acct.openTrades) ? acct.openTrades.length : 0
+      if (openN > 0) {
+        onToast?.(`Close ${openN} open trade${openN === 1 ? '' : 's'} before switching accounts`, '#ff3056')
+        return
+      }
+    } catch { /* fall through; server-side guard is the safety net */ }
+
+    // Warning confirmation — switching restarts the broker resolver and the worker
+    // will reconnect on its next poll (≤30s). Mirror Trade pauses until then.
+    const ok = window.confirm(
+      'Switch active broker?\n\n' +
+      'This will restart the broker connection. Mirror Trade will pause for up to 30 seconds while the worker reconnects.\n\n' +
+      'Continue?'
+    )
+    if (!ok) return
+
+    let switchedToBroker: string | undefined
+    try {
+      const res = await authFetch('/api/broker-config', {
+        method: 'POST',
+        body: JSON.stringify({ id, is_active: true }),
+      })
+      const d = await res.json()
+      if (!res.ok || d.error) {
+        // Server-side open-positions guard fires here as fallback
+        if (d.code === 'OPEN_POSITIONS_EXIST') {
+          onToast?.(`Close ${d.openCount ?? '?'} open trade${d.openCount === 1 ? '' : 's'} before switching accounts`, '#ff3056')
+        } else {
+          onToast?.('Switch failed: ' + (d.error || res.status), '#ff3056')
+        }
+        return
+      }
+      switchedToBroker = configs.find(c => c.id === id)?.label
+      onToast?.(`Account switched — worker reconnecting…`, '#00e5b4')
+      load()
+      onBrokerSaved?.()
+    } catch (e: any) {
+      onToast?.('Switch failed: ' + e.message, '#ff3056')
+      return
+    }
+
+    // Post-switch health check: poll worker status + account at +30s. Confirms the
+    // worker has rebuilt its broker connection against the new active row and the
+    // EA/broker is reachable. Non-blocking — UI returns immediately.
+    setTimeout(async () => {
+      try {
+        const [statusRes, acctRes] = await Promise.all([
+          authFetch('/api/worker/status'),
+          authFetch('/api/account'),
+        ])
+        const status = await statusRes.json()
+        const acct   = await acctRes.json()
+        if (acct.broker && acct.balance > 0) {
+          const balStr = `${acct.currency || 'USD'} ${Number(acct.balance).toFixed(2)}`
+          onToast?.(`✓ Worker connected to ${acct.broker} — balance ${balStr}`, '#00ff87')
+        } else if (status?.isAlive) {
+          onToast?.(`⚠ Worker alive but broker balance is $0 — check EA / credentials for ${switchedToBroker || 'new account'}`, '#ffb800')
+        } else {
+          const since = status?.lastSeenAgeS != null ? `${Math.round(status.lastSeenAgeS / 60)}m ago` : 'unknown'
+          onToast?.(`⚠ Worker last seen ${since} — may need restart on host`, '#ffb800')
+        }
+      } catch (e: any) {
+        onToast?.('Health check failed: ' + e.message, '#ffb800')
+      }
+    }, 30_000)
   }
 
   async function testConnection() {

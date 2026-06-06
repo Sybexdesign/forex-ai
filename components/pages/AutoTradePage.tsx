@@ -248,6 +248,20 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   }, [userId])
 
   useEffect(() => { loadOpenTrades() }, [loadOpenTrades])
+
+  // Account-switch reaction: when the active broker name changes (account.broker)
+  // OR the broker_configs row was just re-activated (account.lastSwitchedAt), clear
+  // the per-pair and per-section cooldown trackers so the new account isn't
+  // throttled by stale state from the previous one.
+  const accountBroker = account?.broker as string | undefined
+  const accountSwitchedAt = account?.lastSwitchedAt as string | undefined
+  useEffect(() => {
+    if (!accountBroker && !accountSwitchedAt) return
+    lastPairPlacedRef.current.clear()
+    lastAutoPlacedRef.current.clear()
+    autoScalpExecutedRef.current.clear()
+    console.log(`[auto] Account switched (broker=${accountBroker || '?'} switchedAt=${accountSwitchedAt || '—'}) — pair cooldowns reset`)
+  }, [accountBroker, accountSwitchedAt])
   useEffect(() => { openTradesRef.current = openTrades }, [openTrades])
   useEffect(() => { pricesRef.current = prices }, [prices])
   useEffect(() => { accountRef.current = account }, [account])

@@ -491,14 +491,20 @@ async function fetchRiskState() {
   const dailyLossPct = (balance > 0 && realizedPL < 0)
     ? Math.abs(realizedPL) / balance
     : 0
-  // Detect broker switch: if the active broker name changed (user flipped is_active
-  // in broker_configs), drop any stale derived state. balance and openCount come
-  // from the new broker fresh, but log so the operator sees it.
-  if (cachedRisk && cachedRisk.broker && acct.broker && cachedRisk.broker !== acct.broker) {
-    console.log(`[risk] broker switch detected — was '${cachedRisk.broker}' now '${acct.broker}' — cache reset`)
-    wlog('info', `Broker switch: ${cachedRisk.broker} → ${acct.broker} · balance now ${balance}`, { metadata: { from: cachedRisk.broker, to: acct.broker, balance } })
+  // Detect broker switch via two signals (either fires):
+  //   1. Broker NAME changed (e.g. MT5 Direct → OANDA): different adapter resolved
+  //   2. last_switched_at advanced: same broker name but config row was re-activated
+  //      (e.g. re-saved credentials or flipped is_active off then back on)
+  // Both invalidate the cache, both log to worker_logs so the operator can audit.
+  const nameChanged = cachedRisk && cachedRisk.broker && acct.broker && cachedRisk.broker !== acct.broker
+  const stampChanged = cachedRisk && acct.lastSwitchedAt && cachedRisk.lastSwitchedAt &&
+                       acct.lastSwitchedAt !== cachedRisk.lastSwitchedAt
+  if (nameChanged || stampChanged) {
+    const reason = nameChanged ? `name '${cachedRisk.broker}' → '${acct.broker}'` : `last_switched_at advanced to ${acct.lastSwitchedAt}`
+    console.log(`[worker] Account switch detected — reconnecting broker immediately (${reason})`)
+    wlog('info', `Account switch detected: ${reason} · balance now ${balance}`, { metadata: { from: cachedRisk.broker, to: acct.broker, lastSwitchedAt: acct.lastSwitchedAt, balance } })
   }
-  cachedRisk   = { balance, openCount, dailyLossPct, broker: acct.broker }
+  cachedRisk   = { balance, openCount, dailyLossPct, broker: acct.broker, lastSwitchedAt: acct.lastSwitchedAt || null }
   riskCachedAt = Date.now()
   return cachedRisk
 }

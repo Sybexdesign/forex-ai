@@ -26,7 +26,33 @@ export async function GET(req: NextRequest) {
       syncClosedTrades(token, openTrades).catch(() => {})
     }
 
-    return NextResponse.json({ ...summary, broker: broker.name, openTrades })
+    // Surface the active broker_configs row's last_switched_at so the worker can
+    // detect mid-session account switches AND same-broker reconfigure events that
+    // the broker-name check alone misses. Read via admin client; gracefully skip
+    // on any error (this is metadata, not a critical path).
+    let lastSwitchedAt: string | null = null
+    if (token) {
+      try {
+        const parts = token.split('.')
+        if (parts.length >= 3) {
+          const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString())
+          const userId = payload?.sub
+          if (userId) {
+            const admin = getAdminClient()
+            const { data: cfg } = await admin
+              .from('broker_configs')
+              .select('last_switched_at')
+              .eq('user_id', userId)
+              .eq('is_active', true)
+              .limit(1)
+              .maybeSingle()
+            lastSwitchedAt = cfg?.last_switched_at ?? null
+          }
+        }
+      } catch { /* metadata fetch is best-effort */ }
+    }
+
+    return NextResponse.json({ ...summary, broker: broker.name, openTrades, lastSwitchedAt })
   } catch (error: any) {
     console.error('[account]', error)
     return NextResponse.json({ error: error.message }, { status: 500 })
