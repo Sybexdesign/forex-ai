@@ -216,9 +216,24 @@ function writeLocalStrategy(s: StrategySettings) {
   try { localStorage.setItem(STRATEGY_LS_KEY, JSON.stringify(s)) } catch { /* quota */ }
 }
 
+export interface AutoTradeGate {
+  enabled:  boolean
+  sections: string[]   // e.g. ['scalp'] or ['scalp','mirror']
+  pairs:    string[]   // e.g. ['XAU/USD','XAG/USD']
+}
+
+const DEFAULT_AUTO_TRADE: AutoTradeGate = {
+  enabled:  false,
+  sections: ['scalp'],
+  pairs:    ['XAU/USD', 'XAG/USD'],
+}
+
 export function useStrategy(userId?: string) {
   // Initialise immediately from localStorage so the UI is correct before any network call
   const [strategy, setStrategyState] = useState<StrategySettings | null>(() => readLocalStrategy())
+  // Auto-trade gate. Stored server-side (top-level columns on strategies); browser
+  // initialises to safe-off defaults until the first /api/strategy GET returns.
+  const [autoTrade, setAutoTradeState] = useState<AutoTradeGate>(DEFAULT_AUTO_TRADE)
 
   const setStrategy = useCallback((s: StrategySettings) => {
     writeLocalStrategy(s)
@@ -235,6 +250,14 @@ export function useStrategy(userId?: string) {
       // Only overwrite localStorage if the DB returned something other than bare defaults
       if (data.settings && data.settings.watchlist?.length) {
         setStrategy(data.settings)
+      }
+      // Auto-trade gate has no localStorage shadow — always reflect what DB says.
+      if (data.autoTrade && typeof data.autoTrade === 'object') {
+        setAutoTradeState({
+          enabled:  !!data.autoTrade.enabled,
+          sections: Array.isArray(data.autoTrade.sections) ? data.autoTrade.sections : DEFAULT_AUTO_TRADE.sections,
+          pairs:    Array.isArray(data.autoTrade.pairs)    ? data.autoTrade.pairs    : DEFAULT_AUTO_TRADE.pairs,
+        })
       }
     } catch { /* keep localStorage value on network error */ }
   }, [userId, setStrategy])
@@ -262,6 +285,31 @@ export function useStrategy(userId?: string) {
     return {}
   }, [userId, setStrategy])
 
+  // Update the auto-trade gate. Optimistically updates local state then POSTs to
+  // /api/strategy with the autoTrade payload. The current `settings` is sent
+  // alongside so the upsert doesn't blank-out unrelated fields.
+  const saveAutoTrade = useCallback(async (partial: Partial<AutoTradeGate>): Promise<{ error?: string }> => {
+    const next: AutoTradeGate = { ...autoTrade, ...partial }
+    setAutoTradeState(next)
+    if (!userId) return {}
+    try {
+      const res = await fetch('/api/strategy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId, settings: strategy, autoTrade: next }),
+      })
+      const data = await res.json()
+      if (!res.ok || data.error) {
+        console.warn('[autoTrade] DB sync failed:', data.error || res.status)
+        return { error: data.error || `HTTP ${res.status}` }
+      }
+    } catch (e: any) {
+      console.warn('[autoTrade] DB sync failed:', e.message)
+      return { error: e.message }
+    }
+    return {}
+  }, [userId, autoTrade, strategy])
+
   useEffect(() => { load() }, [load])
-  return { strategy, save }
+  return { strategy, save, autoTrade, saveAutoTrade }
 }

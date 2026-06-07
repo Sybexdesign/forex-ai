@@ -2,12 +2,13 @@
 // components/pages/AutoTradePage.tsx
 // Full-auto + semi-auto trading with prop firm enforcement
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Panel, LoadingDots, CopyValue } from '../ui'
 import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { authFetch } from '@/lib/api'
 import type { ScanSignal, ScanDiagnostic } from '@/hooks/useScanner'
 import type { StrategySettings } from '@/lib/supabase'
+import type { AutoTradeGate } from '@/hooks/useForex'
 
 const TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1H', '4H']
 const METALS_ONLY = ['XAU/USD', 'XAG/USD']
@@ -61,6 +62,12 @@ function Pager({ page, total, onPage }: { page: number; total: number; onPage: (
 interface AutoTradePageProps {
   strategy: StrategySettings
   onSaveStrategy: (s: StrategySettings) => Promise<unknown> | void
+  // Server-side auto-trade gate (Fix 6). Reads from strategies table top-level
+  // columns via /api/strategy. Worker reads the same row independently every
+  // 5 min via loadStrategy(), so toggling here turns the 24/7 worker engine on
+  // or off without needing the browser to stay open.
+  autoTrade: AutoTradeGate
+  onSaveAutoTrade: (partial: Partial<AutoTradeGate>) => Promise<{ error?: string }>
   account: any
   onToast: (msg: string, color?: string) => void
   newsInWindow?: boolean
@@ -86,7 +93,7 @@ interface AutoTradePageProps {
   watchlist: string[]
 }
 
-export default function AutoTradePage({ strategy, onSaveStrategy, account, onToast, newsInWindow = false, userId, prices = {}, onRefreshAccount, onRefreshTrades, scanner, timeframe, setTimeframe, watchlist: rawWatchlist }: AutoTradePageProps) {
+export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onSaveAutoTrade, account, onToast, newsInWindow = false, userId, prices = {}, onRefreshAccount, onRefreshTrades, scanner, timeframe, setTimeframe, watchlist: rawWatchlist }: AutoTradePageProps) {
   // Always restrict to metals — defensive filter in case AppShell passes extra pairs
   const watchlist = rawWatchlist.filter(p => METALS_ONLY.includes(p)).length
     ? rawWatchlist.filter(p => METALS_ONLY.includes(p))
@@ -105,10 +112,12 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   const [pfEnabled, setPfEnabled]     = useState(false)
   const [pfRiskCap, setPfRiskCap]     = useState<number | null>(null)  // null = not yet loaded
 
-  // Auto-trading — all settings persisted to localStorage so state survives reload/refresh
-  const [autoTradeEnabled, setAutoTradeEnabled] = useState<boolean>(() => {
-    try { return localStorage.getItem('at_enabled') === 'true' } catch { return false }
-  })
+  // Auto-trading toggles + sections + pairs now live in Supabase (top-level
+  // columns on strategies via onSaveAutoTrade). UI-only preferences (profit
+  // target % and fixed USD amount) stay in localStorage — these don't need
+  // to be server-visible because the worker doesn't use them.
+  const autoTradeEnabled = autoTrade.enabled
+  const setAutoTradeEnabled = (v: boolean) => { void onSaveAutoTrade({ enabled: v }) }
   const [profitTargetPct, setProfitTargetPct] = useState<number>(() => {
     try { return parseInt(localStorage.getItem('at_targetPct') || '75', 10) } catch { return 75 }
   })
@@ -119,18 +128,18 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   // persisted to Supabase via /api/strategy). The button row below writes back via onSaveStrategy.
   const maxConcurrentTrades = strategy.maxPositions
   const setMaxConcurrentTrades = (n: number) => onSaveStrategy({ ...strategy, maxPositions: n })
-  const [autoSections, setAutoSections] = useState<Set<string>>(() => {
-    try {
-      const s = localStorage.getItem('at_sections')
-      return s ? new Set(JSON.parse(s)) : new Set(['scalp'])
-    } catch { return new Set(['scalp']) }
-  })
-  const [autoPairs, setAutoPairs] = useState<Set<string>>(() => {
-    try {
-      const s = localStorage.getItem('at_pairs')
-      return s ? new Set(JSON.parse(s)) : new Set(METALS_ONLY)
-    } catch { return new Set(METALS_ONLY) }
-  })
+  // Sections and pairs derive from the server-side autoTrade gate. The setters
+  // accept a Set updater (matching the old API) and push the new value to Supabase.
+  const autoSections = useMemo(() => new Set(autoTrade.sections), [autoTrade.sections])
+  const setAutoSections = (updater: (prev: Set<string>) => Set<string>) => {
+    const next = updater(new Set(autoTrade.sections))
+    void onSaveAutoTrade({ sections: [...next] })
+  }
+  const autoPairs = useMemo(() => new Set(autoTrade.pairs), [autoTrade.pairs])
+  const setAutoPairs = (updater: (prev: Set<string>) => Set<string>) => {
+    const next = updater(new Set(autoTrade.pairs))
+    void onSaveAutoTrade({ pairs: [...next] })
+  }
   const autoScalpExecutedRef                      = useRef<Set<string>>(new Set())
   const lastAutoPlacedRef                         = useRef<Map<string, number>>(new Map())  // key=section-pair → last placement ms
   const lastPairPlacedRef                         = useRef<Map<string, number>>(new Map())  // key=pair → last placement ms across ALL sections (5-min cooldown)
@@ -280,11 +289,30 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   useEffect(() => { accountRef.current = account }, [account])
 
   // Persist auto-trade settings to localStorage on every change
-  useEffect(() => { try { localStorage.setItem('at_enabled',   String(autoTradeEnabled))       } catch {} }, [autoTradeEnabled])
+  // at_enabled, at_sections, at_pairs are now server-side via onSaveAutoTrade.
+  // Only the two UI-only preferences remain in localStorage.
   useEffect(() => { try { localStorage.setItem('at_targetPct', String(profitTargetPct))         } catch {} }, [profitTargetPct])
   useEffect(() => { try { localStorage.setItem('at_fixedUsd',  String(fixedProfitUsd))          } catch {} }, [fixedProfitUsd])
-  useEffect(() => { try { localStorage.setItem('at_sections',  JSON.stringify([...autoSections])) } catch {} }, [autoSections])
-  useEffect(() => { try { localStorage.setItem('at_pairs',     JSON.stringify([...autoPairs]))    } catch {} }, [autoPairs])
+
+  // Poll /api/worker/status every 30s so the indicator panel can show whether the
+  // 24/7 worker engine will actually execute orders (PAPER = decision-log only,
+  // LIVE = real orders). Critical pairing with autoTrade.enabled — both must be
+  // true for the worker to autonomously place trades.
+  const [workerStatus, setWorkerStatus] = useState<{ mode: string | null; isAlive: boolean; lastSeenAgeS: number | null } | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    const fetchStatus = async () => {
+      try {
+        const res = await authFetch('/api/worker/status')
+        if (!res.ok) return
+        const d = await res.json()
+        if (!cancelled) setWorkerStatus({ mode: d.mode || null, isAlive: !!d.isAlive, lastSeenAgeS: d.lastSeenAgeS ?? null })
+      } catch { /* keep last */ }
+    }
+    fetchStatus()
+    const id = setInterval(fetchStatus, 30_000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
 
   // Sync profit target to EA — fires whenever either component changes.
   // Sends both components (fixedUsd, targetPct) and the precomputed close amount so the EA
@@ -769,6 +797,56 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
         </div>
       </div>
 
+      {/* ── Worker Engine Status — Fix 6 (24/7 server-side mirror exec) ─────── */}
+      {(() => {
+        const mirrorEngineEnabled = autoTrade.enabled
+        const mode                = workerStatus?.mode || 'unknown'
+        const isLive              = mode === 'live'
+        const isPaper             = mode === 'paper'
+        const workerAlive         = workerStatus?.isAlive === true
+        // Critical mismatch: user has flipped auto_trade_enabled=true but worker
+        // is still in paper. Code will log decisions but won't place real orders.
+        const paperWhileEnabled = mirrorEngineEnabled && isPaper
+        const accent = paperWhileEnabled ? '#ffb800'
+          : (mirrorEngineEnabled && isLive ? '#00ff87'
+            : '#607080')
+        return (
+          <div style={{
+            background:   `${accent}10`,
+            border:       `1px solid ${accent}40`,
+            borderRadius: 5,
+            padding:      '10px 14px',
+            display:      'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+            flexWrap:     'wrap',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+              <span style={{
+                fontSize: 10, fontWeight: 700, letterSpacing: 1.5,
+                color: accent,
+                padding: '3px 8px', borderRadius: 3,
+                background: `${accent}22`,
+              }}>
+                24/7 WORKER ENGINE
+              </span>
+              <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                Mirror exec: <b style={{ color: mirrorEngineEnabled ? '#00ff87' : 'var(--text-muted)' }}>{mirrorEngineEnabled ? 'ENABLED' : 'OFF'}</b>
+                <span style={{ margin: '0 8px', color: 'var(--text-dim)' }}>·</span>
+                Mode: <b style={{ color: isLive ? '#00ff87' : isPaper ? '#ffb800' : 'var(--text-muted)' }}>{mode.toUpperCase()}</b>
+                <span style={{ margin: '0 8px', color: 'var(--text-dim)' }}>·</span>
+                Worker: <b style={{ color: workerAlive ? '#00ff87' : '#ff3056' }}>{workerAlive ? 'ALIVE' : 'OFFLINE'}</b>
+              </span>
+            </div>
+            <div style={{ fontSize: 11, color: accent, fontWeight: 600, maxWidth: 540 }}>
+              {paperWhileEnabled
+                ? '⚠ Mirror exec enabled but worker is in PAPER mode — logs decisions only, no real orders. Set WORKER_MODE=live on DigitalOcean to enable 24/7 execution.'
+                : mirrorEngineEnabled && isLive
+                  ? '✓ Worker will autonomously execute even when this browser tab is closed.'
+                  : '○ Browser must remain open for auto-trades to execute. Flip auto_trade_enabled=true and WORKER_MODE=live for 24/7 execution.'}
+            </div>
+          </div>
+        )
+      })()}
+
       {/* ── Auto Trading Control Panel ──────────────────────────────── */}
       <div style={{
         background: autoTradeEnabled ? 'rgba(0,229,180,0.05)' : 'rgba(255,255,255,0.02)',
@@ -788,7 +866,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
             </div>
           </div>
           <button
-            onClick={() => setAutoTradeEnabled(v => !v)}
+            onClick={() => setAutoTradeEnabled(!autoTradeEnabled)}
             style={{
               padding: '8px 22px', borderRadius: 4, border: 'none', cursor: 'pointer',
               fontWeight: 700, fontSize: 13, letterSpacing: 1.5, flexShrink: 0,

@@ -78,7 +78,7 @@ export default function AppShell() {
     }
     return 'dark'
   })
-  const { strategy: savedStrategy, save: saveStrategy } = useStrategy(user?.id)
+  const { strategy: savedStrategy, save: saveStrategy, autoTrade, saveAutoTrade } = useStrategy(user?.id)
   // savedStrategy is initialised from localStorage synchronously, so this is correct on first render.
   // Falls back to DEFAULT_STRATEGY only when the user has never saved (no localStorage entry).
   const strategy = savedStrategy ?? DEFAULT_STRATEGY
@@ -425,6 +425,7 @@ export default function AppShell() {
             <AutoTradePage
               strategy={strategy} account={account} onToast={addToast}
               onSaveStrategy={handleSaveStrategy}
+              autoTrade={autoTrade} onSaveAutoTrade={saveAutoTrade}
               newsInWindow={news?.hasHighImpactInWindow || false}
               userId={user?.id} prices={prices}
               onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades}

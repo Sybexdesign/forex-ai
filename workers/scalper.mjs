@@ -45,6 +45,11 @@ const STRATEGY_REFRESH_MS = 5 * 60_000  // re-pull live strategy every 5 min
 // browser values; both code paths feed the same /api/orders endpoint.
 const MIRROR_SL_CAP = 35
 const MIRROR_TP_CAP = 70
+
+// Server-side auto-trade execution (Fix 6 — mirror execution audit).
+// PAIR_COOLDOWN_MS matches AutoTradePage so browser + worker can't double-trade.
+const PAIR_COOLDOWN_MS    = 5 * 60_000
+const lastPairPlacedRef   = new Map()  // pair → ms timestamp of last auto-trade placement
 const HEARTBEAT_MS     = 30 * 60_000
 const FETCH_TIMEOUT_MS = 45_000       // Claude API can take 10-15 s
 const MAX_SIG_BATCH    = 3            // max concurrent Claude calls per sweep
@@ -66,6 +71,12 @@ let liveStrategy = {
   hardDailyStop: true,
   hardNews: true,
   demoLock: false,
+  // Server-side auto-trade gate (Fix 6). All three default to safe-off so the
+  // worker won't autonomously execute until the user explicitly flips
+  // strategies.auto_trade_enabled=TRUE AND the worker is on WORKER_MODE=live.
+  autoTradeEnabled:  false,
+  autoTradeSections: ['scalp'],
+  autoTradePairs:    ['XAU/USD', 'XAG/USD'],
 }
 
 // ── Pairs + Strategy Defaults ─────────────────────────────────────────────────
@@ -112,6 +123,18 @@ function getSession(d = new Date()) {
 function getStrategy(pair, session) {
   if (pair.startsWith('XA')) return 'Breakout'
   return PAIR_STRATEGY[pair] || 'Momentum'
+}
+
+// ── Auto-trade session block (Fix 6 — mirrors AutoTradePage day-aware block) ──
+// Mon-Sat (UTC day 1-6), hour 20-23  → daily-close loss window (block)
+// Sunday (UTC day 0),    hour 0-20    → pre-open dead zone (block)
+// Sunday                  hour 22-23  → weekly market open (ALLOW)
+function autoTradeSessionBlocked(d = new Date()) {
+  const utcDay  = d.getUTCDay()
+  const utcHour = d.getUTCHours()
+  if (utcDay >= 1 && utcDay <= 6 && utcHour >= 20 && utcHour <= 23) return 'daily-close'
+  if (utcDay === 0 && utcHour < 21) return 'sunday-pre-open'
+  return null
 }
 
 // ── Session direction bias (precious metals only) ─────────────────────────────
@@ -480,8 +503,16 @@ async function loadStrategy() {
     const data = await apiFetch(`/api/strategy?userId=${encodeURIComponent(WORKER_USER_ID)}`)
     if (data?.settings && typeof data.settings === 'object') {
       liveStrategy = { ...liveStrategy, ...data.settings }
-      console.log(`[strategy] loaded — minStrength=${liveStrategy.minStrength}% riskPct=${liveStrategy.riskPct}% SL=${liveStrategy.slPips}p TP=${liveStrategy.tpPips}p maxPos=${liveStrategy.maxPositions}`)
     }
+    // Fix 6 — also merge the auto-trade gate so the worker knows whether to
+    // execute autonomously. Defaults preserve safe-off when /api/strategy
+    // doesn't return the field (older deploys / migration not yet applied).
+    if (data?.autoTrade && typeof data.autoTrade === 'object') {
+      liveStrategy.autoTradeEnabled  = !!data.autoTrade.enabled
+      liveStrategy.autoTradeSections = Array.isArray(data.autoTrade.sections) ? data.autoTrade.sections : ['scalp']
+      liveStrategy.autoTradePairs    = Array.isArray(data.autoTrade.pairs)    ? data.autoTrade.pairs    : ['XAU/USD','XAG/USD']
+    }
+    console.log(`[strategy] loaded — minStrength=${liveStrategy.minStrength}% riskPct=${liveStrategy.riskPct}% SL=${liveStrategy.slPips}p TP=${liveStrategy.tpPips}p maxPos=${liveStrategy.maxPositions} | autoEnabled=${liveStrategy.autoTradeEnabled} sections=[${liveStrategy.autoTradeSections.join(',')}] pairs=[${liveStrategy.autoTradePairs.join(',')}]`)
   } catch (e) {
     console.warn('[strategy] fetch failed — using cached values:', e.message)
   }
@@ -515,7 +546,27 @@ async function fetchRiskState() {
   return cachedRisk
 }
 
-async function placeOrder(pair, direction, signal) {
+// Decision logger for the auto-trade engine. Every skip/execute event lands in
+// worker_logs with a reason code so the operator can audit why a signal didn't
+// (or did) fire. Reason values: executed | skipped-confidence | skipped-adx |
+// skipped-cooldown | skipped-session-daily-close | skipped-sunday-preopen |
+// skipped-maxpositions | skipped-disabled | skipped-paper-mode |
+// skipped-pair-filter | skipped-section-disabled | skipped-staleness
+async function logAutoTradeDecision(reason, pair, direction, signal, extra = {}) {
+  return wlog('order', `auto-trade ${reason}: ${pair} ${direction}`, {
+    pair,
+    session: getSession(),
+    metadata: {
+      reason,
+      direction,
+      confidence: signal?.confidence,
+      ...extra,
+    },
+  })
+}
+
+// section: 'scalp' (signal direction) or 'mirror' (inverted direction)
+async function placeOrder(pair, direction, signal, section = 'scalp') {
   // Send the full live strategy so runRiskGuards() in lib/risk.ts can enforce
   // maxPositions, maxLoss, hardDailyStop, hardNews, and session times — not just
   // sizing/SL/TP. Sized off the user's configured riskPct, not a hardcoded 1%.
@@ -534,7 +585,11 @@ async function placeOrder(pair, direction, signal) {
     ? Math.min(MIRROR_TP_CAP, Math.max(floorTp, sourceTpPips))
     : floorTp
   const nowIso       = new Date().toISOString()
-  const signalRef    = `worker-${pair.replace('/', '')}-${Date.now()}`
+  // Source attribution: 'scalp' for forward direction, 'mirror' for inverse.
+  // signal_id_ref carries a worker- prefix so audit queries can isolate
+  // server-placed trades from browser-placed trades within the same source.
+  const source       = section === 'mirror' ? 'mirror' : 'scalp'
+  const signalRef    = `worker-${section}-${pair.replace('/', '')}-${Date.now()}`
   return apiFetch('/api/orders', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -550,7 +605,7 @@ async function placeOrder(pair, direction, signal) {
       userId:              WORKER_USER_ID || undefined,
       maxConcurrentTrades: liveStrategy.maxPositions,
       // Audit attribution — see 20260606_trades_source_tracking migration.
-      source:              'worker',
+      source,
       source_sl_pips:      sourceSlPips,
       source_tp_pips:      sourceTpPips,
       signal_at:           nowIso,
@@ -667,48 +722,98 @@ async function processSignal(pair, tick, strategy, session, direction) {
   stats.alerts++
   wlog('alert', `${dir} ${pair} — confidence ${conf}%`, { pair, session, metadata: { direction: dir, confidence: conf, strategy, session } })
 
-  // Risk guards + order placement (live mode only)
+  // ── Server-side auto-trade execution (Fix 6 — 24/7 mirror engine) ──────────
+  // Triple-locked: WORKER_MODE=live AND auto_trade_enabled=true (per-user DB
+  // flag, defaults FALSE) AND signal passes every gate. Browser path still
+  // exists in parallel; this just makes the worker an independent autonomous
+  // executor so closing the browser doesn't stop trading.
   let placed = false
-  if (WORKER_MODE === 'live') {
-    if (tradingHalted) {
-      console.log('[risk] trading halted — skipping order')
-    } else {
-      let risk
-      try { risk = await fetchRiskState() } catch { /* skip order on error */ }
 
-      if (risk) {
-        // Daily loss halt is balance-relative. The threshold is liveStrategy.maxLoss
-        // (a percentage from /api/strategy, e.g. 3 = 3%), applied to the LIVE balance
-        // pulled fresh by fetchRiskState. dailyLossPct itself is realizedPL / balance,
-        // so changing account size scales the threshold automatically.
-        const maxLossFrac = (liveStrategy.maxLoss || 3) / 100
-        if (risk.dailyLossPct >= maxLossFrac) {
-          tradingHalted = true
-          if (!haltNotified) {
-            haltNotified = true
-            const lossUSD = (risk.dailyLossPct * risk.balance).toFixed(2)
-            const limitUSD = (maxLossFrac * risk.balance).toFixed(2)
-            await tgSend(`🛑 <b>Daily loss limit reached (${liveStrategy.maxLoss}%)</b> — trading halted for today.\nLoss: $${lossUSD} / Limit: $${limitUSD} of $${risk.balance.toFixed(2)} balance.\nWorker still scanning and alerting in paper mode.`)
-          }
-        } else if (risk.openCount >= liveStrategy.maxPositions) {
-          console.log(`[risk] ${risk.openCount}/${liveStrategy.maxPositions} trades open — skipping order`)
-        } else {
-          try {
-            const result = await placeOrder(pair, dir, signal)
-            if (result.success) {
-              placed = true
-              stats.trades++
-              // Invalidate the risk cache — openCount just increased; serving the
-              // stale value lets the next signal slip past the maxPositions gate.
-              cachedRisk = null
-              console.log(`[order] ✓ [${ACCOUNT_TYPE.toUpperCase()}] ${pair} ${dir} → trade ${result.tradeId} @ ${result.filledPrice} lots=${result.lots}`)
-              wlog('order', `${dir} order placed`, { pair, session, metadata: { direction: dir, success: true, tradeId: result.tradeId, filledPrice: result.filledPrice, lots: result.lots } })
-            } else {
-              console.log(`[order] blocked: ${(result.reasons || []).join(', ')}`)
-              wlog('order', `${dir} order blocked: ${(result.reasons || []).join(', ')}`, { pair, session, metadata: { direction: dir, success: false, reasons: result.reasons } })
+  if (WORKER_MODE !== 'live') {
+    logAutoTradeDecision('skipped-paper-mode', pair, dir, signal)
+  } else if (!liveStrategy.autoTradeEnabled) {
+    logAutoTradeDecision('skipped-disabled', pair, dir, signal)
+  } else if (!liveStrategy.autoTradePairs.includes(pair)) {
+    logAutoTradeDecision('skipped-pair-filter', pair, dir, signal, { allowedPairs: liveStrategy.autoTradePairs })
+  } else if (tradingHalted) {
+    logAutoTradeDecision('skipped-daily-loss-halted', pair, dir, signal)
+  } else {
+    const blockReason = autoTradeSessionBlocked()
+    if (blockReason === 'daily-close') {
+      logAutoTradeDecision('skipped-session-daily-close', pair, dir, signal)
+    } else if (blockReason === 'sunday-pre-open') {
+      logAutoTradeDecision('skipped-sunday-preopen', pair, dir, signal)
+    } else {
+      // Per-pair cooldown — matches the browser's 5-min PAIR_COOLDOWN_MS so
+      // browser + worker never double-trade a pair within the same window.
+      const lastPlaced = lastPairPlacedRef.get(pair) || 0
+      if (Date.now() - lastPlaced < PAIR_COOLDOWN_MS) {
+        const remainingS = Math.round((PAIR_COOLDOWN_MS - (Date.now() - lastPlaced)) / 1000)
+        logAutoTradeDecision('skipped-cooldown', pair, dir, signal, { remainingS })
+      } else {
+        let risk
+        try { risk = await fetchRiskState() } catch { /* skip on error */ }
+
+        if (risk) {
+          // Daily loss halt is balance-relative. liveStrategy.maxLoss (% as a
+          // number, e.g. 3 = 3%) × live balance. Scales automatically with account size.
+          const maxLossFrac = (liveStrategy.maxLoss || 3) / 100
+          if (risk.dailyLossPct >= maxLossFrac) {
+            tradingHalted = true
+            if (!haltNotified) {
+              haltNotified = true
+              const lossUSD  = (risk.dailyLossPct * risk.balance).toFixed(2)
+              const limitUSD = (maxLossFrac        * risk.balance).toFixed(2)
+              await tgSend(`🛑 <b>Daily loss limit reached (${liveStrategy.maxLoss}%)</b> — trading halted for today.\nLoss: $${lossUSD} / Limit: $${limitUSD} of $${risk.balance.toFixed(2)} balance.\nWorker still scanning and alerting in paper mode.`)
             }
-          } catch (e) {
-            console.error('[order]', e.message)
+            logAutoTradeDecision('skipped-daily-loss-halted', pair, dir, signal)
+          } else {
+            // Iterate sections — place scalp first, then mirror. Each placement
+            // re-checks maxPositions against an incrementing local counter so
+            // both can fire only if there's room for both.
+            let openLocal   = risk.openCount
+            let placedAny   = false
+            for (const section of liveStrategy.autoTradeSections) {
+              if (section !== 'scalp' && section !== 'mirror') {
+                logAutoTradeDecision('skipped-section-disabled', pair, dir, signal, { section })
+                continue
+              }
+              if (openLocal >= liveStrategy.maxPositions) {
+                logAutoTradeDecision('skipped-maxpositions', pair, dir, signal, { section, openLocal, maxPositions: liveStrategy.maxPositions })
+                continue
+              }
+              const sectionDir = section === 'mirror'
+                ? (dir === 'BUY' ? 'SELL' : 'BUY')
+                : dir
+              try {
+                const result = await placeOrder(pair, sectionDir, signal, section)
+                if (result.success) {
+                  placedAny = true
+                  openLocal++
+                  stats.trades++
+                  console.log(`[order] ✓ [${ACCOUNT_TYPE.toUpperCase()}] ${section.toUpperCase()} ${pair} ${sectionDir} → trade ${result.tradeId} @ ${result.filledPrice} lots=${result.lots}`)
+                  await logAutoTradeDecision('executed', pair, sectionDir, signal, {
+                    section,
+                    tradeId:     result.tradeId,
+                    filledPrice: result.filledPrice,
+                    lots:        result.lots,
+                  })
+                } else {
+                  console.log(`[order] blocked (${section}): ${(result.reasons || []).join(', ')}`)
+                  await logAutoTradeDecision('skipped-server-blocked', pair, sectionDir, signal, { section, reasons: result.reasons })
+                }
+              } catch (e) {
+                console.error('[order]', e.message)
+                await logAutoTradeDecision('skipped-error', pair, sectionDir, signal, { section, error: e.message })
+              }
+            }
+            if (placedAny) {
+              placed = true
+              lastPairPlacedRef.set(pair, Date.now())
+              // Invalidate the risk cache — openCount just changed; serving the
+              // stale value lets the next signal slip past maxPositions.
+              cachedRisk = null
+            }
           }
         }
       }

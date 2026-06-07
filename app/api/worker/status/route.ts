@@ -38,6 +38,7 @@ export async function GET() {
 
     const lastStartupAt = bootRes.data?.created_at ?? null
     const lastSeenAt    = lastRes.data?.created_at ?? null
+    const bootMeta      = bootRes.data?.metadata   as { mode?: string; pairs?: string[]; threshold?: number } | null
     const brokerMeta    = brokerRes.data?.metadata as { broker?: string; balance?: number; currency?: string } | null
 
     const now = Date.now()
@@ -54,8 +55,12 @@ export async function GET() {
       lastStartupAgeS:  ageSec(lastStartupAt),
       lastSeenAt,
       lastSeenAgeS,
-      broker:           brokerMeta?.broker  ?? null,
-      balance:          brokerMeta?.balance ?? null,
+      // Worker mode comes from the boot banner metadata.mode field. Either
+      // 'paper' or 'live'. Used by the UI to show whether auto_trade_enabled=true
+      // will actually result in real orders or just decision logs.
+      mode:             (bootMeta?.mode || '').toLowerCase() || null,
+      broker:           brokerMeta?.broker   ?? null,
+      balance:          brokerMeta?.balance  ?? null,
       currency:         brokerMeta?.currency ?? null,
     })
   } catch (e: any) {
