@@ -228,8 +228,23 @@ export default function StrategyPage({ strategy, onSave }: StrategyPageProps) {
             <SliderRow
               label="Stop loss" value={local.slPips} min={5} max={80} step={1} unit=" pips"
               onChange={v => set('slPips', v)} color="#ff3056"
-              description="Max loss pips before auto-close"
+              description="Stop loss distance in pips"
             />
+            {/* Auto-trade floor/cap explainer (Option C — MIRROR_SL_CAP in AutoTradePage). */}
+            <div style={{
+              background: 'rgba(0,128,255,0.06)',
+              border:     '1px solid rgba(0,128,255,0.18)',
+              borderRadius: 3,
+              padding:   '8px 12px',
+              fontSize:  11,
+              lineHeight: 1.5,
+              color:     'var(--text-secondary)',
+              marginBottom: 16,
+            }}>
+              ℹ This is the <b>minimum</b> SL. Auto-trade may widen up to 35 pips based on
+              market volatility — the engine's ATR-derived SL is used when it sits between
+              this value and the 35-pip cap.
+            </div>
 
             {/* R:R display */}
             <div style={{
