@@ -17,6 +17,19 @@ const SCALP_REFRESH_MS = 15_000  // refresh scalp signals every 15 seconds
 const SCALP_EXPIRY_MS  = 3 * 60_000  // 3-minute signal validity
 const PAIR_COOLDOWN_MS = 5 * 60_000  // minimum gap between two auto-trades on the same pair (any section) — caps the 30-60/hour overtrading
 
+// SL/TP clamp bounds for scalp + mirror auto paths (Option C — see ATR audit).
+// strategy.slPips/tpPips act as the FLOOR (minimum SL/TP). The engine's
+// ATR-derived value is allowed to widen up to MIRROR_*_CAP. This stops the
+// previous behaviour where strategy.slPips=18 was acting as a ceiling on top
+// of an engine that already produces 30-80 pip SLs — placing a tight stop
+// inside one bar of XAU/USD noise on every trade.
+//
+// 35-pip cap chosen because 5-day XAU ATR has a 5th percentile of ~24 pips,
+// so even calm-market signals will produce SLs below the cap. Above the cap
+// the position size becomes too small to be useful.
+const MIRROR_SL_CAP = 35
+const MIRROR_TP_CAP = 70  // = 2 × SL cap to preserve the 1:2 R:R target
+
 interface ScalpSignal {
   pair: string
   direction: 'BUY' | 'SELL' | 'HOLD'
@@ -345,14 +358,13 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
     setPlacingScalp(sig.pair)
     try {
       const pip = getPipValue(sig.pair)
-      // Derive SL/TP from the signal's price levels, then clamp by the user's
-      // strategy ceiling. The pre-clamp values are passed to the API as
-      // source_sl_pips/source_tp_pips so the clamp-impact audit can reconstruct
-      // whether the user's 18/36 cap was overriding the source's intent.
+      // Option C clamp: strategy.slPips/tpPips are the FLOOR, MIRROR_*_CAP is the
+      // outer ceiling, and the engine's ATR-derived value sits in between. The raw
+      // derived value is still passed as source_sl_pips for clamp-impact auditing.
       const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
       const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
-      const scalpSlPips   = Math.min(derivedSlPips, strategy.slPips)
-      const scalpTpPips   = Math.min(derivedTpPips, strategy.tpPips)
+      const scalpSlPips   = Math.min(MIRROR_SL_CAP, Math.max(strategy.slPips, derivedSlPips))
+      const scalpTpPips   = Math.min(MIRROR_TP_CAP, Math.max(strategy.tpPips, derivedTpPips))
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
@@ -401,11 +413,11 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
       const mirrorSl  = 2 * sig.entry - sig.sl
       const mirrorTp  = 2 * sig.entry - sig.tp
       const pip = getPipValue(sig.pair)
-      // Capture pre-clamp values for clamp-impact audit (see Fix 3 / handleScalpOrder).
+      // Option C clamp: strategy.slPips/tpPips floor, MIRROR_*_CAP outer ceiling.
       const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
       const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
-      const slPips        = Math.min(derivedSlPips, strategy.slPips)
-      const tpPips        = Math.min(derivedTpPips, strategy.tpPips)
+      const slPips        = Math.min(MIRROR_SL_CAP, Math.max(strategy.slPips, derivedSlPips))
+      const tpPips        = Math.min(MIRROR_TP_CAP, Math.max(strategy.tpPips, derivedTpPips))
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
@@ -450,11 +462,11 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   // Shared order placement for auto-trader — no UI loading state side-effects
   async function autoPlaceOrder(sig: ScalpSignal, isMirror: boolean): Promise<boolean> {
     const pip = getPipValue(sig.pair)
-    // Capture pre-clamp values for clamp-impact audit (see Fix 3 / handleScalpOrder).
+    // Option C clamp: strategy.slPips/tpPips floor, MIRROR_*_CAP outer ceiling.
     const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
     const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
-    const slPips        = Math.min(derivedSlPips, strategy.slPips)
-    const tpPips        = Math.min(derivedTpPips, strategy.tpPips)
+    const slPips        = Math.min(MIRROR_SL_CAP, Math.max(strategy.slPips, derivedSlPips))
+    const tpPips        = Math.min(MIRROR_TP_CAP, Math.max(strategy.tpPips, derivedTpPips))
     const direction = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
     const prefix    = isMirror ? 'mirror' : 'scalp'
     const signalRef = `${prefix}-${sig.pair.replace('/', '')}-${sig.fetchedAt}`

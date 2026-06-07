@@ -39,6 +39,12 @@ const SIG_COOLDOWN_MS  = 60_000       // 1 min between Claude calls per pair
 const ALERT_COOL_MS    = 15 * 60_000  // 15 min per pair+direction alert
 const RISK_CACHE_MS    = 30_000       // 30 s — matches EA balance push cadence so the daily-loss halt and openCount stay close to live; also invalidated on order/outcome/broker-switch
 const STRATEGY_REFRESH_MS = 5 * 60_000  // re-pull live strategy every 5 min
+
+// SL/TP clamp bounds — see AutoTradePage MIRROR_SL_CAP comment. Floor = user's
+// liveStrategy.slPips/tpPips; outer cap = these constants. Keep in sync with the
+// browser values; both code paths feed the same /api/orders endpoint.
+const MIRROR_SL_CAP = 35
+const MIRROR_TP_CAP = 70
 const HEARTBEAT_MS     = 30 * 60_000
 const FETCH_TIMEOUT_MS = 45_000       // Claude API can take 10-15 s
 const MAX_SIG_BATCH    = 3            // max concurrent Claude calls per sweep
@@ -513,11 +519,20 @@ async function placeOrder(pair, direction, signal) {
   // Send the full live strategy so runRiskGuards() in lib/risk.ts can enforce
   // maxPositions, maxLoss, hardDailyStop, hardNews, and session times — not just
   // sizing/SL/TP. Sized off the user's configured riskPct, not a hardcoded 1%.
-  // The worker derives its SL/TP from the AI signal's price levels (not from
-  // strategy), so source_sl_pips/tp_pips are computed here for audit attribution.
+  // The worker derives SL/TP from the AI signal's price levels and applies the
+  // same Option C floor/cap clamp the browser uses, then overrides slPips/tpPips
+  // in the strategy payload so /api/orders sizes off the clamped values.
   const pip = pipSize(pair)
-  const sourceSlPips = signal.sl  && signal.entry ? Math.abs(signal.entry - signal.sl) / pip : null
-  const sourceTpPips = signal.tp  && signal.entry ? Math.abs(signal.tp   - signal.entry) / pip : null
+  const sourceSlPips = signal.sl && signal.entry ? Math.abs(signal.entry - signal.sl) / pip : null
+  const sourceTpPips = signal.tp && signal.entry ? Math.abs(signal.tp   - signal.entry) / pip : null
+  const floorSl      = liveStrategy.slPips || 18
+  const floorTp      = liveStrategy.tpPips || 36
+  const clampedSl    = sourceSlPips !== null
+    ? Math.min(MIRROR_SL_CAP, Math.max(floorSl, sourceSlPips))
+    : floorSl
+  const clampedTp    = sourceTpPips !== null
+    ? Math.min(MIRROR_TP_CAP, Math.max(floorTp, sourceTpPips))
+    : floorTp
   const nowIso       = new Date().toISOString()
   const signalRef    = `worker-${pair.replace('/', '')}-${Date.now()}`
   return apiFetch('/api/orders', {
@@ -526,7 +541,9 @@ async function placeOrder(pair, direction, signal) {
     body:    JSON.stringify({
       pair,
       direction,
-      strategy:            liveStrategy,
+      // Spread liveStrategy and override slPips/tpPips with the clamped values so
+      // orders/route.ts sizes the position against the realised stop distance.
+      strategy:            { ...liveStrategy, slPips: clampedSl, tpPips: clampedTp },
       aiConfidence:        signal.confidence,
       checklistScore:      (signal.reasons || []).length,
       currentPrice:        signal.entry,
