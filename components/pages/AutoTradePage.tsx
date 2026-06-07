@@ -523,12 +523,23 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   // Auto-trade: execute scalp/mirror signals when autoTradeEnabled
   useEffect(() => {
     if (!autoTradeEnabled) return
-    // Asian/Close session block (20:00–23:59 UTC). Historical data showed this window
-    // produced 84% of total losses across 90 trades at 54.4% win rate (-$354 net).
-    // Browser auto-execution pauses here; manual trades from the cards remain possible.
-    const utcHour = new Date().getUTCHours()
-    if (utcHour >= 20 && utcHour <= 23) {
-      console.log(`[auto] Asian/Close session ${utcHour}:00 UTC — mirror/scalp execution paused (block window 20:00–23:59 UTC)`)
+    // Day-aware session block. The 20:00–23:59 UTC loss window was derived from
+    // Mon–Thu daily-close behaviour (84% of total losses, 54.4% win rate across 90
+    // trades). Sunday 22:00 UTC is a different regime — the weekly market open —
+    // and was being blocked unnecessarily. Sat 20–23 is moot (broker closed) but
+    // harmless to block.
+    //
+    //   Mon–Sat (UTC day 1–6), hour 20–23 → block (daily-close loss window)
+    //   Sunday  (UTC day 0),    hour 0–20  → block (pre-open dead zone)
+    //   Sunday                  hour 22–23 → ALLOWED (week open, manual regime)
+    const _autoNow  = new Date()
+    const utcHour   = _autoNow.getUTCHours()
+    const utcDay    = _autoNow.getUTCDay()
+    const isDailyClose   = utcDay >= 1 && utcDay <= 6 && utcHour >= 20 && utcHour <= 23
+    const isSundayPreOpen = utcDay === 0 && utcHour < 21
+    if (isDailyClose || isSundayPreOpen) {
+      const reason = isDailyClose ? 'daily-close block (Mon-Sat 20:00–23:59 UTC)' : 'Sunday pre-open block (before 21:00 UTC)'
+      console.log(`[auto] Session block active — execution paused (day=${utcDay} hour=${utcHour}, ${reason})`)
       return
     }
     void (async () => {
@@ -697,21 +708,30 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
   const fmtCountdown = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 
   // Session status — recomputed every render (scalpTick fires once per second).
-  // Mirrors the block window inside the auto-trade useEffect so the UI matches behaviour.
+  // Mirrors the day-aware block inside the auto-trade useEffect so UI matches
+  // behaviour. Sunday 22-23 is the weekly market open (allowed); Mon-Sat 20-23
+  // is the daily-close loss window (blocked); Sunday pre-open (< 21) is blocked.
   const _scalpTickRef = scalpTick  // reference so React tracks re-renders
   void _scalpTickRef
   const _utcNow   = new Date()
   const _utcHour  = _utcNow.getUTCHours()
+  const _utcDay   = _utcNow.getUTCDay()
   const _utcLabel = _utcNow.toISOString().slice(11, 19)
+  const _isDailyClose    = _utcDay >= 1 && _utcDay <= 6 && _utcHour >= 20 && _utcHour <= 23
+  const _isSundayPreOpen = _utcDay === 0 && _utcHour < 21
+  const _isSundayOpen    = _utcDay === 0 && _utcHour >= 22 && _utcHour <= 23
   const sessionLabel =
-    _utcHour >= 7  && _utcHour <= 11 ? 'London'
-    : _utcHour >= 12 && _utcHour <= 15 ? 'London-NY Overlap'
-    : _utcHour >= 16 && _utcHour <= 19 ? 'New York'
-    : _utcHour >= 20 && _utcHour <= 23 ? 'Asian / Daily Close'
+    _isSundayOpen                       ? 'Sunday Open (week start)'
+    : _utcHour >= 7  && _utcHour <= 11  ? 'London'
+    : _utcHour >= 12 && _utcHour <= 15  ? 'London-NY Overlap'
+    : _utcHour >= 16 && _utcHour <= 19  ? 'New York'
+    : _utcHour >= 20 && _utcHour <= 23  ? 'Asian / Daily Close'
+    : _isSundayPreOpen                  ? 'Sunday Pre-Open'
     : 'Off Hours (Asian)'
-  const sessionBlocked = _utcHour >= 20 && _utcHour <= 23
+  const sessionBlocked = _isDailyClose || _isSundayPreOpen
   const sessionColor   = sessionBlocked ? '#ff3056'
-    : (_utcHour >= 12 && _utcHour <= 15) ? '#00e5b4'   // best window
+    : _isSundayOpen ? '#ffb800'                           // week-open = caution amber
+    : (_utcHour >= 12 && _utcHour <= 15) ? '#00e5b4'      // best window
     : '#0080ff'
 
   return (
@@ -741,7 +761,9 @@ export default function AutoTradePage({ strategy, onSaveStrategy, account, onToa
         <div style={{ fontSize: 11, fontWeight: 700, color: sessionBlocked ? '#ff3056' : '#00e5b4' }}>
           {autoTradeEnabled
             ? (sessionBlocked
-                ? '⏸ AUTO-EXECUTION PAUSED — Asian/Close block (20:00–23:59 UTC)'
+                ? (_isDailyClose
+                    ? '⏸ AUTO-EXECUTION PAUSED — daily-close block (Mon–Sat 20:00–23:59 UTC)'
+                    : '⏸ AUTO-EXECUTION PAUSED — Sunday pre-open (until 22:00 UTC)')
                 : '▶ AUTO-EXECUTION ACTIVE')
             : '○ Auto-trading off'}
         </div>
