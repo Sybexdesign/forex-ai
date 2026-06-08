@@ -760,8 +760,11 @@ async function processSignal(pair, tick, strategy, session, direction) {
   lastSigFetch.set(pair, Date.now())
   stats.sigChecks++
 
-  // HTF alignment: check 15m trend before spending an AI call
-  if (direction) {
+  // HTF alignment: check 15m trend before spending an AI call.
+  // Scalp skips this — the regime classifier handles ranging conditions where
+  // 15m is inherently ambiguous, and the regime-aware effectiveMinStrength gate
+  // downstream provides the actual filter. Browser path doesn't apply HTF either.
+  if (direction && strategy !== 'Scalp') {
     const aligned = await isHTFAligned(pair, direction)
     if (!aligned) {
       console.log(`[htf] ${pair} — 15m disagrees with 5m ${direction} setup — skipping AI call`)
