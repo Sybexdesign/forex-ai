@@ -117,7 +117,15 @@ export async function POST(req: NextRequest) {
     // Needed for the hard-USD-cap inside manageTrades AND for the post-close
     // >1R Telegram alert below. Fetched once per sync; tolerates missing row.
     const { data: stratRow } = await sb.from('strategies').select('settings').eq('user_id', userId).single()
-    const riskPct = +(stratRow?.settings?.riskPct ?? 0.5)
+    const riskPct           = +(stratRow?.settings?.riskPct ?? 0.5)
+    // hardCapMultiplier is read from strategies.settings (default 1.25 if absent
+    // or out of range). Plumbed through riskCtx so manageTrades enforces the
+    // user-configured cap dynamically. Clamped to [1.0, 3.0] so a typo can't
+    // accidentally disable the cap (e.g. 0) or balloon it to absurd levels.
+    const hardCapMultRaw    = Number(stratRow?.settings?.hardCapMultiplier ?? 1.25)
+    const hardCapMultiplier = isFinite(hardCapMultRaw) && hardCapMultRaw >= 1.0 && hardCapMultRaw <= 3.0
+      ? hardCapMultRaw
+      : 1.25
     const oneRusd = balance > 0 && riskPct > 0 ? balance * (riskPct / 100) : 0
     // Snapshot of last-tick positions BEFORE we overwrite row.config — needed to
     // recover the EA's last-known unrealised P/L for trades that disappeared this tick.
@@ -278,9 +286,9 @@ export async function POST(req: NextRequest) {
         latestPrices,
         candleCache,
         tradeState,
-        // Fix 8 — pass live balance + user's riskPct so trade-manager can enforce
-        // the absolute USD cap (= balance × riskPct/100 × 2).
-        { accountBalance: balance, riskPct },
+        // Fix 8 — pass live balance + user's riskPct + hardCapMultiplier so
+        // trade-manager enforces the absolute USD cap dynamically per user.
+        { accountBalance: balance, riskPct, hardCapMultiplier },
       )
       tradeState = nextState
       for (const line of log) console.log(line)

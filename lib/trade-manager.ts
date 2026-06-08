@@ -71,13 +71,16 @@ export interface ManageResult {
 
 /**
  * Optional risk context. When provided, manageTrades applies a hard USD floor:
- * close any position whose unrealised P/L drops below -(balance × riskPct/100 × 1.25).
- * This is a belt-and-braces second layer on top of the -1.5R MAX_LOSS_R check —
- * catches cases where MT5 SL gap-throughs make the R-based check fire late.
+ * close any position whose unrealised P/L drops below
+ *   -(balance × riskPct/100 × hardCapMultiplier).
+ * hardCapMultiplier is now user-configurable via strategies.settings; falls back
+ * to 1.25 when not supplied (catches cases where MT5 SL gap-throughs make the
+ * -1.5R MAX_LOSS_R R-based check fire late).
  */
 export interface RiskContext {
-  accountBalance: number   // live balance from broker (USD)
-  riskPct:        number   // user's risk per trade (%) e.g. 0.5
+  accountBalance:     number    // live balance from broker (USD)
+  riskPct:            number    // user's risk per trade (%) e.g. 0.5
+  hardCapMultiplier?: number    // multiplier on 1R for the hard USD cap (default 1.25)
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -147,14 +150,17 @@ export function manageTrades(
   const nextState: Record<string, TradeState> = {}
   const openTickets = new Set(openPositions.map(p => String(p.ticket)))
 
-  // Hard USD cap = balance × riskPct/100 × 1.25 (i.e. 1.25× the user's per-trade risk).
-  // Tightened from 1.5× after a -$71.48 gap-through that hit 1.46R nearly maxed the
-  // previous cap. 1.25R = ~$60 on a $9.7k / 0.5% account, capping single-trade losses
-  // at 25% over target risk instead of 50%. Trade-off: slightly more aggressive close
-  // during normal volatility, but prevents F-style 1.5R losses from happening again.
+  // Hard USD cap = balance × riskPct/100 × hardCapMultiplier.
+  // Multiplier is now user-configurable via strategies.settings.hardCapMultiplier
+  // (default 1.25). Tightened from 1.5× after a -$71.48 gap-through that hit
+  // 1.46R nearly maxed the previous cap. Allowing per-user tuning so prop-firm
+  // accounts with tighter risk policy can set, say, 1.10 without a code change.
   // Computed once per tick; falsy/zero when riskCtx is not provided, which disables the check.
+  const hardCapMult = (riskCtx && typeof riskCtx.hardCapMultiplier === 'number' && riskCtx.hardCapMultiplier > 0)
+    ? riskCtx.hardCapMultiplier
+    : 1.25
   const hardCapUsd = (riskCtx && riskCtx.accountBalance > 0 && riskCtx.riskPct > 0)
-    ? riskCtx.accountBalance * (riskCtx.riskPct / 100) * 1.25
+    ? riskCtx.accountBalance * (riskCtx.riskPct / 100) * hardCapMult
     : 0
 
   for (const pos of openPositions) {
@@ -212,7 +218,7 @@ export function manageTrades(
     // worse price than expected. Cap = balance × riskPct/100 × 2 (2× target risk).
     // Only enabled when riskCtx is provided by the caller.
     if (hardCapUsd > 0 && pos.profit < -hardCapUsd) {
-      log.push(`[tm] ${sym}#${key} HARD-CAP-CLOSE: pl=$${pos.profit.toFixed(2)} < -$${hardCapUsd.toFixed(2)} (1.25× user risk)`)
+      log.push(`[tm] ${sym}#${key} HARD-CAP-CLOSE: pl=$${pos.profit.toFixed(2)} < -$${hardCapUsd.toFixed(2)} (${hardCapMult}× user risk)`)
       commands.push({
         id:        crypto.randomUUID(),
         type:      'close',
