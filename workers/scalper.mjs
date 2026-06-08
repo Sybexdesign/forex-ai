@@ -904,7 +904,15 @@ async function processSignal(pair, tick, strategy, session, direction) {
   }
   alertCooldowns.set(coolKey, Date.now())
   stats.alerts++
-  wlog('alert', `${dir} ${pair} — confidence ${conf}%`, { pair, session, metadata: { direction: dir, confidence: conf, strategy, session } })
+  wlog('alert', `${dir} ${pair} — confidence ${conf}%${signal.marketRegime ? ` [${signal.marketRegime}]` : ''}`, {
+    pair, session, metadata: {
+      direction: dir, confidence: conf, strategy, session,
+      marketRegime:         signal.marketRegime         ?? null,
+      effectiveMinStrength: signal.effectiveMinStrength ?? null,
+      suggestedSection:     signal.suggestedSection     ?? null,
+      adx:                  signal.adx                  ?? tick.adx ?? null,
+    },
+  })
 
   // ── Server-side auto-trade execution (Fix 6 — 24/7 mirror engine) ──────────
   // Triple-locked: WORKER_MODE=live AND auto_trade_enabled=true (per-user DB
