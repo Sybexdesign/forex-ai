@@ -95,6 +95,11 @@ const PARTIAL_LOCK_R  = 1.5          // lock SL at +0.5R level when profit hits 
 // DECAY_THRESHOLD raised from 0.4 → 0.5 so a trade peaking at +$20 closes at +$10
 // (50% of peak) instead of being allowed to fall to +$8 before triggering.
 const DECAY_THRESHOLD = 0.5
+// DECAY_MIN_PEAK_USD added 2026-06-08 after a +$14 → -$2.13 fill: decay-exit fired
+// at the 50% threshold ($7) but executed below zero due to ~2s queue lag. Only
+// activate decay when the trade has built a meaningful cushion (peak ≥ $20) so
+// the $10-decay-target is robust against typical XAU execution slippage of $1-3.
+const DECAY_MIN_PEAK_USD = 20
 const TRAIL_ATR_MULT_LOOSE = 1.0     // default trail distance when profit small
 const TRAIL_ATR_MULT_TIGHT = 0.5     // tighter trail when profit > PROFIT_TIGHTEN_USD
 const PROFIT_TIGHTEN_USD   = 15      // $-threshold to switch to tight trail
@@ -334,12 +339,13 @@ export function manageTrades(
     }
 
     // ── 5. Profit decay exit ─────────────────────────────────────────────────
+    // Activation gate: peak must reach DECAY_MIN_PEAK_USD ($20). Below that the
+    // 50% threshold is too small a cushion — a +$14 → +$7 trigger has historically
+    // filled at -$2 after the ~2s queue lag (real fill 2026-06-08).
     // Floor = 1.5 pips of profit (capped at $0.25) to survive execution slippage.
-    // A queued close takes ~2s to fill in MT5; without this floor a positive-profit
-    // trigger can fill negative after price moves during the execution delay.
     const decayCloseFloor = Math.min(1.5 * pvpl * pos.lots, 0.25)
-    if (peakProfit > 0 && pos.profit < peakProfit * DECAY_THRESHOLD && pos.profit >= decayCloseFloor) {
-      log.push(`[tm] ${sym}#${key} DECAY-EXIT: profit=$${pos.profit.toFixed(2)} < 50% of peak $${peakProfit.toFixed(2)} (floor=$${decayCloseFloor.toFixed(2)})`)
+    if (peakProfit >= DECAY_MIN_PEAK_USD && pos.profit < peakProfit * DECAY_THRESHOLD && pos.profit >= decayCloseFloor) {
+      log.push(`[tm] ${sym}#${key} DECAY-EXIT: profit=$${pos.profit.toFixed(2)} < 50% of peak $${peakProfit.toFixed(2)} (peak≥$${DECAY_MIN_PEAK_USD}, floor=$${decayCloseFloor.toFixed(2)})`)
       commands.push({
         id:        crypto.randomUUID(),
         type:      'close',

@@ -38,6 +38,12 @@ input ENUM_ORDER_TYPE_FILLING FillMode = ORDER_FILLING_RETURN;
 // v8.1 FIX - MIN HOLD TIME
 input int    MinHoldSeconds      = 60;   // no BE / trail / decay until trade is this old
 
+// v9.4 - DECAY EXIT MIN PEAK ($-cushion needed before decay activates)
+// Added after a +$14 → -$2.13 fill: decay triggered at the 50% level ($7) but
+// executed below zero due to ~2s MT5 queue lag. Setting the gate at $20 means
+// the 50% target ($10) survives typical XAU slippage of $1-3 per close.
+input double DecayMinPeakUsd     = 20.0;
+
 // v8.1 FIX - SPREAD + SESSION PROTECTION
 input int    MaxSpreadPips       = 30;   // skip SL actions if spread exceeds this
 input bool   UseRolloverFilter   = true; // skip actions during broker rollover 21:55-22:05
@@ -439,10 +445,13 @@ void RunProfitProtection()
       }
 
       double peak = g_prot[si].peakProfit;
-      if(peak > 0.1 && profit < peak * 0.40)
+      // v9.4 — decay only activates after peak ≥ DecayMinPeakUsd. Below the gate
+      // the trade is too thin to safely decay-exit (a +$14 → +$5 trigger filled
+      // at -$2 on 2026-06-08 due to ~2s queue lag).
+      if(peak >= DecayMinPeakUsd && profit < peak * 0.40)
       {
          Print("[pp] ", rawSym, "#", ticket, " DECAY-EXIT: profit=$", DoubleToString(profit, 2),
-               " < 40% of peak=$", DoubleToString(peak, 2), " held=", holdSecs, "s");
+               " < 40% of peak=$", DoubleToString(peak, 2), " (peak>=$", DoubleToString(DecayMinPeakUsd, 2), ") held=", holdSecs, "s");
          doClose = true;
       }
 
