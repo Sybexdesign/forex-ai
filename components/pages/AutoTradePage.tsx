@@ -7,6 +7,7 @@ import { Panel, LoadingDots, CopyValue } from '../ui'
 import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { authFetch } from '@/lib/api'
 import type { ScanSignal, ScanDiagnostic } from '@/hooks/useScanner'
+import { getSupabase } from '@/lib/supabase'
 import type { StrategySettings } from '@/lib/supabase'
 import type { AutoTradeGate } from '@/hooks/useForex'
 
@@ -611,6 +612,54 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     if (!autoTradeEnabled) return
     // No-op: worker is the execution owner. The loop body is intentionally empty.
   }, [scalpSignals, autoTradeEnabled, strategy.maxPositions, strategy.minStrength, circuitBreakerUntil]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Worker-placed trade notifications via Supabase Realtime.
+  // Subscribes to INSERTs on the trades table filtered by user_id. Fires a toast
+  // and refreshes the open-trades list whenever the worker (or any other source)
+  // places a new trade. UPDATEs (close events) also fire so the user sees the
+  // outcome land. Restores the toast that the disabled browser auto-loop used
+  // to provide for browser-fired trades.
+  useEffect(() => {
+    if (!userId) return
+    const sb = getSupabase()
+    const channel = sb
+      .channel(`trades-realtime-${userId}`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'trades', filter: `user_id=eq.${userId}` },
+        (payload) => {
+          const t = (payload as any).new || {}
+          const color = t.direction === 'BUY' ? DIR_COLOR.BUY : DIR_COLOR.SELL
+          const conf  = t.signal_confidence ? ` ${t.signal_confidence}%` : ''
+          const src   = t.source ? ` (${t.source})` : ''
+          onToast?.(`⚡ ${t.direction} ${t.pair}${src}${conf}`, color)
+          loadOpenTrades()
+          onRefreshTrades?.()
+          setTimeout(() => onRefreshAccount?.(), 1500)
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'trades', filter: `user_id=eq.${userId}` },
+        (payload) => {
+          const t   = (payload as any).new || {}
+          const old = (payload as any).old || {}
+          // Only toast on result transitions (OPEN → WIN/LOSS/CANCELLED/CLOSED).
+          if (!old.result || old.result === t.result || old.result !== 'OPEN') return
+          const isWin = t.result === 'WIN'
+          const color = isWin ? '#00e5b4' : t.result === 'LOSS' ? '#ff3056' : '#888'
+          const pl = typeof t.pl_usd === 'number'
+            ? (t.pl_usd >= 0 ? `+$${t.pl_usd.toFixed(2)}` : `-$${Math.abs(t.pl_usd).toFixed(2)}`)
+            : ''
+          onToast?.(`${isWin ? '✓' : t.result === 'LOSS' ? '✗' : '○'} ${t.direction} ${t.pair} ${t.result} ${pl}`.trim(), color)
+          loadOpenTrades()
+          onRefreshTrades?.()
+          setTimeout(() => onRefreshAccount?.(), 1000)
+        }
+      )
+      .subscribe()
+    return () => { sb.removeChannel(channel) }
+  }, [userId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Profit target monitoring — 2s interval
   // Close threshold = fixedProfitUsd × profitTargetPct / 100
