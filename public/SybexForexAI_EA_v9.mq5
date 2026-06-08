@@ -447,11 +447,13 @@ void RunProfitProtection()
       double peak = g_prot[si].peakProfit;
       // v9.4 — decay only activates after peak ≥ DecayMinPeakUsd. Below the gate
       // the trade is too thin to safely decay-exit (a +$14 → +$5 trigger filled
-      // at -$2 on 2026-06-08 due to ~2s queue lag).
-      if(peak >= DecayMinPeakUsd && profit < peak * 0.40)
+      // at -$2 on 2026-06-08 due to ~2s queue lag). Threshold raised 0.40 → 0.50
+      // to match lib/trade-manager.ts DECAY_THRESHOLD — the two layers should
+      // agree on when a trade is "decaying enough" to close.
+      if(peak >= DecayMinPeakUsd && profit < peak * 0.50)
       {
          Print("[pp] ", rawSym, "#", ticket, " DECAY-EXIT: profit=$", DoubleToString(profit, 2),
-               " < 40% of peak=$", DoubleToString(peak, 2), " (peak>=$", DoubleToString(DecayMinPeakUsd, 2), ") held=", holdSecs, "s");
+               " < 50% of peak=$", DoubleToString(peak, 2), " (peak>=$", DoubleToString(DecayMinPeakUsd, 2), ") held=", holdSecs, "s");
          doClose = true;
       }
 
