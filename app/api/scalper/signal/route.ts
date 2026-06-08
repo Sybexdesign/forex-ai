@@ -97,20 +97,18 @@ Respond ONLY with valid JSON — no markdown, no prose.`,
 
 // ─── Market-regime classifier ────────────────────────────────────────────────
 // Maps ADX(14) to one of four regimes, each with its own minStrength threshold.
-// Replaces the previous hard ADX<20 HOLD gate + weak-trend cap with a unified
-// dynamic gate: ranging markets need only 65% conviction (because Scalp's
-// 4/5-vote majority already gives 71%), while strong trends require 75%.
+// Operator policy 2026-06-08: mirror is the only auto-traded section, and
+// strong-trend regimes (ADX ≥35) are where the AI is statistically calibrated
+// — i.e. exactly where mirror is fighting the move. Setting strong-trend's
+// threshold to 100 hard-suppresses all auto-trades there. Manual scalp/mirror
+// buttons in the UI bypass this gate and still work.
 //
-//   ranging       ADX < 20    threshold 65   — chop, 4/5 votes can squeeze through
+//   ranging       ADX < 20    threshold 65   — chop, AI miscalibrated, mirror wins
 //   weak-trend    ADX 20-24   threshold 68   — developing trend
 //   trending      ADX 25-34   threshold 72   — confirmed trend (default 72)
-//   strong-trend  ADX ≥ 35    threshold 75   — momentum dominant
+//   strong-trend  ADX ≥ 35    threshold 100  — momentum dominant, mirror SUPPRESSED
 //
-// Section bias:
-//   ranging       → mirror   (mean-reversion friendly — fades into the noise)
-//   weak-trend    → mirror   (early reversal candidates)
-//   trending      → scalp    (follow the move)
-//   strong-trend  → scalp    (trend-following, high conviction)
+// suggestedSection is informational only — execution is always mirror by policy.
 export type MarketRegime = 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
 
 export function classifyRegime(adx: number): {
@@ -118,10 +116,10 @@ export function classifyRegime(adx: number): {
   effectiveMinStrength: number
   suggestedSection: 'mirror' | 'scalp'
 } {
-  if (adx < 20)  return { regime: 'ranging',      effectiveMinStrength: 65, suggestedSection: 'mirror' }
-  if (adx < 25)  return { regime: 'weak-trend',   effectiveMinStrength: 68, suggestedSection: 'mirror' }
-  if (adx < 35)  return { regime: 'trending',     effectiveMinStrength: 72, suggestedSection: 'scalp'  }
-  return           { regime: 'strong-trend', effectiveMinStrength: 75, suggestedSection: 'scalp'  }
+  if (adx < 20)  return { regime: 'ranging',      effectiveMinStrength: 65,  suggestedSection: 'mirror' }
+  if (adx < 25)  return { regime: 'weak-trend',   effectiveMinStrength: 68,  suggestedSection: 'mirror' }
+  if (adx < 35)  return { regime: 'trending',     effectiveMinStrength: 72,  suggestedSection: 'scalp'  }
+  return           { regime: 'strong-trend', effectiveMinStrength: 100, suggestedSection: 'scalp'  }
 }
 
 function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
