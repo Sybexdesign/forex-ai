@@ -599,94 +599,17 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     }
   }, [pendingSignals, autoExecute, enabled]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Auto-trade: execute scalp/mirror signals when autoTradeEnabled
+  // Auto-trade execution: DISABLED in the browser. The worker (workers/scalper.mjs)
+  // is the single owner of auto-trade placement to prevent same-second duplicate
+  // orders that were causing paired retcode 10016 cancellations (e.g. 10:50, 11:16
+  // on 2026-06-08 — browser and worker both firing within the same EA polling
+  // window). Manual scalp/mirror buttons still work; this only stops the loop.
+  //
+  // If you need to re-enable browser execution (e.g. worker outage), revert this
+  // hunk — the full logic is preserved in git history at commit a63843d~1.
   useEffect(() => {
     if (!autoTradeEnabled) return
-    // Circuit-breaker guard — server-side gate also enforces this in the worker,
-    // but checking client-side avoids a noisy round-trip when CB is active.
-    if (circuitBreakerUntil && Date.now() < circuitBreakerUntil) {
-      console.log(`[auto] Circuit breaker active — ${cbCountdown} remaining; skipping tick`)
-      return
-    }
-    // Day-aware session block. The 20:00–23:59 UTC loss window was derived from
-    // Mon–Thu daily-close behaviour (84% of total losses, 54.4% win rate across 90
-    // trades). Sunday 22:00 UTC is a different regime — the weekly market open —
-    // and was being blocked unnecessarily. Sat 20–23 is moot (broker closed) but
-    // harmless to block.
-    //
-    //   Mon–Sat (UTC day 1–6), hour 20–23 → block (daily-close loss window)
-    //   Sunday  (UTC day 0),    hour 0–20  → block (pre-open dead zone)
-    //   Sunday                  hour 22–23 → ALLOWED (week open, manual regime)
-    const _autoNow  = new Date()
-    const utcHour   = _autoNow.getUTCHours()
-    const utcDay    = _autoNow.getUTCDay()
-    const isDailyClose   = utcDay >= 1 && utcDay <= 6 && utcHour >= 20 && utcHour <= 23
-    const isSundayPreOpen = utcDay === 0 && utcHour < 21
-    if (isDailyClose || isSundayPreOpen) {
-      const reason = isDailyClose ? 'daily-close block (Mon-Sat 20:00–23:59 UTC)' : 'Sunday pre-open block (before 21:00 UTC)'
-      console.log(`[auto] Session block active — execution paused (day=${utcDay} hour=${utcHour}, ${reason})`)
-      return
-    }
-    void (async () => {
-      const now = Date.now()
-      // Prune stale fetchedAt keys from dedup set (older than 10 min) to prevent unbounded growth
-      for (const k of [...autoScalpExecutedRef.current]) {
-        const ts = parseInt(k.split('-').pop() ?? '0', 10)
-        if (now - ts > 10 * 60_000) autoScalpExecutedRef.current.delete(k)
-      }
-
-      // Effective open count = DB open trades minus any currently being auto-closed.
-      let localOpenCount = openTradesRef.current.length - closingForTargetRef.current.size
-      for (const [pair, sig] of Object.entries(scalpSignals)) {
-        if (!sig || sig.direction === 'HOLD' || sig.blocked) continue
-        if (!autoPairs.has(pair)) continue
-        if (now > sig.expiresAt) continue
-        // Dynamic minStrength: prefer signal's regime-aware effectiveMinStrength
-        // when present (ranging=65, weak-trend=68, trending=72, strong=75), falling
-        // back to the user-configured strategy.minStrength when missing.
-        const effMin = typeof sig.effectiveMinStrength === 'number'
-          ? sig.effectiveMinStrength
-          : strategy.minStrength
-        if (sig.confidence < effMin) continue
-        // 5-min per-pair cooldown across ALL sections (scalp + mirror). Prevents
-        // back-to-back trades on the same pair when two consecutive signals only
-        // 15s apart both pass the gate. Historical data showed 30-60 trades/hour;
-        // a healthy XAU scalp cadence is 4-8/hour.
-        const lastPairTrade = lastPairPlacedRef.current.get(pair) ?? 0
-        if (now - lastPairTrade < PAIR_COOLDOWN_MS) {
-          const remainingS = Math.round((PAIR_COOLDOWN_MS - (now - lastPairTrade)) / 1000)
-          console.log(`[auto] ${pair} pair cooldown active — ${remainingS}s remaining`)
-          continue
-        }
-        for (const section of ['scalp', 'mirror']) {
-          if (!autoSections.has(section)) continue
-          if (localOpenCount >= maxConcurrentTrades) continue
-
-          // Per-pair+section cooldown: don't re-place within the signal's 3-min validity window.
-          // Prevents hammering the API every 15s when signals refresh with a new fetchedAt.
-          const cooldownKey = `${section}-${pair}`
-          const lastPlaced  = lastAutoPlacedRef.current.get(cooldownKey) ?? 0
-          if (now - lastPlaced < SCALP_EXPIRY_MS) continue
-
-          const key = `${section}-${pair}-${sig.fetchedAt}`
-          if (autoScalpExecutedRef.current.has(key)) continue
-          autoScalpExecutedRef.current.add(key)
-
-          const isMirror = section === 'mirror'
-          const dir = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
-          const ok = await autoPlaceOrder(sig, isMirror)
-          if (ok) {
-            localOpenCount++
-            lastAutoPlacedRef.current.set(cooldownKey, now)  // record placement time (per-section)
-            lastPairPlacedRef.current.set(pair, now)          // and per-pair (5-min cross-section cooldown)
-            onToast(`⚡ Auto: ${dir} ${pair} (${section === 'scalp' ? 'scalp' : 'mirror'})`, DIR_COLOR[dir] || '#00e5b4')
-            loadOpenTrades()
-            onRefreshTrades?.()
-            setTimeout(() => onRefreshAccount?.(), 1500)
-          }
-        }
-      }
-    })()
+    // No-op: worker is the execution owner. The loop body is intentionally empty.
   }, [scalpSignals, autoTradeEnabled, strategy.maxPositions, strategy.minStrength, circuitBreakerUntil]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Profit target monitoring — 2s interval

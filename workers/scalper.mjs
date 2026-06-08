@@ -816,15 +816,13 @@ async function processSignal(pair, tick, strategy, session, direction) {
   // Evidence: XAU/USD BUY has 0% win rate in Asian/London/NY sessions; SELL has
   // 0% win rate during NY+LON overlap. Counter-session signals are systematically
   // wrong — suppressing them avoids placing losing trades and polluting ML data.
+  //
+  // Mirror sections flip the signal direction, so we now check inside the section
+  // loop (further down) against each section's effective direction. Here we only
+  // pre-compute the bias so it's available there. Skipping the whole signal at
+  // this layer would suppress mirror trades that ARE bias-aligned (e.g. signal
+  // BUY in SELL-only session → scalp blocked, but mirror flips to SELL = allowed).
   const sessionBias = getMetalSessionBias(pair)
-  if (sessionBias && dir !== 'HOLD' && dir !== sessionBias) {
-    const h = new Date().getUTCHours()
-    console.log(`[session-gate] ${pair} ${dir} blocked — session bias is ${sessionBias} at ${h}:00 UTC`)
-    wlog('info', `Session gate: ${pair} ${dir} blocked (bias=${sessionBias})`, {
-      pair, session, metadata: { direction: dir, sessionBias, utcHour: h, reason: 'session_direction_gate' },
-    })
-    return
-  }
 
   console.log(
     `[${pair}] ${strategy}/${session} → ${dir} ${conf}%` +
@@ -984,6 +982,18 @@ async function processSignal(pair, tick, strategy, session, direction) {
               const sectionDir = section === 'mirror'
                 ? (dir === 'BUY' ? 'SELL' : 'BUY')
                 : dir
+              // Per-section session-bias check: block only when the effective
+              // direction (after mirror flip) goes against the session's
+              // statistically dominant direction. Allows a mirror trade to fire
+              // when the scalp side is bias-blocked.
+              if (sessionBias && sectionDir !== 'HOLD' && sectionDir !== sessionBias) {
+                const h = new Date().getUTCHours()
+                console.log(`[session-gate] ${pair} ${section}=${sectionDir} blocked — bias is ${sessionBias} at ${h}:00 UTC`)
+                await logAutoTradeDecision('skipped-session-bias', pair, sectionDir, signal, {
+                  section, sessionBias, utcHour: h,
+                })
+                continue
+              }
               try {
                 const result = await placeOrder(pair, sectionDir, signal, section)
                 if (result.success) {
