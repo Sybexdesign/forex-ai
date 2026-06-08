@@ -5,7 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 import { manageTrades } from '@/lib/trade-manager'
-import { alertRiskBreach, alertProfitReversal } from '@/lib/telegram'
+import { alertRiskBreach, alertProfitReversal, alertCircuitBreaker } from '@/lib/telegram'
 
 export const dynamic = 'force-dynamic'
 
@@ -180,6 +180,9 @@ export async function POST(req: NextRequest) {
           // Fix 8 — post-close >1R Telegram alert. Use EA's last-known unrealised P/L
           // from the previous-tick snapshot. If the trade vanished with a loss exceeding
           // 1R of the user's risk, surface it so operator sees broker-side SL hits.
+          // Also arm the circuit-breaker (Fix 3 of this batch): pause auto-trade
+          // execution for 15 min so a gap-through doesn't immediately compound.
+          let circuitBreakerArmedAt: string | null = null
           if (oneRusd > 0) {
             for (const t of toClose) {
               const lastPos = t.oanda_trade_id ? prevPositionsByTicket[String(t.oanda_trade_id)] : null
@@ -188,7 +191,34 @@ export async function POST(req: NextRequest) {
                 alertRiskBreach({
                   pair: t.pair, ticket: t.oanda_trade_id, pl: lastPl, cap: oneRusd, reason: 'post-close-1R',
                 }).catch(() => {})
+                // Arm the circuit breaker for 15 min from this close. We write the
+                // earliest-armed timestamp so multiple losses don't shorten the pause.
+                if (!circuitBreakerArmedAt) {
+                  const until = new Date(Date.now() + 15 * 60_000).toISOString()
+                  circuitBreakerArmedAt = until
+                  console.warn(`[mt5-sync] CIRCUIT BREAKER ARMED — ${t.pair} lost $${Math.abs(lastPl).toFixed(2)} (1R=$${oneRusd.toFixed(2)}); pausing auto-trade until ${until}`)
+                  alertCircuitBreaker({
+                    pair: t.pair, loss: lastPl, oneR: oneRusd,
+                    pauseUntil: new Date(until).toUTCString().slice(17, 25) + ' UTC',
+                    pauseMin: 15,
+                  }).catch(() => {})
+                }
               }
+            }
+          }
+          // If circuit breaker fired, stash it in broker_configs.config so the
+          // worker (separate process) can read it via /api/account on its next
+          // fetchRiskState cycle. Worker will skip auto-trade execution until the
+          // timestamp passes.
+          if (circuitBreakerArmedAt) {
+            try {
+              // Merge into existing config — read latest first to avoid clobbering
+              // anything mt5-sync writes below in the same request.
+              const { data: cur } = await sb.from('broker_configs').select('config').eq('id', row.id).single()
+              const merged = { ...(cur?.config || {}), circuitBreakerUntil: circuitBreakerArmedAt }
+              await sb.from('broker_configs').update({ config: merged }).eq('id', row.id)
+            } catch (e: any) {
+              console.error('[mt5-sync] failed to persist circuitBreakerUntil:', e?.message)
             }
           }
         }

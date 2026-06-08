@@ -541,7 +541,14 @@ async function fetchRiskState() {
     console.log(`[worker] Account switch detected — reconnecting broker immediately (${reason})`)
     wlog('info', `Account switch detected: ${reason} · balance now ${balance}`, { metadata: { from: cachedRisk.broker, to: acct.broker, lastSwitchedAt: acct.lastSwitchedAt, balance } })
   }
-  cachedRisk   = { balance, openCount, dailyLossPct, broker: acct.broker, lastSwitchedAt: acct.lastSwitchedAt || null }
+  cachedRisk   = {
+    balance, openCount, dailyLossPct,
+    broker: acct.broker,
+    lastSwitchedAt: acct.lastSwitchedAt || null,
+    // Circuit-breaker timestamp written by mt5-sync after a >1R loss. Worker
+    // skips auto-trade execution while Date.now() < circuitBreakerUntil.
+    circuitBreakerUntil: acct.circuitBreakerUntil || null,
+  }
   riskCachedAt = Date.now()
   return cachedRisk
 }
@@ -753,6 +760,19 @@ async function processSignal(pair, tick, strategy, session, direction) {
       } else {
         let risk
         try { risk = await fetchRiskState() } catch { /* skip on error */ }
+
+        // Circuit breaker (Fix 3 — large-loss cooldown). Set by mt5-sync after
+        // any close with loss >1R. Pauses auto-trade for 15 min so a gap-through
+        // doesn't compound into back-to-back losses.
+        if (risk && risk.circuitBreakerUntil) {
+          const cbUntilMs = new Date(risk.circuitBreakerUntil).getTime()
+          if (Date.now() < cbUntilMs) {
+            const remainingS = Math.round((cbUntilMs - Date.now()) / 1000)
+            logAutoTradeDecision('skipped-circuit-breaker', pair, dir, signal, { remainingS, until: risk.circuitBreakerUntil })
+            await tgSend(formatAlert(pair, strategy, session, signal, 'paper'))
+            return
+          }
+        }
 
         if (risk) {
           // Daily loss halt is balance-relative. liveStrategy.maxLoss (% as a

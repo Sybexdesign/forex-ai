@@ -71,7 +71,7 @@ export interface ManageResult {
 
 /**
  * Optional risk context. When provided, manageTrades applies a hard USD floor:
- * close any position whose unrealised P/L drops below -(balance × riskPct/100 × 1.5).
+ * close any position whose unrealised P/L drops below -(balance × riskPct/100 × 1.25).
  * This is a belt-and-braces second layer on top of the -1.5R MAX_LOSS_R check —
  * catches cases where MT5 SL gap-throughs make the R-based check fire late.
  */
@@ -147,12 +147,14 @@ export function manageTrades(
   const nextState: Record<string, TradeState> = {}
   const openTickets = new Set(openPositions.map(p => String(p.ticket)))
 
-  // Hard USD cap = balance × riskPct/100 × 1.5 (i.e. 1.5× the user's per-trade risk).
-  // Tightened from 2× — historical worst loss of $82.20 would have been caught at the
-  // 1.5× threshold (~$71 on a $9.5k account at 0.5%). 2× would have let it through.
+  // Hard USD cap = balance × riskPct/100 × 1.25 (i.e. 1.25× the user's per-trade risk).
+  // Tightened from 1.5× after a -$71.48 gap-through that hit 1.46R nearly maxed the
+  // previous cap. 1.25R = ~$60 on a $9.7k / 0.5% account, capping single-trade losses
+  // at 25% over target risk instead of 50%. Trade-off: slightly more aggressive close
+  // during normal volatility, but prevents F-style 1.5R losses from happening again.
   // Computed once per tick; falsy/zero when riskCtx is not provided, which disables the check.
   const hardCapUsd = (riskCtx && riskCtx.accountBalance > 0 && riskCtx.riskPct > 0)
-    ? riskCtx.accountBalance * (riskCtx.riskPct / 100) * 1.5
+    ? riskCtx.accountBalance * (riskCtx.riskPct / 100) * 1.25
     : 0
 
   for (const pos of openPositions) {
@@ -210,7 +212,7 @@ export function manageTrades(
     // worse price than expected. Cap = balance × riskPct/100 × 2 (2× target risk).
     // Only enabled when riskCtx is provided by the caller.
     if (hardCapUsd > 0 && pos.profit < -hardCapUsd) {
-      log.push(`[tm] ${sym}#${key} HARD-CAP-CLOSE: pl=$${pos.profit.toFixed(2)} < -$${hardCapUsd.toFixed(2)} (1.5× user risk)`)
+      log.push(`[tm] ${sym}#${key} HARD-CAP-CLOSE: pl=$${pos.profit.toFixed(2)} < -$${hardCapUsd.toFixed(2)} (1.25× user risk)`)
       commands.push({
         id:        crypto.randomUUID(),
         type:      'close',

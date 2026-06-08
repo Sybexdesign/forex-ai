@@ -223,6 +223,28 @@ export async function alertRiskBreach(opts: {
   await send(lines)
 }
 
+// Circuit-breaker armed — fired by mt5-sync reconciliation when a trade closes
+// with loss exceeding 1R. Auto-trade execution pauses for the duration so a
+// gap-through-then-reenter doesn't compound the damage.
+export async function alertCircuitBreaker(opts: {
+  pair:       string
+  loss:       number
+  oneR:       number
+  pauseUntil: string  // ISO timestamp
+  pauseMin:   number
+}) {
+  const lines = [
+    `⚡ <b>CIRCUIT BREAKER ARMED — ${opts.pair}</b>`,
+    ``,
+    `Last trade lost <code>-$${Math.abs(opts.loss).toFixed(2)}</code> (1R = $${opts.oneR.toFixed(2)})`,
+    `Auto-trade execution paused for <b>${opts.pauseMin} min</b>`,
+    `Resumes after: ${opts.pauseUntil}`,
+    ``,
+    `Reduces compounding risk after gap-through events.`,
+  ].join('\n')
+  await send(lines)
+}
+
 // Profit-reversal warning — fired by trade-manager when a winning trade has
 // peaked above $10 and pulled back >30%. Informational; the decay-exit rule
 // is the actual close trigger that follows shortly. One alert per ticket.

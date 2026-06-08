@@ -28,9 +28,10 @@ export async function GET(req: NextRequest) {
 
     // Surface the active broker_configs row's last_switched_at so the worker can
     // detect mid-session account switches AND same-broker reconfigure events that
-    // the broker-name check alone misses. Read via admin client; gracefully skip
-    // on any error (this is metadata, not a critical path).
-    let lastSwitchedAt: string | null = null
+    // the broker-name check alone misses. Also surface circuitBreakerUntil so the
+    // worker can pause auto-trade after large-loss close events (Fix 3).
+    let lastSwitchedAt:      string | null = null
+    let circuitBreakerUntil: string | null = null
     if (token) {
       try {
         const parts = token.split('.')
@@ -41,18 +42,19 @@ export async function GET(req: NextRequest) {
             const admin = getAdminClient()
             const { data: cfg } = await admin
               .from('broker_configs')
-              .select('last_switched_at')
+              .select('last_switched_at, config')
               .eq('user_id', userId)
               .eq('is_active', true)
               .limit(1)
               .maybeSingle()
-            lastSwitchedAt = cfg?.last_switched_at ?? null
+            lastSwitchedAt      = cfg?.last_switched_at ?? null
+            circuitBreakerUntil = (cfg?.config as any)?.circuitBreakerUntil ?? null
           }
         }
       } catch { /* metadata fetch is best-effort */ }
     }
 
-    return NextResponse.json({ ...summary, broker: broker.name, openTrades, lastSwitchedAt })
+    return NextResponse.json({ ...summary, broker: broker.name, openTrades, lastSwitchedAt, circuitBreakerUntil })
   } catch (error: any) {
     console.error('[account]', error)
     return NextResponse.json({ error: error.message }, { status: 500 })
