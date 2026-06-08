@@ -244,19 +244,45 @@ export async function POST(req: NextRequest) {
     if (!lots || lots <= 0) {
       return NextResponse.json({ success: false, blocked: true, reasons: ['Position size calculated as 0 — check balance, risk % and SL pips in Strategy settings'] }, { status: 422 })
     }
+    // Broker min-stop-distance guard — prevents MT5 retcode 10016 (invalid stops).
+    // Brokers reject orders where SL/TP sit inside their freeze level, which can
+    // change with spread spikes. Conservative per-instrument floors below; if the
+    // strategy's SL/TP comes in tighter, widen with a 10% safety margin. The clamp
+    // also catches the 0.5R hard-cap floor (slPips=18 on XAU = 1.8 USD) being
+    // tighter than the broker accepts during volatile sessions.
+    const MIN_STOP_PIPS: Record<string, number> = {
+      XAU: 30,    // XAU/USD: 3.0 USD = 30 pips at pip=0.1
+      XAG: 10,    // XAG/USD: 0.10 USD = 10 pips at pip=0.01
+      JPY: 5,     // *JPY: 5 pips at pip=0.01
+      FX:  3,     // major FX: 3 pips at pip=0.0001
+    }
+    const minSlKey = pair.startsWith('XAU') ? 'XAU'
+                   : pair.startsWith('XAG') ? 'XAG'
+                   : pair.includes('JPY')   ? 'JPY' : 'FX'
+    const minStop  = MIN_STOP_PIPS[minSlKey]
+    let safeSlPips = strategy.slPips
+    let safeTpPips = strategy.tpPips
+    if (safeSlPips < minStop) {
+      console.warn(`[orders] ${pair} SL ${safeSlPips}p < broker min ${minStop}p — widening to ${Math.round(minStop * 1.1)}p`)
+      safeSlPips = Math.round(minStop * 1.1)
+    }
+    if (safeTpPips < minStop) {
+      console.warn(`[orders] ${pair} TP ${safeTpPips}p < broker min ${minStop}p — widening to ${Math.round(minStop * 1.1)}p`)
+      safeTpPips = Math.round(minStop * 1.1)
+    }
     // Explicit pre-fire log so it's impossible to miss when a real order is about
     // to hit a live account. Same line format on demo so the operator can grep
     // either trail. ACCOUNT_TYPE comes from env — set ACCOUNT_TYPE=live in prod.
     const accountType = (process.env.ACCOUNT_TYPE || 'demo').toLowerCase()
     if (accountType === 'live') {
-      console.warn(`[orders] LIVE ORDER placing — pair=${pair} direction=${direction} lots=${lots} sl=${strategy.slPips}p tp=${strategy.tpPips}p balance=$${balance.toFixed(2)} broker=${broker.name}`)
+      console.warn(`[orders] LIVE ORDER placing — pair=${pair} direction=${direction} lots=${lots} sl=${safeSlPips}p tp=${safeTpPips}p balance=$${balance.toFixed(2)} broker=${broker.name}`)
     } else {
-      console.log(`[orders] DEMO order placing — pair=${pair} direction=${direction} lots=${lots} sl=${strategy.slPips}p tp=${strategy.tpPips}p balance=$${balance.toFixed(2)} broker=${broker.name}`)
+      console.log(`[orders] DEMO order placing — pair=${pair} direction=${direction} lots=${lots} sl=${safeSlPips}p tp=${safeTpPips}p balance=$${balance.toFixed(2)} broker=${broker.name}`)
     }
     const orderResult = await broker.placeOrder({
       pair, direction, lots,
-      takeProfitPips: strategy.tpPips,
-      stopLossPips: strategy.slPips,
+      takeProfitPips: safeTpPips,
+      stopLossPips: safeSlPips,
       currentPrice,
     })
 
