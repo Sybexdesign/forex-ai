@@ -270,6 +270,40 @@ export async function POST(req: NextRequest) {
       console.warn(`[orders] ${pair} TP ${safeTpPips}p < broker min ${minStop}p — widening to ${Math.round(minStop * 1.1)}p`)
       safeTpPips = Math.round(minStop * 1.1)
     }
+    // ─── Cross-source dedup guard ────────────────────────────────────────
+    // Reject any order with same user+pair+direction placed in the prior 2s.
+    // Belt-and-braces against worker+browser racing or two-tab manual clicks —
+    // the API layer is the single bottleneck both paths funnel through, so
+    // catching duplicates here is source-agnostic.
+    if (userId) {
+      try {
+        const admin   = getAdminClient()
+        const cutoff  = new Date(Date.now() - 2000).toISOString()
+        const { data: dupes } = await admin.from('trades')
+          .select('id, created_at, source')
+          .eq('user_id', userId)
+          .eq('pair', pair)
+          .eq('direction', direction)
+          .gte('created_at', cutoff)
+          .order('created_at', { ascending: false })
+          .limit(1)
+        if (dupes && dupes.length > 0) {
+          const existing = dupes[0]
+          console.warn(`[orders] DUPLICATE rejected — ${pair} ${direction} placed ${Math.round((Date.now() - new Date(existing.created_at).getTime()))}ms ago (existing id=${existing.id} source=${existing.source})`)
+          return NextResponse.json({
+            success: false,
+            error: 'Duplicate order rejected — same user+pair+direction within 2s',
+            code: 'DUPLICATE_ORDER',
+            existingTradeId: existing.id,
+            existingSource:  existing.source,
+          }, { status: 409 })
+        }
+      } catch (e: any) {
+        // Dedup is best-effort; never block a legitimate order if Supabase is slow.
+        console.warn(`[orders] dedup check failed (allowing order through): ${e?.message}`)
+      }
+    }
+
     // Explicit pre-fire log so it's impossible to miss when a real order is about
     // to hit a live account. Same line format on demo so the operator can grep
     // either trail. ACCOUNT_TYPE comes from env — set ACCOUNT_TYPE=live in prod.
