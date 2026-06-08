@@ -234,13 +234,26 @@ export async function alertCircuitBreaker(opts: {
   pauseMin:   number
 }) {
   const lines = [
-    `⚡ <b>CIRCUIT BREAKER ARMED — ${opts.pair}</b>`,
+    `⚡ <b>CIRCUIT BREAKER ARMED</b>`,
     ``,
-    `Last trade lost <code>-$${Math.abs(opts.loss).toFixed(2)}</code> (1R = $${opts.oneR.toFixed(2)})`,
-    `Auto-trade execution paused for <b>${opts.pauseMin} min</b>`,
-    `Resumes after: ${opts.pauseUntil}`,
+    `Reason: Loss exceeded 1R on ${opts.pair}`,
+    `Last trade: <code>-$${Math.abs(opts.loss).toFixed(2)}</code> (1R = $${opts.oneR.toFixed(2)})`,
+    `Auto-trade paused for <b>${opts.pauseMin} minutes</b>`,
+    `Resumes at: ${opts.pauseUntil}`,
     ``,
-    `Reduces compounding risk after gap-through events.`,
+    `All signals will be logged but not executed during this window.`,
+  ].join('\n')
+  await send(lines)
+}
+
+// Circuit-breaker cleared — fired by worker fetchRiskState when it detects the
+// circuitBreakerUntil timestamp has expired. One-shot per activation.
+export async function alertCircuitBreakerCleared() {
+  const lines = [
+    `✅ <b>CIRCUIT BREAKER CLEARED</b>`,
+    ``,
+    `Auto-trade resumed`,
+    `Next qualifying signal will execute normally.`,
   ].join('\n')
   await send(lines)
 }

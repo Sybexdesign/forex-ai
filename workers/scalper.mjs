@@ -218,6 +218,7 @@ const STALE_SKIP_COUNT = 12        // skip signal after N identical consecutive 
 const HTF_CACHE_MS    = 30_000     // 30s — prevents serving a candle that closed on the previous bar
 let   cachedRisk     = null
 let   riskCachedAt   = 0
+let   lastCbClearedAt = null  // CB ISO timestamp we've already announced "cleared" for — dedup
 let   tradingHalted  = false
 let   haltNotified   = false
 
@@ -541,13 +542,27 @@ async function fetchRiskState() {
     console.log(`[worker] Account switch detected — reconnecting broker immediately (${reason})`)
     wlog('info', `Account switch detected: ${reason} · balance now ${balance}`, { metadata: { from: cachedRisk.broker, to: acct.broker, lastSwitchedAt: acct.lastSwitchedAt, balance } })
   }
+  // Circuit-breaker transition detection: when the previous fetch saw an active
+  // CB and the current fetch sees it expired, fire the Telegram CLEARED alert
+  // once. Stored in module state so it survives across cache refreshes.
+  const cbCurrent = acct.circuitBreakerUntil || null
+  const cbCurMs   = cbCurrent ? new Date(cbCurrent).getTime() : 0
+  const cbWasActive = cachedRisk && cachedRisk.circuitBreakerUntil
+                   && new Date(cachedRisk.circuitBreakerUntil).getTime() > riskCachedAt
+  const cbNowActive = cbCurMs > Date.now()
+  if (cbWasActive && !cbNowActive && lastCbClearedAt !== cbCurrent) {
+    lastCbClearedAt = cbCurrent
+    console.log(`[worker] Circuit breaker cleared — auto-trade resumed (was until ${cbCurrent})`)
+    wlog('info', `Circuit breaker cleared — auto-trade resumed`, { metadata: { wasUntil: cbCurrent } })
+    tgSend('✅ <b>CIRCUIT BREAKER CLEARED</b>\n\nAuto-trade resumed\nNext qualifying signal will execute normally.').catch(() => {})
+  }
   cachedRisk   = {
     balance, openCount, dailyLossPct,
     broker: acct.broker,
     lastSwitchedAt: acct.lastSwitchedAt || null,
     // Circuit-breaker timestamp written by mt5-sync after a >1R loss. Worker
     // skips auto-trade execution while Date.now() < circuitBreakerUntil.
-    circuitBreakerUntil: acct.circuitBreakerUntil || null,
+    circuitBreakerUntil: cbCurrent,
   }
   riskCachedAt = Date.now()
   return cachedRisk

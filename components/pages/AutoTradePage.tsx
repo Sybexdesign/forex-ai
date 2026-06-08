@@ -294,6 +294,46 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   useEffect(() => { try { localStorage.setItem('at_targetPct', String(profitTargetPct))         } catch {} }, [profitTargetPct])
   useEffect(() => { try { localStorage.setItem('at_fixedUsd',  String(fixedProfitUsd))          } catch {} }, [fixedProfitUsd])
 
+  // Circuit-breaker state — armed by mt5-sync after a close with loss >1R.
+  // Read from account.circuitBreakerUntil (set by /api/account from the active
+  // broker_configs row). A 1Hz ticker drives the countdown display until the
+  // timestamp expires, then we revert to normal display + toast "cleared".
+  const [circuitBreakerUntil, setCircuitBreakerUntil] = useState<number | null>(null)
+  const [cbCountdown,         setCbCountdown]         = useState<string>('')
+  const cbAcknowledgedRef = useRef<number | null>(null)  // dedup the "cleared" toast
+
+  useEffect(() => {
+    const ts = account?.circuitBreakerUntil ? new Date(account.circuitBreakerUntil).getTime() : null
+    if (ts && ts > Date.now()) {
+      setCircuitBreakerUntil(ts)
+    } else if (!ts) {
+      setCircuitBreakerUntil(null)
+    }
+  }, [account?.circuitBreakerUntil])
+
+  useEffect(() => {
+    if (!circuitBreakerUntil) return
+    const tick = () => {
+      const remaining = circuitBreakerUntil - Date.now()
+      if (remaining <= 0) {
+        // Fire the "cleared" toast once per CB-activation only.
+        if (cbAcknowledgedRef.current !== circuitBreakerUntil) {
+          cbAcknowledgedRef.current = circuitBreakerUntil
+          onToast?.('✅ Circuit breaker cleared — auto-trade resumed', '#00ff87')
+        }
+        setCircuitBreakerUntil(null)
+        setCbCountdown('')
+        return
+      }
+      const mins = Math.floor(remaining / 60000)
+      const secs = Math.floor((remaining % 60000) / 1000)
+      setCbCountdown(`${mins}:${secs.toString().padStart(2, '0')}`)
+    }
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [circuitBreakerUntil, onToast])
+
   // Poll /api/worker/status every 30s so the indicator panel can show whether the
   // 24/7 worker engine will actually execute orders (PAPER = decision-log only,
   // LIVE = real orders). Critical pairing with autoTrade.enabled — both must be
@@ -551,6 +591,12 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   // Auto-trade: execute scalp/mirror signals when autoTradeEnabled
   useEffect(() => {
     if (!autoTradeEnabled) return
+    // Circuit-breaker guard — server-side gate also enforces this in the worker,
+    // but checking client-side avoids a noisy round-trip when CB is active.
+    if (circuitBreakerUntil && Date.now() < circuitBreakerUntil) {
+      console.log(`[auto] Circuit breaker active — ${cbCountdown} remaining; skipping tick`)
+      return
+    }
     // Day-aware session block. The 20:00–23:59 UTC loss window was derived from
     // Mon–Thu daily-close behaviour (84% of total losses, 54.4% win rate across 90
     // trades). Sunday 22:00 UTC is a different regime — the weekly market open —
@@ -625,7 +671,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         }
       }
     })()
-  }, [scalpSignals, autoTradeEnabled, strategy.maxPositions, strategy.minStrength]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [scalpSignals, autoTradeEnabled, strategy.maxPositions, strategy.minStrength, circuitBreakerUntil]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Profit target monitoring — 2s interval
   // Close threshold = fixedProfitUsd × profitTargetPct / 100
@@ -774,28 +820,48 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         display:      'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {/* Circuit-breaker label takes priority over the normal session label when active */}
           <span style={{
             fontSize: 10, fontWeight: 700, letterSpacing: 1.5,
-            color: sessionColor,
+            color: circuitBreakerUntil ? '#dc2626' : sessionColor,
             padding: '3px 8px', borderRadius: 3,
-            background: `${sessionColor}22`,
+            background: circuitBreakerUntil ? 'rgba(220,38,38,0.18)' : `${sessionColor}22`,
           }}>
-            {sessionLabel.toUpperCase()}
+            {circuitBreakerUntil ? '⚡ CIRCUIT BREAKER' : sessionLabel.toUpperCase()}
           </span>
           <span className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
             {_utcLabel} UTC
           </span>
         </div>
-        <div style={{ fontSize: 11, fontWeight: 700, color: sessionBlocked ? '#ff3056' : '#00e5b4' }}>
-          {autoTradeEnabled
-            ? (sessionBlocked
-                ? (_isDailyClose
-                    ? '⏸ AUTO-EXECUTION PAUSED — daily-close block (Mon–Sat 20:00–23:59 UTC)'
-                    : '⏸ AUTO-EXECUTION PAUSED — Sunday pre-open (until 22:00 UTC)')
-                : '▶ AUTO-EXECUTION ACTIVE')
-            : '○ Auto-trading off'}
+        <div style={{ fontSize: 11, fontWeight: 700, color: circuitBreakerUntil ? '#dc2626' : (sessionBlocked ? '#ff3056' : '#00e5b4') }}>
+          {circuitBreakerUntil
+            ? `⚡ AUTO-TRADE PAUSED · ${cbCountdown} remaining`
+            : (autoTradeEnabled
+              ? (sessionBlocked
+                  ? (_isDailyClose
+                      ? '⏸ AUTO-EXECUTION PAUSED — daily-close block (Mon–Sat 20:00–23:59 UTC)'
+                      : '⏸ AUTO-EXECUTION PAUSED — Sunday pre-open (until 22:00 UTC)')
+                  : '▶ AUTO-EXECUTION ACTIVE')
+              : '○ Auto-trading off')}
         </div>
       </div>
+
+      {/* ── Circuit Breaker Banner — only renders when CB is active ───────────── */}
+      {circuitBreakerUntil && cbCountdown && (
+        <div className="circuit-breaker-banner">
+          <div className="circuit-breaker-icon">⚡</div>
+          <div className="circuit-breaker-content">
+            <div className="circuit-breaker-title">CIRCUIT BREAKER ACTIVE</div>
+            <div className="circuit-breaker-subtitle">
+              Auto-trade paused after large loss — resuming in
+            </div>
+            <div className="circuit-breaker-countdown">{cbCountdown}</div>
+          </div>
+          <div className="circuit-breaker-reason">
+            Protecting against compounding losses
+          </div>
+        </div>
+      )}
 
       {/* ── Worker Engine Status — Fix 6 (24/7 server-side mirror exec) ─────── */}
       {(() => {
