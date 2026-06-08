@@ -121,7 +121,12 @@ function getSession(d = new Date()) {
 }
 
 function getStrategy(pair, session) {
-  if (pair.startsWith('XA')) return 'Breakout'
+  // Metals use Scalp — Breakout's BB-squeeze pre-filter is too restrictive
+  // for normal market conditions and the regime-aware effectiveMinStrength
+  // gate on Scalp signals is what we actually want gating execution. The
+  // browser path on AutoTradePage already calls Scalp for XAU/XAG; this
+  // matches that behaviour so worker + browser see the same signals.
+  if (pair.startsWith('XA')) return 'Scalp'
   return PAIR_STRATEGY[pair] || 'Momentum'
 }
 
@@ -166,6 +171,10 @@ function hasSignalCondition(tick, strategy) {
   switch (strategy) {
     case 'Momentum':      return (rsi14 < 42 || rsi14 > 58) && adx > 18
     case 'Mean Reversion': return rsi14 < 38 || rsi14 > 62
+    // Scalp: skip the pre-filter — the regime-aware effectiveMinStrength gate
+    // downstream (in processSignal) decides whether the signal qualifies.
+    // 60s per-pair cooldown caps Claude calls at 2/min total across XAU+XAG.
+    case 'Scalp':         return true
     case 'Breakout': {
       if (relBbWidth >= 0.004) return false  // no squeeze — skip
       if (adx <= 20) return false            // weak trend = false breakout
@@ -1100,6 +1109,15 @@ async function runSweep() {
       const htfTick = htfByPair[cand.pair]
       const htfDir  = inferHTFDirection(htfTick)  // 15m primary direction
       const dir5m   = inferDirection(cand.tick)   // 5m confirming direction
+
+      // Scalp: skip HTF macro-bias check. Ranging regimes produce ambiguous
+      // 15m trends by definition; the regime-aware effectiveMinStrength gate
+      // (65/68/72/75) downstream decides eligibility. Browser path on
+      // AutoTradePage doesn't apply an HTF prefilter either — keep parity.
+      if (cand.strategy === 'Scalp') {
+        queue.push({ ...cand, direction: dir5m || htfDir || null })
+        continue
+      }
 
       if (!htfDir) {
         // 15m trend is ambiguous — no fallback to 5m; no macro bias = no trade
