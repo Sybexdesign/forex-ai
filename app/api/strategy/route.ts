@@ -41,19 +41,25 @@ export async function POST(req: NextRequest) {
     if (!userId) return NextResponse.json({ error: 'userId required' }, { status: 400 })
 
     const admin = getAdminClient()
-    // Build upsert payload. settings is always updated. autoTrade fields are
-    // optional — only included when the caller wants to change them, so
-    // callers updating only settings don't accidentally clobber the
-    // auto-trade gate or vice versa.
+    // Build upsert payload. BOTH settings and the autoTrade fields are now
+    // optional — caller sends only what they want to change. Prevents two
+    // distinct edit paths (Strategy slider save vs auto-trade toggle) from
+    // clobbering each other when running concurrently or out of order.
     const payload: Record<string, unknown> = {
       user_id: userId,
-      settings,
       updated_at: new Date().toISOString(),
+    }
+    if (settings && typeof settings === 'object') {
+      payload.settings = settings
     }
     if (autoTrade && typeof autoTrade === 'object') {
       if (typeof autoTrade.enabled === 'boolean') payload.auto_trade_enabled  = autoTrade.enabled
       if (Array.isArray(autoTrade.sections))      payload.auto_trade_sections = autoTrade.sections
       if (Array.isArray(autoTrade.pairs))         payload.auto_trade_pairs    = autoTrade.pairs
+    }
+    // No-op guard: if caller sent neither settings nor autoTrade, don't write.
+    if (Object.keys(payload).length <= 2) {
+      return NextResponse.json({ success: true, noop: true })
     }
     const { error } = await admin
       .from('strategies')

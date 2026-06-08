@@ -30,12 +30,15 @@ export interface EAPosition {
 interface EACandle { t: number; o: number; h: number; l: number; c: number; v: number }
 
 export interface TradeState {
-  originalEntry: number
-  originalSl:    number
-  openedAt:      string   // ISO — when manager first saw this ticket
-  peakProfit:    number   // highest unrealised P&L seen (account currency)
-  beApplied:     boolean
-  partialLocked: boolean
+  originalEntry:      number
+  originalSl:         number
+  openedAt:           string   // ISO — when manager first saw this ticket
+  peakProfit:         number   // highest unrealised P&L seen (account currency)
+  beApplied:          boolean
+  partialLocked:      boolean
+  // True once we've fired the "profit reversal" Telegram alert for this ticket
+  // (gate to one alert per trade — see REVERSAL_ALERT_USD / REVERSAL_ALERT_FRAC).
+  reversalAlertSent?: boolean
 }
 
 export interface ManagementCommand {
@@ -53,15 +56,16 @@ export interface ManageResult {
   commands:   ManagementCommand[]
   log:        string[]
   /**
-   * Risk events emitted this tick — hard-cap or emergency-1.5R closes.
-   * mt5-sync routes these to Telegram. Empty array = nothing breaching.
+   * Risk events emitted this tick — hard-cap, emergency-1.5R closes, or
+   * profit-reversal info alerts. mt5-sync routes these to Telegram.
    */
   riskEvents: Array<{
-    reason:  'hard-cap' | 'emergency-1.5R'
+    reason:  'hard-cap' | 'emergency-1.5R' | 'profit-reversal'
     pair:    string
     ticket:  number | string
-    pl:      number
-    cap?:    number
+    pl:      number       // current unrealised P/L when the event fired
+    cap?:    number       // for hard-cap: the threshold breached
+    peak?:   number       // for profit-reversal: the peak the trade reached
   }>
 }
 
@@ -80,10 +84,23 @@ export interface RiskContext {
 
 const MAX_HOLD_MS     = 20 * 60_000  // 20-minute scalp window
 const MIN_PROFIT_R    = 0.2          // must reach 0.2R within MAX_HOLD_MS
-const BE_TRIGGER_R    = 1.0          // move SL to break-even when profit hits 1R (was 0.5R — was causing 73% of wins to exit at $0–3 via premature BE)
-const PARTIAL_LOCK_R  = 1.5          // lock SL at +0.75R level when profit hits 1.5R (was 1.0R)
-const TRAIL_ATR_MULT  = 1.0          // SL = price ± ATR * 1.0 (wider trail gives room to run)
-const DECAY_THRESHOLD = 0.4          // close if profit falls below 40% of peak (was 50%)
+// BE_TRIGGER_R lowered from 1.0 → 0.5 after a +$20 → -$1.65 reversal proved that
+// 1R BE was leaving too much profit at risk. Trade-off is more $0 exits but
+// avoids "round-trip" losses where a clear winner fully reverses.
+const BE_TRIGGER_R    = 0.5
+const PARTIAL_LOCK_R  = 1.5          // lock SL at +0.5R level when profit hits 1.5R
+// DECAY_THRESHOLD raised from 0.4 → 0.5 so a trade peaking at +$20 closes at +$10
+// (50% of peak) instead of being allowed to fall to +$8 before triggering.
+const DECAY_THRESHOLD = 0.5
+const TRAIL_ATR_MULT_LOOSE = 1.0     // default trail distance when profit small
+const TRAIL_ATR_MULT_TIGHT = 0.5     // tighter trail when profit > PROFIT_TIGHTEN_USD
+const PROFIT_TIGHTEN_USD   = 15      // $-threshold to switch to tight trail
+const REVERSAL_ALERT_USD   = 10      // peak must exceed this before reversal alert can fire
+const REVERSAL_ALERT_FRAC  = 0.30    // alert when profit falls below 30% of peak (i.e. pulled back >70%? — see comment)
+// REVERSAL_ALERT_FRAC interpretation: alert when current profit drops below
+// (1 - REVERSAL_ALERT_FRAC) × peak. With 0.30 that means: alert when profit
+// has pulled back 30% from the peak (e.g. peak $20 → profit $14 = -30%).
+// One alert per trade — gated by tradeState.reversalAlertSent.
 const MAX_LOSS_R      = -1.5         // emergency close if loss exceeds 1.5× initial risk
 const ATR_PERIOD      = 14
 const CMD_TTL_S       = 120          // pending command expires after 2 minutes
@@ -175,6 +192,18 @@ export function manageTrades(
     const { peakProfit } = state
     const currentR = pos.profit / initialRiskUsd
 
+    // Profit-reversal alert (one-shot per ticket). Fires when a trade reached
+    // a meaningful peak ($10+) AND has pulled back >30% from that peak but
+    // hasn't yet hit the decay-exit threshold. Operator sees the warning
+    // before the close fires.
+    if (!state.reversalAlertSent
+        && peakProfit > REVERSAL_ALERT_USD
+        && pos.profit < peakProfit * (1 - REVERSAL_ALERT_FRAC)) {
+      state.reversalAlertSent = true
+      riskEvents.push({ reason: 'profit-reversal', pair, ticket: pos.ticket, pl: pos.profit, peak: peakProfit })
+      log.push(`[tm] ${sym}#${key} PROFIT-REVERSAL ALERT: peak=$${peakProfit.toFixed(2)} now=$${pos.profit.toFixed(2)} (${Math.round((1 - pos.profit / peakProfit) * 100)}% pullback)`)
+    }
+
     // ── 0a. Hard USD cap (Fix 8) ─────────────────────────────────────────────
     // Belt-and-braces above MAX_LOSS_R. Catches gap-through cases where the
     // R-based check fires late because the MT5 SL was already breached at a
@@ -249,10 +278,13 @@ export function manageTrades(
     }
 
     // ── 3. ATR trailing stop (only advances in profit direction) ─────────────
+    // Multiplier switches from 1.0×ATR (loose, room to run) to 0.5×ATR (tight,
+    // protect profit) once the trade exceeds PROFIT_TIGHTEN_USD = $15 unrealised.
+    const trailMult = pos.profit > PROFIT_TIGHTEN_USD ? TRAIL_ATR_MULT_TIGHT : TRAIL_ATR_MULT_LOOSE
     if (atr > 0 && midPx > 0) {
       const trailSl = dir === 'BUY'
-        ? midPx - atr * TRAIL_ATR_MULT
-        : midPx + atr * TRAIL_ATR_MULT
+        ? midPx - atr * trailMult
+        : midPx + atr * trailMult
       // Must be: (a) better than current live SL, (b) better than any SL from rules 1/2,
       // (c) strictly in profit territory (beyond original entry)
       const inProfit   = dir === 'BUY' ? trailSl > originalEntry : trailSl < originalEntry

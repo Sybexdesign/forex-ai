@@ -223,6 +223,28 @@ export async function alertRiskBreach(opts: {
   await send(lines)
 }
 
+// Profit-reversal warning — fired by trade-manager when a winning trade has
+// peaked above $10 and pulled back >30%. Informational; the decay-exit rule
+// is the actual close trigger that follows shortly. One alert per ticket.
+export async function alertProfitReversal(opts: {
+  pair: string
+  ticket?: number | string
+  pl:    number
+  peak:  number
+}) {
+  const pulledBackPct = Math.round((1 - opts.pl / opts.peak) * 100)
+  const lines = [
+    `⚠️ <b>PROFIT REVERSAL — ${opts.pair}</b>`,
+    ``,
+    `Was: <code>+$${opts.peak.toFixed(2)}</code>`,
+    `Now: <code>+$${opts.pl.toFixed(2)}</code> (${pulledBackPct}% pullback)`,
+    opts.ticket !== undefined ? `Ticket: <code>${opts.ticket}</code>` : null,
+    ``,
+    `Decay exit approaching at 50% of peak.`,
+  ].filter(Boolean).join('\n')
+  await send(lines)
+}
+
 export async function alertTradeClosed(opts: {
   pair: string
   direction: 'BUY' | 'SELL'

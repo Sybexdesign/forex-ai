@@ -286,17 +286,21 @@ export function useStrategy(userId?: string) {
   }, [userId, setStrategy])
 
   // Update the auto-trade gate. Optimistically updates local state then POSTs to
-  // /api/strategy with the autoTrade payload. The current `settings` is sent
-  // alongside so the upsert doesn't blank-out unrelated fields.
+  // /api/strategy with ONLY the fields that explicitly changed. Previous version
+  // sent the entire `next` (merged with current local state), which caused a
+  // race where toggling enabled while the initial GET was still in flight
+  // would clobber sections/pairs back to defaults. This version sends only
+  // `partial` so unspecified fields are left untouched server-side.
   const saveAutoTrade = useCallback(async (partial: Partial<AutoTradeGate>): Promise<{ error?: string }> => {
-    const next: AutoTradeGate = { ...autoTrade, ...partial }
-    setAutoTradeState(next)
+    setAutoTradeState(prev => ({ ...prev, ...partial }))
     if (!userId) return {}
     try {
       const res = await fetch('/api/strategy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId, settings: strategy, autoTrade: next }),
+        // settings omitted — POST handler only updates settings when present,
+        // so the autoTrade fields can be updated independently.
+        body: JSON.stringify({ userId, autoTrade: partial }),
       })
       const data = await res.json()
       if (!res.ok || data.error) {
@@ -308,7 +312,7 @@ export function useStrategy(userId?: string) {
       return { error: e.message }
     }
     return {}
-  }, [userId, autoTrade, strategy])
+  }, [userId])
 
   useEffect(() => { load() }, [load])
   return { strategy, save, autoTrade, saveAutoTrade }

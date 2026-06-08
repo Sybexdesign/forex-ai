@@ -5,7 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 import { manageTrades } from '@/lib/trade-manager'
-import { alertRiskBreach } from '@/lib/telegram'
+import { alertRiskBreach, alertProfitReversal } from '@/lib/telegram'
 
 export const dynamic = 'force-dynamic'
 
@@ -257,10 +257,17 @@ export async function POST(req: NextRequest) {
 
       // Fix 8 — fire Telegram alerts for any hard-cap or emergency-1.5R breach.
       // Non-blocking; failures are logged inside lib/telegram.
+      // Profit-reversal events route to alertProfitReversal (different message).
       for (const evt of riskEvents) {
-        alertRiskBreach({
-          pair: evt.pair, ticket: evt.ticket, pl: evt.pl, cap: evt.cap, reason: evt.reason,
-        }).catch(() => {})
+        if (evt.reason === 'profit-reversal') {
+          alertProfitReversal({
+            pair: evt.pair, ticket: evt.ticket, pl: evt.pl, peak: evt.peak ?? evt.pl,
+          }).catch(() => {})
+        } else {
+          alertRiskBreach({
+            pair: evt.pair, ticket: evt.ticket, pl: evt.pl, cap: evt.cap, reason: evt.reason,
+          }).catch(() => {})
+        }
       }
 
       for (const cmd of commands) {
