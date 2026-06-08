@@ -342,11 +342,70 @@ string ExecuteOrders(string response)
       double lots      = JsonNum(obj, "lots");
       double slPrice   = JsonNum(obj, "slPrice");
       double tpPrice   = JsonNum(obj, "tpPrice");
+      // Fields specific to modify_sl commands emitted by lib/trade-manager.ts.
+      // ticket: ulong identifier of the live position. newSl: target SL price.
+      double newSl     = JsonNum(obj, "newSl");
+      ulong  ticket    = (ulong)JsonNum(obj, "ticket");
 
-      if(StringLen(orderId) > 0 && StringLen(symbol) > 0 && lots > 0)
+      // Accept modify_sl rows even when lots==0 (modify commands carry no volume).
+      bool   isModify  = (StringFind(obj, "\"type\":\"modify_sl\"") >= 0);
+      bool   isClose   = (StringFind(obj, "\"type\":\"close\"") >= 0);
+      bool   valid     = StringLen(orderId) > 0 && StringLen(symbol) > 0 && (lots > 0 || isModify || isClose);
+
+      if(valid)
       {
          if(!first) completed += ",";
-         bool isClose = (StringFind(obj, "\"type\":\"close\"") >= 0);
+
+         if(isModify)
+         {
+            // Select the position by ticket so we can read its current TP and
+            // preserve it on the modify. PositionModify with tp=0 would clear
+            // the TP on most brokers — must pass the existing TP value back.
+            bool ok = false;
+            string errMsg = "";
+            if(ticket > 0 && PositionSelectByTicket(ticket))
+            {
+               double currentTp = PositionGetDouble(POSITION_TP);
+
+               MqlTradeRequest req;
+               MqlTradeResult  res2;
+               ZeroMemory(req);
+               ZeroMemory(res2);
+
+               req.action   = TRADE_ACTION_SLTP;
+               req.symbol   = symbol;
+               req.position = ticket;
+               req.sl       = newSl;
+               req.tp       = currentTp;   // PRESERVE TP — do not pass 0
+
+               ok = OrderSend(req, res2);
+               if(!ok || res2.retcode != 10009)
+               {
+                  errMsg = "retcode " + IntegerToString(res2.retcode);
+                  ok = false;
+               }
+            }
+            else
+            {
+               errMsg = "PositionSelectByTicket(" + IntegerToString((int)ticket) + ") failed";
+            }
+
+            if(ok)
+            {
+               completed += "{\"id\":\"" + orderId + "\",\"success\":true,\"type\":\"modify_sl\""
+                          + ",\"newSl\":" + DoubleToString(newSl,5) + "}";
+               Print("SybexForexAI v6: modify_sl ticket=", ticket, " newSl=", newSl, " (TP preserved)");
+            }
+            else
+            {
+               completed += "{\"id\":\"" + orderId + "\",\"success\":false"
+                          + ",\"type\":\"modify_sl\",\"error\":\"" + errMsg + "\"}";
+               Print("SybexForexAI v6: modify_sl FAILED ticket=", ticket, " ", errMsg);
+            }
+            first = false;
+            searchPos = objEnd + 1;
+            continue;
+         }
 
          if(isClose)
          {
