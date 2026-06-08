@@ -185,17 +185,21 @@ export async function POST(req: NextRequest) {
           }
           console.log(`[mt5-sync] Reconciled ${toClose.length} stale OPEN trade(s) → CLOSED`)
 
-          // Fix 8 — post-close >1R Telegram alert. Use EA's last-known unrealised P/L
-          // from the previous-tick snapshot. If the trade vanished with a loss exceeding
-          // 1R of the user's risk, surface it so operator sees broker-side SL hits.
-          // Also arm the circuit-breaker (Fix 3 of this batch): pause auto-trade
-          // execution for 15 min so a gap-through doesn't immediately compound.
+          // Fix 8 — post-close >1R Telegram alert. Uses EA's last-known UNREALISED P/L
+          // from the previous-tick snapshot. The realised pl_usd at fill is typically
+          // worse than the last unrealised snapshot by spread + slippage (5-15 pips on
+          // XAU). Trade L (08-Jun) demonstrated this: unrealised was ~-$42 (0.87R) at
+          // last snapshot, realised closed at -$48.65 (1.006R). To catch realised >=1R
+          // losses we threshold the UNREALISED snapshot at 0.85R, so by the time fill
+          // settles at ≥1R the CB is already armed.
+          const CB_TRIGGER_FRAC = 0.85   // arm CB when unrealised < -0.85R
+          const cbTriggerUsd    = oneRusd * CB_TRIGGER_FRAC
           let circuitBreakerArmedAt: string | null = null
           if (oneRusd > 0) {
             for (const t of toClose) {
               const lastPos = t.oanda_trade_id ? prevPositionsByTicket[String(t.oanda_trade_id)] : null
               const lastPl  = lastPos && typeof lastPos.profit === 'number' ? lastPos.profit : null
-              if (lastPl !== null && lastPl < -oneRusd) {
+              if (lastPl !== null && lastPl < -cbTriggerUsd) {
                 alertRiskBreach({
                   pair: t.pair, ticket: t.oanda_trade_id, pl: lastPl, cap: oneRusd, reason: 'post-close-1R',
                 }).catch(() => {})
@@ -204,7 +208,7 @@ export async function POST(req: NextRequest) {
                 if (!circuitBreakerArmedAt) {
                   const until = new Date(Date.now() + 15 * 60_000).toISOString()
                   circuitBreakerArmedAt = until
-                  console.warn(`[mt5-sync] CIRCUIT BREAKER ARMED — ${t.pair} lost $${Math.abs(lastPl).toFixed(2)} (1R=$${oneRusd.toFixed(2)}); pausing auto-trade until ${until}`)
+                  console.warn(`[mt5-sync] CIRCUIT BREAKER ARMED — ${t.pair} lost $${Math.abs(lastPl).toFixed(2)} unrealised (trigger=$${cbTriggerUsd.toFixed(2)} = 0.85R; 1R=$${oneRusd.toFixed(2)}); pausing auto-trade until ${until}`)
                   alertCircuitBreaker({
                     pair: t.pair, loss: lastPl, oneR: oneRusd,
                     pauseUntil: new Date(until).toUTCString().slice(17, 25) + ' UTC',
