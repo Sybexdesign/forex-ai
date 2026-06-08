@@ -405,11 +405,17 @@ async function postAutoTradeSection(newSection) {
 }
 
 async function evaluateSectionBias() {
+  // DISABLED 2026-06-08 — operator decision: mirror is the permanent default.
+  // The bias detector's only function was flipping between scalp and mirror
+  // sections after 3 consecutive losses, which contradicts the "always mirror"
+  // policy. Regime classifier and CB trigger continue to handle threshold and
+  // pause logic; direction is never auto-switched. Keep the function body
+  // intact below the early-return so re-enabling is a one-line change.
+  return
+
+  // eslint-disable-next-line no-unreachable
   if (!liveStrategy.autoTradeEnabled) return
-  // Only auto-flip when exactly ONE section is active. If user has both
-  // ['scalp','mirror'] enabled they want the worker placing both, no flip.
   if (!Array.isArray(liveStrategy.autoTradeSections) || liveStrategy.autoTradeSections.length !== 1) return
-  // Cooldown so the new section gets a chance to play out before we re-evaluate.
   if (Date.now() - lastAutoSectionSwitchAt < AUTO_SECTION_SWITCH_COOLDOWN_MS) return
 
   const current = liveStrategy.autoTradeSections[0]
@@ -1296,9 +1302,9 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
 
   scheduleMidnightRestart()
   setInterval(sendHeartbeat, HEARTBEAT_MS)
-  // Direction-bias detector — poll every 60s. Cheap query (limit 3 rows on
-  // an indexed table) and cooldown prevents over-firing.
-  setInterval(() => { void evaluateSectionBias() }, 60_000)
+  // Direction-bias detector schedule REMOVED 2026-06-08. The function itself
+  // early-returns now (see evaluateSectionBias). Operator policy: mirror is
+  // the permanent default; direction is never auto-switched.
 
   const startMsg = [
     `🚀 <b>SybexForexAI Worker Started</b>`,
