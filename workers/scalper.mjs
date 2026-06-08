@@ -130,16 +130,35 @@ function getStrategy(pair, session) {
   return PAIR_STRATEGY[pair] || 'Momentum'
 }
 
-// ── Auto-trade session block (Fix 6 — mirrors AutoTradePage day-aware block) ──
-// Mon-Sat (UTC day 1-6), hour 20-23  → daily-close loss window (block)
-// Sunday (UTC day 0),    hour 0-20    → pre-open dead zone (block)
-// Sunday                  hour 22-23  → weekly market open (ALLOW)
-function autoTradeSessionBlocked(d = new Date()) {
+// ── Auto-trade window: London-NY overlap ONLY ────────────────────────────────
+// Policy 2026-06-08: trading restricted to 12:00-15:59 UTC weekdays (Mon-Fri).
+// Replaces the prior multi-rule scheme (Asian/Sunday-preopen/daily-close blocks
+// + per-direction session-bias) with a single positive allowlist. Outside this
+// window auto-execution is suppressed entirely. Telegram + worker_logs continue
+// to track signals so we can audit what was missed.
+function isLondonNYOverlap(d = new Date()) {
+  const utcDay  = d.getUTCDay()    // 0=Sun, 6=Sat
+  const utcHour = d.getUTCHours()
+  const isWeekday = utcDay >= 1 && utcDay <= 5
+  const isOverlap = utcHour >= 12 && utcHour < 16
+  return isWeekday && isOverlap
+}
+function nextOverlapInfo(d = new Date()) {
   const utcDay  = d.getUTCDay()
   const utcHour = d.getUTCHours()
-  if (utcDay >= 1 && utcDay <= 6 && utcHour >= 20 && utcHour <= 23) return 'daily-close'
-  if (utcDay === 0 && utcHour < 21) return 'sunday-pre-open'
-  return null
+  const utcMin  = d.getUTCMinutes()
+  if (utcDay >= 1 && utcDay <= 5 && utcHour < 12) {
+    const m = (12 - utcHour) * 60 - utcMin
+    return `today 12:00 UTC (in ${Math.floor(m/60)}h ${m%60}m)`
+  }
+  if (utcDay >= 1 && utcDay <= 4 && utcHour >= 16) {
+    const m = (24 - utcHour + 12) * 60 - utcMin
+    return `tomorrow 12:00 UTC (in ${Math.floor(m/60)}h ${m%60}m)`
+  }
+  if (utcDay === 5 && utcHour >= 16) return 'Monday 12:00 UTC'
+  if (utcDay === 6) return 'Monday 12:00 UTC'
+  if (utcDay === 0) return 'Monday 12:00 UTC'
+  return 'calculating…'
 }
 
 // ── Session direction bias (precious metals only) ─────────────────────────────
@@ -954,13 +973,17 @@ async function processSignal(pair, tick, strategy, session, direction) {
     logAutoTradeDecision('skipped-pair-filter', pair, dir, signal, { allowedPairs: liveStrategy.autoTradePairs })
   } else if (tradingHalted) {
     logAutoTradeDecision('skipped-daily-loss-halted', pair, dir, signal)
+  } else if (!isLondonNYOverlap()) {
+    // Single allowlist: only 12:00-15:59 UTC Mon-Fri. Replaces daily-close +
+    // sunday-pre-open + per-section session-bias gates.
+    const now = new Date()
+    logAutoTradeDecision('skipped-outside-overlap', pair, dir, signal, {
+      utcHour: now.getUTCHours(),
+      utcDay:  now.getUTCDay(),
+      nextWindow: nextOverlapInfo(now),
+    })
   } else {
-    const blockReason = autoTradeSessionBlocked()
-    if (blockReason === 'daily-close') {
-      logAutoTradeDecision('skipped-session-daily-close', pair, dir, signal)
-    } else if (blockReason === 'sunday-pre-open') {
-      logAutoTradeDecision('skipped-sunday-preopen', pair, dir, signal)
-    } else {
+    {
       // Per-pair cooldown — matches the browser's 5-min PAIR_COOLDOWN_MS so
       // browser + worker never double-trade a pair within the same window.
       const lastPlaced = lastPairPlacedRef.get(pair) || 0
@@ -1015,18 +1038,8 @@ async function processSignal(pair, tick, strategy, session, direction) {
               const sectionDir = section === 'mirror'
                 ? (dir === 'BUY' ? 'SELL' : 'BUY')
                 : dir
-              // Per-section session-bias check: block only when the effective
-              // direction (after mirror flip) goes against the session's
-              // statistically dominant direction. Allows a mirror trade to fire
-              // when the scalp side is bias-blocked.
-              if (sessionBias && sectionDir !== 'HOLD' && sectionDir !== sessionBias) {
-                const h = new Date().getUTCHours()
-                console.log(`[session-gate] ${pair} ${section}=${sectionDir} blocked — bias is ${sessionBias} at ${h}:00 UTC`)
-                await logAutoTradeDecision('skipped-session-bias', pair, sectionDir, signal, {
-                  section, sessionBias, utcHour: h,
-                })
-                continue
-              }
+              // Per-section session-bias check REMOVED 2026-06-08 — the 12-16
+              // UTC overlap allowlist is the single session gate now.
               try {
                 const result = await placeOrder(pair, sectionDir, signal, section)
                 if (result.success) {
@@ -1227,6 +1240,7 @@ async function sendHeartbeat() {
     `💓 <b>SybexForexAI Worker — Heartbeat</b>`,
     ``,
     `Mode     : ${WORKER_MODE.toUpperCase()}${tradingHalted ? ' (halted)' : ''}`,
+    `Window   : ${isLondonNYOverlap() ? '🟢 LONDON-NY OVERLAP (active)' : '⚪ closed — next: ' + nextOverlapInfo()}`,
     `Session  : ${getSession()}`,
     `Market   : ${isMarketOpen() ? '✅ OPEN' : '🔴 CLOSED'}`,
     `Uptime   : ${uptimeH} h`,
@@ -1258,6 +1272,81 @@ async function sendHeartbeat() {
 
 // ── Midnight Restart ──────────────────────────────────────────────────────────
 // Exit at midnight UTC so DO App Platform / PM2 restarts with clean memory.
+
+// London-NY overlap boundary alerts — fires at exactly 12:00 and 16:00 UTC on
+// weekdays. Self-reschedules on each fire so it runs indefinitely. Wrapped in
+// try/catch so a tgSend failure doesn't kill the loop.
+let _overlapStartStats = null  // snapshot at open: { trades, alerts, balance, t }
+async function fireOverlapAlert(kind) {
+  try {
+    const now = new Date()
+    if (kind === 'open') {
+      _overlapStartStats = { trades: stats.trades, alerts: stats.alerts, t: Date.now() }
+      let extra = ''
+      try {
+        const acct = await apiFetch('/api/account').catch(() => null)
+        if (acct?.balance) extra = `\nBalance: $${Number(acct.balance).toFixed(2)}`
+      } catch {}
+      await tgSend(
+        `🟢 <b>LONDON-NY OVERLAP OPEN</b>\n` +
+        `Auto-trading active for next 4 hours${extra}\n` +
+        `⏱ ${now.toUTCString().slice(17, 25)} UTC`
+      )
+      wlog('info', 'London-NY overlap window opened', { metadata: { kind, ts: now.toISOString() } })
+    } else {
+      const placed = _overlapStartStats ? stats.trades - _overlapStartStats.trades : stats.trades
+      const alerted = _overlapStartStats ? stats.alerts - _overlapStartStats.alerts : stats.alerts
+      await tgSend(
+        `🔴 <b>LONDON-NY OVERLAP CLOSED</b>\n` +
+        `Auto-trading paused until ${nextOverlapInfo(now)}\n` +
+        `Trades placed: ${placed} · Alerts: ${alerted}\n` +
+        `⏱ ${now.toUTCString().slice(17, 25)} UTC`
+      )
+      wlog('info', 'London-NY overlap window closed', { metadata: { kind, ts: now.toISOString(), placed, alerted } })
+      _overlapStartStats = null
+    }
+  } catch (e) {
+    console.error('[overlap-alert]', e?.message)
+  }
+}
+function scheduleOverlapBoundaryAlerts() {
+  function nextBoundaryMs() {
+    const now = new Date()
+    const day = now.getUTCDay()
+    // candidate times: today 12:00, today 16:00, tomorrow 12:00, monday 12:00
+    const candidates = []
+    const todayBase = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+    if (day >= 1 && day <= 5) {
+      candidates.push({ t: todayBase + 12*3600_000, kind: 'open'  })
+      candidates.push({ t: todayBase + 16*3600_000, kind: 'close' })
+    }
+    // next weekday's 12:00 (skip Sat/Sun)
+    let addDays = 1
+    while (true) {
+      const cand = new Date(todayBase + addDays * 86400_000)
+      const candDay = cand.getUTCDay()
+      if (candDay >= 1 && candDay <= 5) {
+        candidates.push({ t: cand.getTime() + 12*3600_000, kind: 'open' })
+        break
+      }
+      addDays++
+      if (addDays > 8) break
+    }
+    const future = candidates.filter(c => c.t > now.getTime()).sort((a,b) => a.t - b.t)
+    return future[0] || null
+  }
+  function arm() {
+    const next = nextBoundaryMs()
+    if (!next) { setTimeout(arm, 60_000); return }
+    const delay = Math.max(0, next.t - Date.now())
+    console.log(`[overlap] next ${next.kind} boundary in ${(delay/60_000).toFixed(1)} min (${new Date(next.t).toUTCString()})`)
+    setTimeout(async () => {
+      await fireOverlapAlert(next.kind)
+      arm()
+    }, delay)
+  }
+  arm()
+}
 
 function scheduleMidnightRestart() {
   const now  = new Date()
@@ -1318,19 +1407,25 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   await loadStrategy()
   setInterval(loadStrategy, STRATEGY_REFRESH_MS)
   console.log(`[worker] Poll   : ${POLL_MS / 1000}s | Alert threshold: ≥${liveStrategy.minStrength}%`)
+  console.log(`[worker] Window : London-NY Overlap 12:00-15:59 UTC weekdays only`)
+  console.log(`[worker] Status : ${isLondonNYOverlap() ? '🟢 OVERLAP ACTIVE' : '⚪ closed — next: ' + nextOverlapInfo()}`)
 
   scheduleMidnightRestart()
   setInterval(sendHeartbeat, HEARTBEAT_MS)
   // Direction-bias detector schedule REMOVED 2026-06-08. The function itself
   // early-returns now (see evaluateSectionBias). Operator policy: mirror is
   // the permanent default; direction is never auto-switched.
+  // London-NY overlap open/close Telegram notifications — fires once at the
+  // exact boundary (12:00 and 16:00 UTC weekdays).
+  scheduleOverlapBoundaryAlerts()
 
   const startMsg = [
     `🚀 <b>SybexForexAI Worker Started</b>`,
     `Mode     : ${WORKER_MODE.toUpperCase()}`,
     `Interval : 10 seconds`,
     `Pairs    : ${PAIRS.join(', ')}`,
-    `Strategy : session-aware rotation`,
+    `Window   : London-NY Overlap 12:00-15:59 UTC weekdays`,
+    `Status   : ${isLondonNYOverlap() ? '🟢 ACTIVE' : '⚪ closed — next: ' + nextOverlapInfo()}`,
     `Threshold: confidence ≥ ${liveStrategy.minStrength}%`,
     `⏱ ${new Date().toUTCString()}`,
   ].join('\n')

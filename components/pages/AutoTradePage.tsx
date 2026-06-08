@@ -772,29 +772,36 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   // Session status — recomputed every render (scalpTick fires once per second).
   // Mirrors the day-aware block inside the auto-trade useEffect so UI matches
   // behaviour. Sunday 22-23 is the weekly market open (allowed); Mon-Sat 20-23
-  // is the daily-close loss window (blocked); Sunday pre-open (< 21) is blocked.
+  // London-NY overlap allowlist 2026-06-08: only trade 12:00-15:59 UTC weekdays.
+  // Single positive rule replaces prior daily-close + sun-preopen + session-bias.
   const _scalpTickRef = scalpTick  // reference so React tracks re-renders
   void _scalpTickRef
   const _utcNow   = new Date()
   const _utcHour  = _utcNow.getUTCHours()
+  const _utcMin   = _utcNow.getUTCMinutes()
   const _utcDay   = _utcNow.getUTCDay()
   const _utcLabel = _utcNow.toISOString().slice(11, 19)
-  const _isDailyClose    = _utcDay >= 1 && _utcDay <= 6 && _utcHour >= 20 && _utcHour <= 23
-  const _isSundayPreOpen = _utcDay === 0 && _utcHour < 21
-  const _isSundayOpen    = _utcDay === 0 && _utcHour >= 22 && _utcHour <= 23
-  const sessionLabel =
-    _isSundayOpen                       ? 'Sunday Open (week start)'
-    : _utcHour >= 7  && _utcHour <= 11  ? 'London'
-    : _utcHour >= 12 && _utcHour <= 15  ? 'London-NY Overlap'
-    : _utcHour >= 16 && _utcHour <= 19  ? 'New York'
-    : _utcHour >= 20 && _utcHour <= 23  ? 'Asian / Daily Close'
-    : _isSundayPreOpen                  ? 'Sunday Pre-Open'
-    : 'Off Hours (Asian)'
-  const sessionBlocked = _isDailyClose || _isSundayPreOpen
-  const sessionColor   = sessionBlocked ? '#ff3056'
-    : _isSundayOpen ? '#ffb800'                           // week-open = caution amber
-    : (_utcHour >= 12 && _utcHour <= 15) ? '#00e5b4'      // best window
-    : '#0080ff'
+  const _isWeekday = _utcDay >= 1 && _utcDay <= 5
+  const isLondonNYOverlap = _isWeekday && _utcHour >= 12 && _utcHour < 16
+  const sessionBlocked    = !isLondonNYOverlap
+  // Time-until / time-remaining helpers — recomputed each render via scalpTick.
+  function fmtHM(mins: number) {
+    const h = Math.floor(mins / 60); const m = mins % 60
+    return h > 0 ? `${h}h ${m}m` : `${m}m`
+  }
+  function timeUntilNextOverlap() {
+    if (_isWeekday && _utcHour < 12) return `Today 12:00 UTC (in ${fmtHM((12 - _utcHour) * 60 - _utcMin)})`
+    if (_utcDay >= 1 && _utcDay <= 4 && _utcHour >= 16) return `Tomorrow 12:00 UTC (in ${fmtHM((24 - _utcHour + 12) * 60 - _utcMin)})`
+    if (_utcDay === 5 && _utcHour >= 16) return 'Monday 12:00 UTC'
+    if (_utcDay === 6) return 'Monday 12:00 UTC'
+    if (_utcDay === 0) return 'Monday 12:00 UTC'
+    return 'calculating…'
+  }
+  function timeRemainingInWindow() {
+    return fmtHM((16 - _utcHour) * 60 - _utcMin) + ' remaining'
+  }
+  const sessionLabel = isLondonNYOverlap ? 'London-NY Overlap' : 'Overlap Closed'
+  const sessionColor = isLondonNYOverlap ? '#00e5b4' : '#6b7280'
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -821,15 +828,13 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
             {_utcLabel} UTC
           </span>
         </div>
-        <div style={{ fontSize: 11, fontWeight: 700, color: circuitBreakerUntil ? '#dc2626' : (sessionBlocked ? '#ff3056' : '#00e5b4') }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: circuitBreakerUntil ? '#dc2626' : (sessionBlocked ? '#6b7280' : '#00e5b4') }}>
           {circuitBreakerUntil
             ? `⚡ AUTO-TRADE PAUSED · ${cbCountdown} remaining`
             : (autoTradeEnabled
               ? (sessionBlocked
-                  ? (_isDailyClose
-                      ? '⏸ AUTO-EXECUTION PAUSED — daily-close block (Mon–Sat 20:00–23:59 UTC)'
-                      : '⏸ AUTO-EXECUTION PAUSED — Sunday pre-open (until 22:00 UTC)')
-                  : '▶ AUTO-EXECUTION ACTIVE')
+                  ? `⏸ OUTSIDE OVERLAP — next: ${timeUntilNextOverlap()}`
+                  : `▶ OVERLAP ACTIVE · ${timeRemainingInWindow()}`)
               : '○ Auto-trading off')}
         </div>
       </div>
