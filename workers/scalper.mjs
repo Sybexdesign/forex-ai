@@ -338,6 +338,110 @@ async function sbUpdate(table, id, data) {
   }
 }
 
+// ── Direction-bias detector (auto-section-switch) ─────────────────────────────
+// After 3 consecutive LOSSes on the currently-active section, flip sections so
+// the worker stops fighting the AI's current calibration regime. Polled every
+// 60s; uses lastAutoSectionSwitchAt cooldown so we don't oscillate while the
+// new section's trades land.
+
+const AUTO_SECTION_SWITCH_COOLDOWN_MS = 15 * 60_000  // 15 min between auto-flips
+let   lastAutoSectionSwitchAt         = 0
+
+// Fetches the latest N closed trades for a specific source on XAU/USD, ordered
+// most-recent first. Returns [] on any failure (we always fail-open here — the
+// bias detector is a nice-to-have, not a safety guard).
+async function fetchRecentTradesBySource(source, n = 3) {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return []
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/trades`
+      + `?user_id=eq.${WORKER_USER_ID}`
+      + `&pair=eq.XAU%2FUSD`
+      + `&source=eq.${source}`
+      + `&result=in.%28WIN%2CLOSS%29`
+      + `&order=created_at.desc`
+      + `&limit=${n}`
+      + `&select=source,result,pl_usd,created_at`
+    const res = await fetch(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+      signal:  AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return []
+    return await res.json()
+  } catch (e) {
+    console.warn('[bias] trade-fetch failed:', e.message)
+    return []
+  }
+}
+
+// Posts the new section to /api/strategy. Uses apiFetch so the WORKER_SERVICE_JWT
+// is included; the POST handler accepts a partial autoTrade payload so settings
+// stay untouched.
+async function postAutoTradeSection(newSection) {
+  if (!WORKER_USER_ID) return false
+  try {
+    await apiFetch('/api/strategy', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        userId:    WORKER_USER_ID,
+        autoTrade: { sections: [newSection] },
+      }),
+    })
+    return true
+  } catch (e) {
+    console.warn('[bias] strategy-update failed:', e.message)
+    return false
+  }
+}
+
+async function evaluateSectionBias() {
+  if (!liveStrategy.autoTradeEnabled) return
+  // Only auto-flip when exactly ONE section is active. If user has both
+  // ['scalp','mirror'] enabled they want the worker placing both, no flip.
+  if (!Array.isArray(liveStrategy.autoTradeSections) || liveStrategy.autoTradeSections.length !== 1) return
+  // Cooldown so the new section gets a chance to play out before we re-evaluate.
+  if (Date.now() - lastAutoSectionSwitchAt < AUTO_SECTION_SWITCH_COOLDOWN_MS) return
+
+  const current = liveStrategy.autoTradeSections[0]
+  if (current !== 'scalp' && current !== 'mirror') return
+
+  const recent = await fetchRecentTradesBySource(current, 3)
+  // Need exactly 3 LOSS results in the most recent 3 to trigger
+  if (recent.length < 3) return
+  const losses = recent.filter(t => t.result === 'LOSS').length
+  if (losses < 3) return
+
+  const next = current === 'mirror' ? 'scalp' : 'mirror'
+  const ok   = await postAutoTradeSection(next)
+  if (!ok) {
+    console.warn(`[bias] ${current}→${next} update failed — will retry on next interval`)
+    return
+  }
+
+  lastAutoSectionSwitchAt = Date.now()
+  // Local mirror so the worker's auto-trade gate uses the new section before
+  // the next loadStrategy() refresh picks it up via API.
+  liveStrategy.autoTradeSections = [next]
+
+  const aiState   = next === 'scalp' ? 'calibrated (follow AI direction)' : 'miscalibrated (inverse AI direction)'
+  const reason    = next === 'scalp'
+    ? 'AI appears calibrated in current market — switching to scalp'
+    : 'AI appears miscalibrated in current market — switching to mirror'
+  console.log(`[bias] 3 consecutive ${current} LOSSes → auto-switching to ${next}`)
+  wlog('info', `auto-section-switch: ${current} → ${next}`, {
+    metadata: { from: current, to: next, trigger: '3 consecutive losses', recent: recent.map(t => ({ at: t.created_at, pl: t.pl_usd })) },
+  })
+  await tgSend(
+    `🔄 <b>AUTO-SECTION SWITCH</b>\n` +
+    `\n` +
+    `Last 3 ${current} trades on XAU/USD all LOST\n` +
+    `Switching to <b>${next.toUpperCase()}</b> (${aiState})\n` +
+    `Reason: ${reason}\n` +
+    `\n` +
+    `Worker auto-trade gate now uses ${next}.`
+  )
+}
+
 // ── Outcome Tracker ───────────────────────────────────────────────────────────
 // Tracks open signals in memory and resolves them when TP/SL is hit.
 // signalId → { pair, direction, sl, tp, insertedAt }
@@ -1105,6 +1209,9 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
 
   scheduleMidnightRestart()
   setInterval(sendHeartbeat, HEARTBEAT_MS)
+  // Direction-bias detector — poll every 60s. Cheap query (limit 3 rows on
+  // an indexed table) and cooldown prevents over-firing.
+  setInterval(() => { void evaluateSectionBias() }, 60_000)
 
   const startMsg = [
     `🚀 <b>SybexForexAI Worker Started</b>`,
