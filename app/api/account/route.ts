@@ -32,6 +32,10 @@ export async function GET(req: NextRequest) {
     // worker can pause auto-trade after large-loss close events (Fix 3).
     let lastSwitchedAt:      string | null = null
     let circuitBreakerUntil: string | null = null
+    let lastCbArmedAt:       string | null = null
+    let lastCbArmedPair:     string | null = null
+    let lastCbArmedPl:       string | null = null
+    let lastCbArmedOneR:     string | null = null
     if (token) {
       try {
         const parts = token.split('.')
@@ -47,14 +51,22 @@ export async function GET(req: NextRequest) {
               .eq('is_active', true)
               .limit(1)
               .maybeSingle()
+            const c             = (cfg?.config as any) || {}
             lastSwitchedAt      = cfg?.last_switched_at ?? null
-            circuitBreakerUntil = (cfg?.config as any)?.circuitBreakerUntil ?? null
+            circuitBreakerUntil = c.circuitBreakerUntil ?? null
+            lastCbArmedAt       = c.lastCbArmedAt       ?? null
+            lastCbArmedPair     = c.lastCbArmedPair     ?? null
+            lastCbArmedPl       = c.lastCbArmedPl       ?? null
+            lastCbArmedOneR     = c.lastCbArmedOneR     ?? null
           }
         }
       } catch { /* metadata fetch is best-effort */ }
     }
 
-    return NextResponse.json({ ...summary, broker: broker.name, openTrades, lastSwitchedAt, circuitBreakerUntil })
+    return NextResponse.json({
+      ...summary, broker: broker.name, openTrades, lastSwitchedAt,
+      circuitBreakerUntil, lastCbArmedAt, lastCbArmedPair, lastCbArmedPl, lastCbArmedOneR,
+    })
   } catch (error: any) {
     console.error('[account]', error)
     return NextResponse.json({ error: error.message }, { status: 500 })

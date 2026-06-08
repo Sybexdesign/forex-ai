@@ -228,6 +228,7 @@ const HTF_CACHE_MS    = 30_000     // 30s — prevents serving a candle that clo
 let   cachedRisk     = null
 let   riskCachedAt   = 0
 let   lastCbClearedAt = null  // CB ISO timestamp we've already announced "cleared" for — dedup
+let   lastCbArmedAt   = null  // CB ISO timestamp we've already announced "armed" for — dedup
 let   tradingHalted  = false
 let   haltNotified   = false
 
@@ -668,6 +669,28 @@ async function fetchRiskState() {
     console.log(`[worker] Circuit breaker cleared — auto-trade resumed (was until ${cbCurrent})`)
     wlog('info', `Circuit breaker cleared — auto-trade resumed`, { metadata: { wasUntil: cbCurrent } })
     tgSend('✅ <b>CIRCUIT BREAKER CLEARED</b>\n\nAuto-trade resumed\nNext qualifying signal will execute normally.').catch(() => {})
+  }
+  // ARMED detection: the new SQL trigger arms CB inline when a loss is written.
+  // Dedup on lastCbArmedAt so we only alert once per arming event.
+  const armedAt = acct.lastCbArmedAt || null
+  if (armedAt && cbNowActive && lastCbArmedAt !== armedAt) {
+    lastCbArmedAt = armedAt
+    const pair    = acct.lastCbArmedPair || 'unknown'
+    const pl      = Number(acct.lastCbArmedPl   || 0)
+    const oneR    = Number(acct.lastCbArmedOneR || 0)
+    const untilUtc = cbCurrent ? new Date(cbCurrent).toUTCString().slice(17, 25) : '—'
+    console.warn(`[worker] CIRCUIT BREAKER ARMED — ${pair} lost $${Math.abs(pl).toFixed(2)} (1R=$${oneR.toFixed(2)}); pausing auto-trade until ${cbCurrent}`)
+    wlog('warn', `Circuit breaker armed: ${pair} loss $${pl} (1R=$${oneR})`, {
+      pair, metadata: { reason: 'realised_loss', pl, oneR, armedAt, until: cbCurrent },
+    })
+    tgSend(
+      `⚡ <b>CIRCUIT BREAKER ARMED</b>\n\n` +
+      `Reason: Loss exceeded 0.85R on ${pair}\n` +
+      `Last trade: <code>-$${Math.abs(pl).toFixed(2)}</code> (1R = $${oneR.toFixed(2)})\n` +
+      `Auto-trade paused for <b>15 minutes</b>\n` +
+      `Resumes at: ${untilUtc} UTC\n\n` +
+      `All signals will be logged but not executed during this window.`
+    ).catch(() => {})
   }
   cachedRisk   = {
     balance, openCount, dailyLossPct,
