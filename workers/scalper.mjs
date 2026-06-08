@@ -679,13 +679,17 @@ async function fetchRiskState() {
 // skipped-maxpositions | skipped-disabled | skipped-paper-mode |
 // skipped-pair-filter | skipped-section-disabled | skipped-staleness
 async function logAutoTradeDecision(reason, pair, direction, signal, extra = {}) {
-  return wlog('order', `auto-trade ${reason}: ${pair} ${direction}`, {
+  return wlog('order', `auto-trade ${reason}: ${pair} ${direction}${signal?.marketRegime ? ` [${signal.marketRegime}]` : ''}`, {
     pair,
     session: getSession(),
     metadata: {
       reason,
       direction,
-      confidence: signal?.confidence,
+      confidence:           signal?.confidence,
+      marketRegime:         signal?.marketRegime         ?? null,
+      effectiveMinStrength: signal?.effectiveMinStrength ?? null,
+      suggestedSection:     signal?.suggestedSection     ?? null,
+      adx:                  signal?.adx                  ?? null,
       ...extra,
     },
   })
@@ -794,8 +798,15 @@ async function processSignal(pair, tick, strategy, session, direction) {
 
   // Log every signal check to Supabase (ML data + UI visibility)
   wlog('signal',
-    `${dir} ${conf}% — ${strategy}`,
-    { pair, session, metadata: { direction: dir, confidence: conf, strategy, session, simulated: tick.simulated, entry: signal.entry, sl: signal.sl, tp: signal.tp, reasons: signal.reasons } }
+    `${dir} ${conf}% — ${strategy}${signal.marketRegime ? ` [${signal.marketRegime}]` : ''}`,
+    { pair, session, metadata: {
+      direction: dir, confidence: conf, strategy, session, simulated: tick.simulated,
+      entry: signal.entry, sl: signal.sl, tp: signal.tp, reasons: signal.reasons,
+      marketRegime:         signal.marketRegime         ?? null,
+      effectiveMinStrength: signal.effectiveMinStrength ?? null,
+      suggestedSection:     signal.suggestedSection     ?? null,
+      adx:                  signal.adx                  ?? tick.adx ?? null,
+    } }
   )
 
   // Save all non-HOLD signals to DB for ML training data, regardless of confidence
@@ -819,13 +830,27 @@ async function processSignal(pair, tick, strategy, session, direction) {
       risk_note:          signal.risk_note,
       acted_on:           false,
       outcome:            'PENDING',
-      indicator_snapshot: tick,
+      indicator_snapshot: {
+        ...tick,
+        _regime: {
+          marketRegime:         signal.marketRegime         ?? null,
+          effectiveMinStrength: signal.effectiveMinStrength ?? null,
+          suggestedSection:     signal.suggestedSection     ?? null,
+          adx:                  signal.adx                  ?? tick.adx ?? null,
+        },
+      },
     }).then(row => {
       if (row?.id) trackSignal(row.id, pair, dir, entry, sl, tp)
     }).catch(() => {})
   }
 
-  if (dir === 'HOLD' || conf < liveStrategy.minStrength) return
+  // Dynamic minStrength: prefer regime-aware effectiveMinStrength from the signal
+  // (ranging=65, weak-trend=68, trending=72, strong=75) over the static configured
+  // minStrength. Falls back when the signal engine doesn't supply it (non-Scalp).
+  const effMin = typeof signal.effectiveMinStrength === 'number'
+    ? signal.effectiveMinStrength
+    : liveStrategy.minStrength
+  if (dir === 'HOLD' || conf < effMin) return
 
   // Hard block: never act on simulated data in live mode
   if (tick.simulated) {

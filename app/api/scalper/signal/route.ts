@@ -74,11 +74,14 @@ Respond ONLY with valid JSON — no markdown, no prose.`,
   'Scalp': `You are a precision scalp trader for precious metals (XAU/USD, XAG/USD).
 Generate a 1–5 minute directional scalp signal.
 
-CRITICAL: If ADX(14) is below 20, you MUST return HOLD — this indicates a ranging
-market unsuitable for scalping. ADX between 20-24 is a weak trend; cap confidence
-at 65 and only proceed if the 5-vote consensus is 4/5 or stronger.
-
-CRITICAL: If ADX is ≥20 you MUST return BUY or SELL. Only return HOLD in an exact tie (extremely rare).
+You MUST always return BUY or SELL — never HOLD. The downstream gate filters
+weak signals by confidence based on the current ADX regime, so your job is to
+score the direction honestly and report the strength you actually see:
+  ADX < 20   → ranging   (low conviction is fine; downstream gate is 65)
+  ADX 20-24 → weak-trend (downstream gate is 68)
+  ADX 25-34 → trending   (downstream gate is 72)
+  ADX ≥ 35  → strong     (downstream gate is 75)
+Only return HOLD in an exact 2.5/2.5 vote tie (extremely rare).
 
 Score 5 momentum factors and pick the majority direction:
 1. RSI(14) > 50 → bullish | RSI(14) < 50 → bearish
@@ -90,6 +93,35 @@ Score 5 momentum factors and pick the majority direction:
 Confidence: 5/5 votes = 90–95, 4/5 = 72–85, 3/5 = 58–68.
 Entry at current price. SL = 1.5 × ATR. TP = 2.0 × ATR.
 Respond ONLY with valid JSON — no markdown, no prose.`,
+}
+
+// ─── Market-regime classifier ────────────────────────────────────────────────
+// Maps ADX(14) to one of four regimes, each with its own minStrength threshold.
+// Replaces the previous hard ADX<20 HOLD gate + weak-trend cap with a unified
+// dynamic gate: ranging markets need only 65% conviction (because Scalp's
+// 4/5-vote majority already gives 71%), while strong trends require 75%.
+//
+//   ranging       ADX < 20    threshold 65   — chop, 4/5 votes can squeeze through
+//   weak-trend    ADX 20-24   threshold 68   — developing trend
+//   trending      ADX 25-34   threshold 72   — confirmed trend (default 72)
+//   strong-trend  ADX ≥ 35    threshold 75   — momentum dominant
+//
+// Section bias:
+//   ranging       → mirror   (mean-reversion friendly — fades into the noise)
+//   weak-trend    → mirror   (early reversal candidates)
+//   trending      → scalp    (follow the move)
+//   strong-trend  → scalp    (trend-following, high conviction)
+export type MarketRegime = 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
+
+export function classifyRegime(adx: number): {
+  regime: MarketRegime
+  effectiveMinStrength: number
+  suggestedSection: 'mirror' | 'scalp'
+} {
+  if (adx < 20)  return { regime: 'ranging',      effectiveMinStrength: 65, suggestedSection: 'mirror' }
+  if (adx < 25)  return { regime: 'weak-trend',   effectiveMinStrength: 68, suggestedSection: 'mirror' }
+  if (adx < 35)  return { regime: 'trending',     effectiveMinStrength: 72, suggestedSection: 'scalp'  }
+  return           { regime: 'strong-trend', effectiveMinStrength: 75, suggestedSection: 'scalp'  }
 }
 
 function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
@@ -138,17 +170,10 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
       }
     }
   } else if (strategy === 'Scalp') {
-    // ADX hard-filter: under 20 = ranging market, scalping in chop is the largest
-    // single cause of small wins with large losses (audit Fix 2). Suppress entirely.
-    if (t.adx < 20) {
-      return {
-        direction: 'HOLD' as Direction,
-        confidence: 0,
-        reasons: [`ADX ${t.adx.toFixed(1)} < 20 — ranging market, scalp suppressed`],
-        entry: t.price, sl: t.price, tp: t.price,
-        risk_note: `Rule-based (ADX filtered). ADX must be ≥20 for scalp entries.`,
-      }
-    }
+    // Note: previous hard ADX<20 HOLD gate removed in favour of the regime-aware
+    // effectiveMinStrength threshold computed below. ADX<20 = 'ranging' regime,
+    // threshold=65 — 3/5 votes (63 confidence) still skip, but 4/5+ (71+) pass.
+    // Same downstream gate applies in AutoTradePage.tsx and workers/scalper.mjs.
     // 5-vote majority: commits to a direction when ADX confirms a trend exists.
     const bbMid = (t.bbUpper + t.bbLower) / 2
     const votes = [
@@ -187,13 +212,8 @@ function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
         reasons.push(`Near-threshold penalty −15: ${nearThresholdMarkers} marginal indicator${nearThresholdMarkers > 1 ? 's' : ''}`)
       }
     }
-    // Weak-trend cap: 20 ≤ ADX < 25 means trend is developing but not confirmed.
-    // Hold confidence to 65 max so the minStrength gate filters weaker setups.
-    if (t.adx >= 20 && t.adx < 25) {
-      const capped = bullVotes >= bearVotes ? Math.min(score, 65) : Math.max(score, 35)
-      if (capped !== score) reasons.push(`ADX ${t.adx.toFixed(1)} — weak trend, confidence capped`)
-      score = capped
-    }
+    // Weak-trend cap replaced by the regime-aware effectiveMinStrength threshold
+    // (see classifyRegime() and the return at the bottom of fallbackSignal).
     if (t.rsi14 > 50) reasons.push(`RSI ${t.rsi14.toFixed(1)} — bullish momentum`) ; else reasons.push(`RSI ${t.rsi14.toFixed(1)} — bearish momentum`)
     if (t.ema9 > t.ema21) reasons.push('EMA9 > EMA21 — bullish trend') ; else reasons.push('EMA9 < EMA21 — bearish trend')
     if (t.macdHistogram > 0) reasons.push(`MACD +${t.macdHistogram.toFixed(4)}`) ; else reasons.push(`MACD ${t.macdHistogram.toFixed(4)}`)
@@ -393,16 +413,6 @@ Return JSON only:
       }
     }
 
-    // ── ADX hard-gate — Scalp only ────────────────────────────────────────
-    // Belt-and-braces: the AI prompt says HOLD when ADX<20, but enforce it here
-    // so the contract is server-guaranteed regardless of model behaviour.
-    if (strategy === 'Scalp' && result.direction !== 'HOLD' && t.adx < 20) {
-      console.log(`[scalper/signal] ADX gate: ADX=${t.adx.toFixed(1)} < 20 → forcing HOLD (was ${result.direction})`)
-      result.direction = 'HOLD' as Direction
-      result.confidence = 0
-      result.reasons = [`ADX ${t.adx.toFixed(1)} < 20 — ranging market, scalp suppressed`, ...(result.reasons || []).slice(0, 3)]
-    }
-
     // ── Directional discipline — Scalp only ───────────────────────────────
     // Prevents the AI from reversing a 4/5 or 5/5 indicator consensus.
     // Near-threshold readings (RSI 48-52, BP 45-55%, tiny EMA gap) are
@@ -426,16 +436,9 @@ Return JSON only:
       }
     }
 
-    // ── Weak-trend confidence cap — Scalp only ─────────────────────────────
-    // 20 ≤ ADX < 25 = trend exists but isn't confirmed. Cap confidence at 65
-    // so anything below strategy.minStrength is suppressed by the order gate.
-    if (strategy === 'Scalp' && result.direction !== 'HOLD' && t.adx >= 20 && t.adx < 25) {
-      if (typeof result.confidence === 'number' && result.confidence > 65) {
-        console.log(`[scalper/signal] Weak-trend cap: ADX=${t.adx.toFixed(1)} → confidence ${result.confidence}→65`)
-        result.confidence = 65
-        result.reasons = [...(result.reasons || []).slice(0, 3), `ADX ${t.adx.toFixed(1)} — weak trend, confidence capped at 65`]
-      }
-    }
+    // Weak-trend confidence cap removed — replaced by the regime-aware
+    // effectiveMinStrength threshold (see classifyRegime()). Downstream gates
+    // in AutoTradePage.tsx and workers/scalper.mjs use sig.effectiveMinStrength.
 
     // Query ML service in parallel with signal result (non-blocking)
     mlData = await queryMlService(body, pair, result.direction as Direction, result.confidence)
@@ -501,7 +504,22 @@ Return JSON only:
       } catch { /* non-critical */ }
     }
 
-    return NextResponse.json({ ...result, fallback, ml: mlData })
+    // Attach market-regime metadata (Scalp only — other strategies have their
+    // own ADX semantics). AutoTradePage and worker use these to gate execution
+    // and to override section bias per-signal.
+    const regimeMeta = strategy === 'Scalp'
+      ? { ...classifyRegime(t.adx), adx: t.adx }
+      : null
+
+    return NextResponse.json({
+      ...result,
+      fallback,
+      ml: mlData,
+      marketRegime:         regimeMeta?.regime ?? null,
+      effectiveMinStrength: regimeMeta?.effectiveMinStrength ?? null,
+      suggestedSection:     regimeMeta?.suggestedSection ?? null,
+      adx:                  regimeMeta?.adx ?? null,
+    })
   } catch (error: any) {
     console.error('[scalper/signal]', error)
     return NextResponse.json({ error: error.message }, { status: 500 })

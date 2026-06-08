@@ -31,6 +31,8 @@ const PAIR_COOLDOWN_MS = 5 * 60_000  // minimum gap between two auto-trades on t
 const MIRROR_SL_CAP = 35
 const MIRROR_TP_CAP = 70  // = 2 × SL cap to preserve the 1:2 R:R target
 
+type MarketRegime = 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
+
 interface ScalpSignal {
   pair: string
   direction: 'BUY' | 'SELL' | 'HOLD'
@@ -45,6 +47,11 @@ interface ScalpSignal {
   simulated?: boolean
   blocked?: boolean
   fetchError?: string
+  // Regime-aware threshold metadata from /api/scalper/signal
+  marketRegime?: MarketRegime | null
+  effectiveMinStrength?: number | null
+  suggestedSection?: 'mirror' | 'scalp' | null
+  adx?: number | null
 }
 
 function Pager({ page, total, onPage }: { page: number; total: number; onPage: (p: number) => void }) {
@@ -231,6 +238,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           expiresAt:  Date.now() + SCALP_EXPIRY_MS,
           fetchedAt:  Date.now(),
           fallback:   sig.fallback ?? false,
+          marketRegime:         sig.marketRegime ?? null,
+          effectiveMinStrength: sig.effectiveMinStrength ?? null,
+          suggestedSection:     sig.suggestedSection ?? null,
+          adx:                  sig.adx ?? null,
           // fetchError cleared on success
         },
       }))
@@ -630,8 +641,13 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         if (!sig || sig.direction === 'HOLD' || sig.blocked) continue
         if (!autoPairs.has(pair)) continue
         if (now > sig.expiresAt) continue
-        // Honour user's minimum signal strength — skip weak signals on the browser auto path too.
-        if (sig.confidence < strategy.minStrength) continue
+        // Dynamic minStrength: prefer signal's regime-aware effectiveMinStrength
+        // when present (ranging=65, weak-trend=68, trending=72, strong=75), falling
+        // back to the user-configured strategy.minStrength when missing.
+        const effMin = typeof sig.effectiveMinStrength === 'number'
+          ? sig.effectiveMinStrength
+          : strategy.minStrength
+        if (sig.confidence < effMin) continue
         // 5-min per-pair cooldown across ALL sections (scalp + mirror). Prevents
         // back-to-back trades on the same pair when two consecutive signals only
         // 15s apart both pass the gate. Historical data showed 30-60 trades/hour;
@@ -1130,6 +1146,28 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                         {conf}%
                       </span>
                     )}
+                    {sig?.marketRegime && (
+                      <span
+                        title={`ADX ${sig.adx?.toFixed?.(1) ?? '?'} — gate ≥${sig.effectiveMinStrength}%`}
+                        style={{
+                          fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                          padding: '2px 6px', borderRadius: 2,
+                          textTransform: 'uppercase',
+                          background:
+                            sig.marketRegime === 'strong-trend' ? 'rgba(0,200,83,0.18)' :
+                            sig.marketRegime === 'trending'     ? 'rgba(0,150,255,0.18)' :
+                            sig.marketRegime === 'weak-trend'   ? 'rgba(255,170,0,0.18)' :
+                                                                  'rgba(255,255,255,0.08)',
+                          color:
+                            sig.marketRegime === 'strong-trend' ? 'var(--color-buy)' :
+                            sig.marketRegime === 'trending'     ? '#42a5f5' :
+                            sig.marketRegime === 'weak-trend'   ? '#ffaa00' :
+                                                                  'var(--text-muted)',
+                        }}
+                      >
+                        {sig.marketRegime}
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div style={{ textAlign: 'right', flexShrink: 0, fontSize: 10 }}>
@@ -1288,6 +1326,28 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                       {dir !== 'HOLD' && conf > 0 && (
                         <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'JetBrains Mono', color: dirColor }}>
                           {conf}%
+                        </span>
+                      )}
+                      {sig?.marketRegime && (
+                        <span
+                          title={`ADX ${sig.adx?.toFixed?.(1) ?? '?'} — gate ≥${sig.effectiveMinStrength}%`}
+                          style={{
+                            fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                            padding: '2px 6px', borderRadius: 2,
+                            textTransform: 'uppercase',
+                            background:
+                              sig.marketRegime === 'strong-trend' ? 'rgba(0,200,83,0.18)' :
+                              sig.marketRegime === 'trending'     ? 'rgba(0,150,255,0.18)' :
+                              sig.marketRegime === 'weak-trend'   ? 'rgba(255,170,0,0.18)' :
+                                                                    'rgba(255,255,255,0.08)',
+                            color:
+                              sig.marketRegime === 'strong-trend' ? 'var(--color-buy)' :
+                              sig.marketRegime === 'trending'     ? '#42a5f5' :
+                              sig.marketRegime === 'weak-trend'   ? '#ffaa00' :
+                                                                    'var(--text-muted)',
+                          }}
+                        >
+                          {sig.marketRegime}
                         </span>
                       )}
                     </div>
