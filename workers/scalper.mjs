@@ -884,41 +884,60 @@ async function processSignal(pair, tick, strategy, session, direction) {
   }
 
   // Dynamic minStrength: prefer regime-aware effectiveMinStrength from the signal
-  // (ranging=65, weak-trend=68, trending=72, strong=75) over the static configured
-  // minStrength. Falls back when the signal engine doesn't supply it (non-Scalp).
+  // (ranging=65, weak-trend=68, trending=72, strong=100 — strong suppresses) over
+  // the static configured minStrength. Falls back when the signal engine doesn't
+  // supply it (non-Scalp).
   const effMin = typeof signal.effectiveMinStrength === 'number'
     ? signal.effectiveMinStrength
     : liveStrategy.minStrength
-  if (dir === 'HOLD' || conf < effMin) return
+  if (dir === 'HOLD') {
+    // Bug-fix 2026-06-08: previously a silent return. Now logged for audit.
+    await logAutoTradeDecision('skipped-hold', pair, dir, signal, { conf, effMin })
+    return
+  }
+  if (conf < effMin) {
+    // Bug-fix 2026-06-08: previously a silent return. Now logged for audit so
+    // the operator can see why a signal didn't fire.
+    await logAutoTradeDecision('skipped-confidence', pair, dir, signal, { conf, effMin })
+    return
+  }
 
   // Hard block: never act on simulated data in live mode
   if (tick.simulated) {
     if (WORKER_MODE === 'live') {
       console.warn(`[risk] LIVE ORDER BLOCKED — simulated market data detected for ${pair}. MT5 EA may be disconnected or all live feeds unavailable.`)
       wlog('error', `Simulated data in LIVE mode — order blocked`, { pair, session, metadata: { reason: 'simulated_data', broker: tick.broker } })
+      await logAutoTradeDecision('skipped-simulated-data', pair, dir, signal, { broker: tick.broker })
     }
     return
   }
 
-  // Alert cooldown
+  // Telegram-alert cooldown — Bug-fix 2026-06-08: this used to `return` from the
+  // function, silently blocking auto-trade execution for 15 min after every
+  // alert on the same pair+direction. That was a major hidden gate. The fix:
+  // the cooldown now ONLY suppresses the Telegram alert + alert-level log; the
+  // auto-trade execution block below runs regardless. The per-pair execution
+  // cooldown (PAIR_COOLDOWN_MS = 5 min via lastPairPlacedRef) is the actual
+  // anti-overtrading guard.
   const coolKey = `${pair}:${dir}`
   const lastAt  = alertCooldowns.get(coolKey) || 0
-  if (Date.now() - lastAt < ALERT_COOL_MS) {
+  const alertCooldownActive = Date.now() - lastAt < ALERT_COOL_MS
+  if (!alertCooldownActive) {
+    alertCooldowns.set(coolKey, Date.now())
+    stats.alerts++
+    wlog('alert', `${dir} ${pair} — confidence ${conf}%${signal.marketRegime ? ` [${signal.marketRegime}]` : ''}`, {
+      pair, session, metadata: {
+        direction: dir, confidence: conf, strategy, session,
+        marketRegime:         signal.marketRegime         ?? null,
+        effectiveMinStrength: signal.effectiveMinStrength ?? null,
+        suggestedSection:     signal.suggestedSection     ?? null,
+        adx:                  signal.adx                  ?? tick.adx ?? null,
+      },
+    })
+  } else {
     const minLeft = Math.ceil((ALERT_COOL_MS - (Date.now() - lastAt)) / 60_000)
-    console.log(`[cooldown] ${coolKey} — ${minLeft}m left`)
-    return
+    console.log(`[alert-cooldown] ${coolKey} — ${minLeft}m left; suppressing Telegram alert (execution continues)`)
   }
-  alertCooldowns.set(coolKey, Date.now())
-  stats.alerts++
-  wlog('alert', `${dir} ${pair} — confidence ${conf}%${signal.marketRegime ? ` [${signal.marketRegime}]` : ''}`, {
-    pair, session, metadata: {
-      direction: dir, confidence: conf, strategy, session,
-      marketRegime:         signal.marketRegime         ?? null,
-      effectiveMinStrength: signal.effectiveMinStrength ?? null,
-      suggestedSection:     signal.suggestedSection     ?? null,
-      adx:                  signal.adx                  ?? tick.adx ?? null,
-    },
-  })
 
   // ── Server-side auto-trade execution (Fix 6 — 24/7 mirror engine) ──────────
   // Triple-locked: WORKER_MODE=live AND auto_trade_enabled=true (per-user DB
