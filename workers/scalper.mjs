@@ -130,17 +130,18 @@ function getStrategy(pair, session) {
   return PAIR_STRATEGY[pair] || 'Momentum'
 }
 
-// ── Auto-trade window: London-NY overlap ONLY ────────────────────────────────
-// Policy 2026-06-08: trading restricted to 12:00-15:59 UTC weekdays (Mon-Fri).
-// Replaces the prior multi-rule scheme (Asian/Sunday-preopen/daily-close blocks
-// + per-direction session-bias) with a single positive allowlist. Outside this
-// window auto-execution is suppressed entirely. Telegram + worker_logs continue
-// to track signals so we can audit what was missed.
+// ── Auto-trade window: London-NY overlap (golden window) ─────────────────────
+// Policy 2026-06-09: TIGHTENED from 12:00-15:59 → 12:00-13:59 UTC weekdays.
+// Reason: hourly P/L on 2026-06-09 showed hour 12 = +$173 (7W/0L), hour 13 ≈
+// break-even, hour 14 = −$71, hour 15 = −$33. The mirror edge degraded sharply
+// after 13:00. Single positive allowlist; outside this 2-hour window auto-
+// execution is suppressed entirely. Telegram + worker_logs continue to track
+// signals so we can audit what was missed.
 function isLondonNYOverlap(d = new Date()) {
   const utcDay  = d.getUTCDay()    // 0=Sun, 6=Sat
   const utcHour = d.getUTCHours()
   const isWeekday = utcDay >= 1 && utcDay <= 5
-  const isOverlap = utcHour >= 12 && utcHour < 16
+  const isOverlap = utcHour >= 12 && utcHour < 14
   return isWeekday && isOverlap
 }
 function nextOverlapInfo(d = new Date()) {
@@ -151,11 +152,11 @@ function nextOverlapInfo(d = new Date()) {
     const m = (12 - utcHour) * 60 - utcMin
     return `today 12:00 UTC (in ${Math.floor(m/60)}h ${m%60}m)`
   }
-  if (utcDay >= 1 && utcDay <= 4 && utcHour >= 16) {
+  if (utcDay >= 1 && utcDay <= 4 && utcHour >= 14) {
     const m = (24 - utcHour + 12) * 60 - utcMin
     return `tomorrow 12:00 UTC (in ${Math.floor(m/60)}h ${m%60}m)`
   }
-  if (utcDay === 5 && utcHour >= 16) return 'Monday 12:00 UTC'
+  if (utcDay === 5 && utcHour >= 14) return 'Monday 12:00 UTC'
   if (utcDay === 6) return 'Monday 12:00 UTC'
   if (utcDay === 0) return 'Monday 12:00 UTC'
   return 'calculating…'
@@ -974,7 +975,7 @@ async function processSignal(pair, tick, strategy, session, direction) {
   } else if (tradingHalted) {
     logAutoTradeDecision('skipped-daily-loss-halted', pair, dir, signal)
   } else if (!isLondonNYOverlap()) {
-    // Single allowlist: only 12:00-15:59 UTC Mon-Fri. Replaces daily-close +
+    // Single allowlist: only 12:00-13:59 UTC Mon-Fri. Replaces daily-close +
     // sunday-pre-open + per-section session-bias gates.
     const now = new Date()
     logAutoTradeDecision('skipped-outside-overlap', pair, dir, signal, {
@@ -1273,7 +1274,7 @@ async function sendHeartbeat() {
 // ── Midnight Restart ──────────────────────────────────────────────────────────
 // Exit at midnight UTC so DO App Platform / PM2 restarts with clean memory.
 
-// London-NY overlap boundary alerts — fires at exactly 12:00 and 16:00 UTC on
+// London-NY overlap boundary alerts — fires at exactly 12:00 and 14:00 UTC on
 // weekdays. Self-reschedules on each fire so it runs indefinitely. Wrapped in
 // try/catch so a tgSend failure doesn't kill the loop.
 let _overlapStartStats = null  // snapshot at open: { trades, alerts, balance, t }
@@ -1289,7 +1290,7 @@ async function fireOverlapAlert(kind) {
       } catch {}
       await tgSend(
         `🟢 <b>LONDON-NY OVERLAP OPEN</b>\n` +
-        `Auto-trading active for next 4 hours${extra}\n` +
+        `Auto-trading active for next 2 hours (12:00-13:59 UTC)${extra}\n` +
         `⏱ ${now.toUTCString().slice(17, 25)} UTC`
       )
       wlog('info', 'London-NY overlap window opened', { metadata: { kind, ts: now.toISOString() } })
@@ -1313,12 +1314,12 @@ function scheduleOverlapBoundaryAlerts() {
   function nextBoundaryMs() {
     const now = new Date()
     const day = now.getUTCDay()
-    // candidate times: today 12:00, today 16:00, tomorrow 12:00, monday 12:00
+    // candidate times: today 12:00, today 14:00, tomorrow 12:00, monday 12:00
     const candidates = []
     const todayBase = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
     if (day >= 1 && day <= 5) {
       candidates.push({ t: todayBase + 12*3600_000, kind: 'open'  })
-      candidates.push({ t: todayBase + 16*3600_000, kind: 'close' })
+      candidates.push({ t: todayBase + 14*3600_000, kind: 'close' })
     }
     // next weekday's 12:00 (skip Sat/Sun)
     let addDays = 1
@@ -1407,7 +1408,7 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   await loadStrategy()
   setInterval(loadStrategy, STRATEGY_REFRESH_MS)
   console.log(`[worker] Poll   : ${POLL_MS / 1000}s | Alert threshold: ≥${liveStrategy.minStrength}%`)
-  console.log(`[worker] Window : London-NY Overlap 12:00-15:59 UTC weekdays only`)
+  console.log(`[worker] Window : London-NY Overlap 12:00-13:59 UTC weekdays only`)
   console.log(`[worker] Status : ${isLondonNYOverlap() ? '🟢 OVERLAP ACTIVE' : '⚪ closed — next: ' + nextOverlapInfo()}`)
   // Profit-target safety check — surface a warning if profitFixedUsd is 0 or
   // null so the operator notices before trades start firing without a TP.
@@ -1436,7 +1437,7 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   // early-returns now (see evaluateSectionBias). Operator policy: mirror is
   // the permanent default; direction is never auto-switched.
   // London-NY overlap open/close Telegram notifications — fires once at the
-  // exact boundary (12:00 and 16:00 UTC weekdays).
+  // exact boundary (12:00 and 14:00 UTC weekdays).
   scheduleOverlapBoundaryAlerts()
 
   const startMsg = [
@@ -1444,7 +1445,7 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
     `Mode     : ${WORKER_MODE.toUpperCase()}`,
     `Interval : 10 seconds`,
     `Pairs    : ${PAIRS.join(', ')}`,
-    `Window   : London-NY Overlap 12:00-15:59 UTC weekdays`,
+    `Window   : London-NY Overlap 12:00-13:59 UTC weekdays`,
     `Status   : ${isLondonNYOverlap() ? '🟢 ACTIVE' : '⚪ closed — next: ' + nextOverlapInfo()}`,
     `Threshold: confidence ≥ ${liveStrategy.minStrength}%`,
     `⏱ ${new Date().toUTCString()}`,

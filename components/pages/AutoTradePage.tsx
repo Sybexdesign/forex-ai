@@ -772,7 +772,8 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   // Session status — recomputed every render (scalpTick fires once per second).
   // Mirrors the day-aware block inside the auto-trade useEffect so UI matches
   // behaviour. Sunday 22-23 is the weekly market open (allowed); Mon-Sat 20-23
-  // London-NY overlap allowlist 2026-06-08: only trade 12:00-15:59 UTC weekdays.
+  // London-NY overlap allowlist 2026-06-09 (tightened): trade 12:00-13:59 UTC
+  // weekdays only. Hourly P/L showed mirror edge degrades sharply after 13:00.
   // Single positive rule replaces prior daily-close + sun-preopen + session-bias.
   const _scalpTickRef = scalpTick  // reference so React tracks re-renders
   void _scalpTickRef
@@ -782,7 +783,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   const _utcDay   = _utcNow.getUTCDay()
   const _utcLabel = _utcNow.toISOString().slice(11, 19)
   const _isWeekday = _utcDay >= 1 && _utcDay <= 5
-  const isLondonNYOverlap = _isWeekday && _utcHour >= 12 && _utcHour < 16
+  const isLondonNYOverlap = _isWeekday && _utcHour >= 12 && _utcHour < 14
   const sessionBlocked    = !isLondonNYOverlap
   // Time-until / time-remaining helpers — recomputed each render via scalpTick.
   function fmtHM(mins: number) {
@@ -791,14 +792,14 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   }
   function timeUntilNextOverlap() {
     if (_isWeekday && _utcHour < 12) return `Today 12:00 UTC (in ${fmtHM((12 - _utcHour) * 60 - _utcMin)})`
-    if (_utcDay >= 1 && _utcDay <= 4 && _utcHour >= 16) return `Tomorrow 12:00 UTC (in ${fmtHM((24 - _utcHour + 12) * 60 - _utcMin)})`
-    if (_utcDay === 5 && _utcHour >= 16) return 'Monday 12:00 UTC'
+    if (_utcDay >= 1 && _utcDay <= 4 && _utcHour >= 14) return `Tomorrow 12:00 UTC (in ${fmtHM((24 - _utcHour + 12) * 60 - _utcMin)})`
+    if (_utcDay === 5 && _utcHour >= 14) return 'Monday 12:00 UTC'
     if (_utcDay === 6) return 'Monday 12:00 UTC'
     if (_utcDay === 0) return 'Monday 12:00 UTC'
     return 'calculating…'
   }
   function timeRemainingInWindow() {
-    return fmtHM((16 - _utcHour) * 60 - _utcMin) + ' remaining'
+    return fmtHM((14 - _utcHour) * 60 - _utcMin) + ' remaining'
   }
   const sessionLabel = isLondonNYOverlap ? 'London-NY Overlap' : 'Overlap Closed'
   const sessionColor = isLondonNYOverlap ? '#00e5b4' : '#6b7280'
