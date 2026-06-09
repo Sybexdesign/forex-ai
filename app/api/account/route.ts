@@ -36,6 +36,8 @@ export async function GET(req: NextRequest) {
     let lastCbArmedPair:     string | null = null
     let lastCbArmedPl:       string | null = null
     let lastCbArmedOneR:     string | null = null
+    let profitFixedUsd:      number | null = null
+    let profitTargetPct:     number | null = null
     if (token) {
       try {
         const parts = token.split('.')
@@ -58,6 +60,8 @@ export async function GET(req: NextRequest) {
             lastCbArmedPair     = c.lastCbArmedPair     ?? null
             lastCbArmedPl       = c.lastCbArmedPl       ?? null
             lastCbArmedOneR     = c.lastCbArmedOneR     ?? null
+            profitFixedUsd      = typeof c.profitFixedUsd  === 'number' ? c.profitFixedUsd  : null
+            profitTargetPct     = typeof c.profitTargetPct === 'number' ? c.profitTargetPct : null
           }
         }
       } catch { /* metadata fetch is best-effort */ }
@@ -66,6 +70,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({
       ...summary, broker: broker.name, openTrades, lastSwitchedAt,
       circuitBreakerUntil, lastCbArmedAt, lastCbArmedPair, lastCbArmedPl, lastCbArmedOneR,
+      profitFixedUsd, profitTargetPct,
     })
   } catch (error: any) {
     console.error('[account]', error)

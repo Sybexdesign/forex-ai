@@ -8,7 +8,7 @@ import { runRiskGuards, isTradeAllowed, getBlockReasons } from '@/lib/risk'
 import { calcPropFirmStatus, applyPropFirmGuards, DEFAULT_PROP_FIRM } from '@/lib/propfirm'
 import type { PropFirmSettings } from '@/lib/propfirm'
 import { getAdminClient } from '@/lib/supabase'
-import { alertOrderPlaced, alertOrderBlocked, alertOrderFailed } from '@/lib/telegram'
+import { alertOrderPlaced, alertOrderBlocked, alertOrderFailed, alertProfitTargetDisabled } from '@/lib/telegram'
 
 function dbToSettings(d: any): PropFirmSettings {
   return {
@@ -27,6 +27,10 @@ function dbToSettings(d: any): PropFirmSettings {
     consistencyRulePct: +d.consistency_rule_pct,
   }
 }
+
+// Dedup map for the profit-target-disabled Telegram warning: userId → last
+// alert ms. One Telegram per user per hour even if many orders fire.
+const ptDisabledWarned = new Map<string, number>()
 
 export async function POST(req: NextRequest) {
   try {
@@ -243,6 +247,35 @@ export async function POST(req: NextRequest) {
     const lots = broker.calcPositionSize(balance, strategy.riskPct, strategy.slPips, pair)
     if (!lots || lots <= 0) {
       return NextResponse.json({ success: false, blocked: true, reasons: ['Position size calculated as 0 — check balance, risk % and SL pips in Strategy settings'] }, { status: 422 })
+    }
+    // ─── Profit-target safety check ───────────────────────────────────────
+    // Warn when broker_configs.config.profitFixedUsd is 0 or null at order time
+    // — without it the EA's fixed-USD TP close is disabled and the trade can
+    // only exit via SL/TP/trail/decay. Likely an unintended setting. Deduped
+    // in-memory per userId for 1h so a misconfigured user gets one Telegram
+    // ping instead of one per fired order.
+    if (userId) {
+      try {
+        const admin = getAdminClient()
+        const { data: cfg } = await admin
+          .from('broker_configs')
+          .select('config')
+          .eq('user_id', userId)
+          .eq('is_active', true)
+          .limit(1)
+          .maybeSingle()
+        const ptUsd  = Number((cfg?.config as any)?.profitFixedUsd ?? 0)
+        const ptOk   = isFinite(ptUsd) && ptUsd > 0
+        if (!ptOk) {
+          console.warn(`[orders] WARNING — ${pair} placed but profitFixedUsd=${(cfg?.config as any)?.profitFixedUsd ?? 'null'} — profit-target close disabled`)
+          if (!ptDisabledWarned.has(userId) || Date.now() - (ptDisabledWarned.get(userId) || 0) > 3600_000) {
+            ptDisabledWarned.set(userId, Date.now())
+            await alertProfitTargetDisabled({ pair }).catch(() => {})
+          }
+        }
+      } catch (e: any) {
+        console.warn(`[orders] profit-target safety check failed (continuing): ${e?.message}`)
+      }
     }
     // Broker min-stop-distance guard — prevents MT5 retcode 10016 (invalid stops).
     // Brokers reject orders where SL/TP sit inside their freeze level, which can

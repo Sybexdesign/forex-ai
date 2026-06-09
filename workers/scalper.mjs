@@ -1409,6 +1409,26 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   console.log(`[worker] Poll   : ${POLL_MS / 1000}s | Alert threshold: ≥${liveStrategy.minStrength}%`)
   console.log(`[worker] Window : London-NY Overlap 12:00-15:59 UTC weekdays only`)
   console.log(`[worker] Status : ${isLondonNYOverlap() ? '🟢 OVERLAP ACTIVE' : '⚪ closed — next: ' + nextOverlapInfo()}`)
+  // Profit-target safety check — surface a warning if profitFixedUsd is 0 or
+  // null so the operator notices before trades start firing without a TP.
+  try {
+    const acct0 = await apiFetch('/api/account').catch(() => null)
+    const ptUsd = Number(acct0?.profitFixedUsd ?? 0)
+    if (!isFinite(ptUsd) || ptUsd <= 0) {
+      console.warn(`[worker] WARNING — profit-target disabled (profitFixedUsd=${acct0?.profitFixedUsd ?? 'null'}). Trades will rely on SL/TP/trail/decay only.`)
+      wlog('warn', 'Profit target disabled at worker startup', { metadata: { profitFixedUsd: acct0?.profitFixedUsd ?? null } })
+      await tgSend(
+        `⚠️ <b>PROFIT TARGET DISABLED</b>\n\n` +
+        `Worker started but <code>profitFixedUsd</code> is 0 / null.\n` +
+        `Trades will rely on SL / TP / trailing stop / decay exit only.\n\n` +
+        `Set <b>Fixed USD Target</b> on the AutoTrade page to enable.`
+      ).catch(() => {})
+    } else {
+      console.log(`[worker] Profit target: $${ptUsd.toFixed(2)} × ${acct0?.profitTargetPct ?? '?'}% = $${(ptUsd * (acct0?.profitTargetPct ?? 0) / 100).toFixed(2)} per-trade close`)
+    }
+  } catch (e) {
+    console.warn(`[worker] profit-target safety check failed (continuing): ${e?.message}`)
+  }
 
   scheduleMidnightRestart()
   setInterval(sendHeartbeat, HEARTBEAT_MS)
