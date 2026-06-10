@@ -29,7 +29,7 @@ const PAIR_COOLDOWN_MS = 5 * 60_000  // minimum gap between two auto-trades on t
 // 35-pip cap chosen because 5-day XAU ATR has a 5th percentile of ~24 pips,
 // so even calm-market signals will produce SLs below the cap. Above the cap
 // the position size becomes too small to be useful.
-const MIRROR_SL_CAP = 35
+const MIRROR_SL_CAP = 25
 const MIRROR_TP_CAP = 70  // = 2 × SL cap to preserve the 1:2 R:R target
 
 type MarketRegime = 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
@@ -1188,28 +1188,47 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
               )}
 
               {/* Lot size / risk row */}
-              {sig && !sig.blocked && dir !== 'HOLD' && (
+              {sig && !sig.blocked && dir !== 'HOLD' && (() => {
+                const useManual    = typeof strategy.manualLots === 'number' && strategy.manualLots > 0
+                const displayLots  = useManual ? (strategy.manualLots as number) : scalpLots
+                const displayRisk  = useManual ? displayLots * 10 * Math.max(1, signalSlPips) : scalpRiskAmt
+                return (
                 <div style={{
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                   background: 'rgba(0,85,176,0.07)', border: '1px solid rgba(0,85,176,0.18)',
                   borderRadius: 2, padding: '6px 8px',
                 }}>
                   <div>
-                    <div style={{ fontSize: 9, color: 'var(--color-accent)', letterSpacing: 1, marginBottom: 1 }}>POSITION</div>
+                    <div style={{ fontSize: 9, color: 'var(--color-accent)', letterSpacing: 1, marginBottom: 1 }}>
+                      POSITION
+                      <span style={{
+                        marginLeft: 6, fontSize: 8, fontWeight: 700, letterSpacing: 1,
+                        padding: '1px 5px', borderRadius: 2,
+                        background: useManual ? 'rgba(255,184,0,0.18)' : 'rgba(0,200,83,0.18)',
+                        color:      useManual ? '#ffb800' : 'var(--color-buy)',
+                      }}>
+                        {useManual ? 'MANUAL' : 'AUTO'}
+                      </span>
+                    </div>
                     <span style={{ fontSize: 16, fontWeight: 900, color: 'var(--color-accent)', fontFamily: 'JetBrains Mono', lineHeight: 1 }}>
-                      {scalpLots.toFixed(2)}
+                      {displayLots.toFixed(2)}
                     </span>
                     <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>lots</span>
                   </div>
                   <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                    <div style={{ color: 'var(--color-loss)' }}>${scalpRiskAmt.toFixed(2)} at risk</div>
-                    <div>{effectiveRiskPct}% of ${accountBalance.toLocaleString()}</div>
-                    {pfCapped && (
+                    <div style={{ color: 'var(--color-loss)' }}>${displayRisk.toFixed(2)} at risk</div>
+                    <div>
+                      {useManual
+                        ? `${signalSlPips.toFixed(1)}p SL × $10/pip-lot`
+                        : `${effectiveRiskPct}% of $${accountBalance.toLocaleString()}`}
+                    </div>
+                    {pfCapped && !useManual && (
                       <div style={{ color: 'var(--color-wait)', fontWeight: 700 }}>PF capped ↓{pfRiskCap}%</div>
                     )}
                   </div>
                 </div>
-              )}
+                )
+              })()}
 
               {/* Reasons */}
               {sig?.reasons && sig.reasons.length > 0 && dir !== 'HOLD' && (
@@ -1370,28 +1389,47 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                 )}
 
                 {/* Lot size / risk row */}
-                {sig && !sig.blocked && dir !== 'HOLD' && (
+                {sig && !sig.blocked && dir !== 'HOLD' && (() => {
+                  const useManual    = typeof strategy.manualLots === 'number' && strategy.manualLots > 0
+                  const displayLots  = useManual ? (strategy.manualLots as number) : scalpLots
+                  const displayRisk  = useManual ? displayLots * 10 * Math.max(1, signalSlPips) : scalpRiskAmt
+                  return (
                   <div style={{
                     display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                     background: 'rgba(0,85,176,0.07)', border: '1px solid rgba(0,85,176,0.18)',
                     borderRadius: 2, padding: '6px 8px',
                   }}>
                     <div>
-                      <div style={{ fontSize: 9, color: 'var(--color-accent)', letterSpacing: 1, marginBottom: 1 }}>POSITION</div>
+                      <div style={{ fontSize: 9, color: 'var(--color-accent)', letterSpacing: 1, marginBottom: 1 }}>
+                        POSITION
+                        <span style={{
+                          marginLeft: 6, fontSize: 8, fontWeight: 700, letterSpacing: 1,
+                          padding: '1px 5px', borderRadius: 2,
+                          background: useManual ? 'rgba(255,184,0,0.18)' : 'rgba(0,200,83,0.18)',
+                          color:      useManual ? '#ffb800' : 'var(--color-buy)',
+                        }}>
+                          {useManual ? 'MANUAL' : 'AUTO'}
+                        </span>
+                      </div>
                       <span style={{ fontSize: 16, fontWeight: 900, color: 'var(--color-accent)', fontFamily: 'JetBrains Mono', lineHeight: 1 }}>
-                        {scalpLots.toFixed(2)}
+                        {displayLots.toFixed(2)}
                       </span>
                       <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>lots</span>
                     </div>
                     <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                      <div style={{ color: 'var(--color-loss)' }}>${scalpRiskAmt.toFixed(2)} at risk</div>
-                      <div>{effectiveRiskPct}% of ${accountBalance.toLocaleString()}</div>
-                      {pfCapped && (
+                      <div style={{ color: 'var(--color-loss)' }}>${displayRisk.toFixed(2)} at risk</div>
+                      <div>
+                        {useManual
+                          ? `${signalSlPips.toFixed(1)}p SL × $10/pip-lot`
+                          : `${effectiveRiskPct}% of $${accountBalance.toLocaleString()}`}
+                      </div>
+                      {pfCapped && !useManual && (
                         <div style={{ color: 'var(--color-wait)', fontWeight: 700 }}>PF capped ↓{pfRiskCap}%</div>
                       )}
                     </div>
                   </div>
-                )}
+                  )
+                })()}
 
                 {/* Reasons (inherited from original) */}
                 {sig?.reasons && sig.reasons.length > 0 && dir !== 'HOLD' && (

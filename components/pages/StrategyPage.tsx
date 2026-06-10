@@ -241,9 +241,9 @@ export default function StrategyPage({ strategy, onSave }: StrategyPageProps) {
               color:     'var(--text-secondary)',
               marginBottom: 16,
             }}>
-              ℹ This is the <b>minimum</b> SL. Auto-trade may widen up to 35 pips based on
+              ℹ This is the <b>minimum</b> SL. Auto-trade may widen up to 25 pips based on
               market volatility — the engine's ATR-derived SL is used when it sits between
-              this value and the 35-pip cap.
+              this value and the 25-pip cap.
             </div>
 
             {/* R:R display */}
@@ -283,6 +283,88 @@ export default function StrategyPage({ strategy, onSave }: StrategyPageProps) {
                   </div>
                 )
               })}
+            </div>
+
+            {/* Manual lot-size override — bypasses balance×risk auto-sizing.
+                Hard cap (1R × hardCapMultiplier) still applies in the orders route. */}
+            <div style={{ marginTop: 16 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
+                <div>
+                  <div style={{ fontSize: 13, color: 'var(--text-secondary)', fontWeight: 600 }}>
+                    Manual lot size
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                    Override auto-sizing · 0 = use auto (balance × risk%)
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                  <input
+                    type="number"
+                    min={0}
+                    max={0.50}
+                    step={0.01}
+                    value={local.manualLots ?? 0}
+                    onChange={e => {
+                      const v = parseFloat(e.target.value)
+                      const clean = isFinite(v) && v > 0 ? Math.min(0.50, v) : null
+                      set('manualLots', clean)
+                    }}
+                    className="mono"
+                    style={{ width: 80, textAlign: 'right', fontSize: 14, padding: '4px 8px' }}
+                  />
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>lots</span>
+                </div>
+              </div>
+
+              {/* Risk preview — only when override is active.
+                  Reference balance is $10k (matches AUTO POSITION SIZE above);
+                  hardCapMultiplier defaults to 1.25 if unset; 25p SL = MIRROR_SL_CAP. */}
+              {typeof local.manualLots === 'number' && local.manualLots > 0 && (() => {
+                const refBalance       = 10000
+                const pipPerLotXau     = 10
+                const slCap            = 25      // MIRROR_SL_CAP
+                const profitTargetUsd  = 22.50   // typical profitFixedUsd exit
+                const hardCapMult      = local.hardCapMultiplier ?? 1.25
+                const maxWin           = local.manualLots * pipPerLotXau * local.tpPips
+                const maxLoss          = local.manualLots * pipPerLotXau * slCap
+                const hardCapUsd       = refBalance * (local.riskPct / 100) * hardCapMult
+                const overCap          = maxLoss > hardCapUsd
+                return (
+                  <div style={{
+                    background: 'rgba(0,0,0,0.2)', borderRadius: 3, padding: '10px 14px',
+                    fontSize: 11, lineHeight: 1.7,
+                  }}>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 6 }}>
+                      AT {local.manualLots} LOTS ON XAU/USD (REF $10K BALANCE)
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: 'var(--text-muted)' }}>Max win ({local.tpPips}p TP)</span>
+                      <span className="mono" style={{ color: '#00ff87' }}>+${maxWin.toFixed(2)}</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: 'var(--text-muted)' }}>Profit-target exit (~)</span>
+                      <span className="mono" style={{ color: '#ffb800' }}>+${profitTargetUsd.toFixed(2)}</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: 'var(--text-muted)' }}>Max loss ({slCap}p SL)</span>
+                      <span className="mono" style={{ color: '#ff3056' }}>−${maxLoss.toFixed(2)}</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: 'var(--text-muted)' }}>Hard cap (1R × {hardCapMult})</span>
+                      <span className="mono" style={{ color: '#ff8800' }}>${hardCapUsd.toFixed(2)}</span>
+                    </div>
+                    {overCap && (
+                      <div style={{
+                        marginTop: 8, padding: '6px 8px',
+                        background: 'rgba(255,184,0,0.08)', border: '1px solid rgba(255,184,0,0.25)',
+                        borderRadius: 3, color: '#ffb800', fontSize: 11, fontWeight: 600,
+                      }}>
+                        ⚠ Manual lots exceed hard cap — orders route will reduce to ~{(hardCapUsd / (pipPerLotXau * slCap)).toFixed(2)} lots
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
             </div>
           </div>
         </Panel>

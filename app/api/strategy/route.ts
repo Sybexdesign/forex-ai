@@ -50,7 +50,22 @@ export async function POST(req: NextRequest) {
       updated_at: new Date().toISOString(),
     }
     if (settings && typeof settings === 'object') {
+      // Validate manualLots if present: must be a number in [0, 0.50]; 0 → null (auto).
+      if (settings.manualLots !== undefined && settings.manualLots !== null) {
+        const lots = parseFloat(settings.manualLots)
+        if (!isFinite(lots) || lots < 0 || lots > 0.50) {
+          return NextResponse.json({ error: 'manualLots must be a number between 0 and 0.50' }, { status: 400 })
+        }
+        settings.manualLots = lots > 0 ? lots : null
+      }
       payload.settings = settings
+      // Mirror manualLots into the dedicated column so it can be queried/indexed
+      // without parsing JSONB. settings.manualLots remains the source of truth at runtime.
+      if (settings.manualLots === null || settings.manualLots === undefined) {
+        payload.manual_lots = null
+      } else {
+        payload.manual_lots = settings.manualLots
+      }
     }
     if (autoTrade && typeof autoTrade === 'object') {
       if (typeof autoTrade.enabled === 'boolean') payload.auto_trade_enabled  = autoTrade.enabled

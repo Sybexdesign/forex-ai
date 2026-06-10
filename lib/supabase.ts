@@ -66,6 +66,13 @@ export interface StrategySettings {
   hardDailyStop: boolean
   hardNews: boolean
   demoLock: boolean
+  // Optional fixed-lot override. null/undefined = auto-size (balance × riskPct ÷ slPips).
+  // When > 0, the orders route uses this lot size; hard cap still enforced.
+  manualLots?: number | null
+  // Optional override for the 1R hard-cap multiplier in mt5-sync trade manager.
+  // Defaults to 1.25 if unset. Surfaced here so the orders route can read the
+  // user's preferred cap when reducing manual-lots that would exceed it.
+  hardCapMultiplier?: number
 }
 
 export const DEFAULT_STRATEGY: StrategySettings = {

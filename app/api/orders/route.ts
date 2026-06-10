@@ -243,10 +243,75 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, blocked: true, reasons: ['Take profit pips must be > 0 — configure tpPips in Strategy settings'] }, { status: 422 })
     }
 
+    // ─── Broker min-stop-distance guard (hoisted above lot calc) ─────────
+    // Brokers reject orders where SL/TP sit inside their freeze level (MT5 retcode 10016),
+    // which can change with spread spikes. Conservative per-instrument floors below; if the
+    // strategy's SL/TP comes in tighter, widen with a 10% safety margin.
+    //
+    // Hoisted ABOVE the lot calculation so both manual-override and auto-sizing
+    // dimension positions against the actual stop distance that will be placed,
+    // not the (pre-widening) strategy.slPips. Previously sized for tight SL but
+    // placed at the wider safeSlPips → over-sized positions by up to 2×.
+    const MIN_STOP_PIPS: Record<string, number> = {
+      XAU: 20,    // XAU/USD: 2.0 USD = 20 pips at pip=0.1 (lowered from 30 — live fills accepted 12-22 pip SLs)
+      XAG: 10,    // XAG/USD: 0.10 USD = 10 pips at pip=0.01
+      JPY: 5,     // *JPY: 5 pips at pip=0.01
+      FX:  3,     // major FX: 3 pips at pip=0.0001
+    }
+    const minSlKey = pair.startsWith('XAU') ? 'XAU'
+                   : pair.startsWith('XAG') ? 'XAG'
+                   : pair.includes('JPY')   ? 'JPY' : 'FX'
+    const minStop  = MIN_STOP_PIPS[minSlKey]
+    let safeSlPips = strategy.slPips
+    let safeTpPips = strategy.tpPips
+    if (safeSlPips < minStop) {
+      console.warn(`[orders] ${pair} SL ${safeSlPips}p < broker min ${minStop}p — widening to ${Math.round(minStop * 1.1)}p`)
+      safeSlPips = Math.round(minStop * 1.1)
+    }
+    if (safeTpPips < minStop) {
+      console.warn(`[orders] ${pair} TP ${safeTpPips}p < broker min ${minStop}p — widening to ${Math.round(minStop * 1.1)}p`)
+      safeTpPips = Math.round(minStop * 1.1)
+    }
+
     // ─── Calculate position size and place order ──────────────────────────
-    const lots = broker.calcPositionSize(balance, strategy.riskPct, strategy.slPips, pair)
+    // Manual-lots override: when strategy.manualLots is a positive number, use it
+    // directly. Otherwise auto-size via balance × riskPct ÷ safeSlPips. The hard-cap
+    // reduction below clamps manual-lots so a misconfigured user can't exceed their
+    // configured 1R cap × hardCapMultiplier on a single trade.
+    let lots: number
+    let lotSource: 'manual' | 'auto'
+    if (typeof strategy.manualLots === 'number' && strategy.manualLots > 0) {
+      lots = strategy.manualLots
+      lotSource = 'manual'
+      console.log(`[orders] ${pair} using manual lots: ${lots} (override active)`)
+    } else {
+      lots = broker.calcPositionSize(balance, strategy.riskPct, safeSlPips, pair)
+      lotSource = 'auto'
+      console.log(`[orders] ${pair} using auto lots: ${lots} (${strategy.riskPct}% of $${balance} ÷ ${safeSlPips}p)`)
+    }
     if (!lots || lots <= 0) {
       return NextResponse.json({ success: false, blocked: true, reasons: ['Position size calculated as 0 — check balance, risk % and SL pips in Strategy settings'] }, { status: 422 })
+    }
+
+    // ─── Hard-cap reduction (manual lots only) ────────────────────────────
+    // Auto-sized lots are already bounded by riskPct so they can't exceed the
+    // user's per-trade risk. Manual lots can be set arbitrarily and need a
+    // safety net. Cap = 1R × hardCapMultiplier (default 1.25; see mt5-sync route).
+    // Pip value per lot is ≈$10 for XAU/USD and most major FX (USD-quote);
+    // approximated here so a misconfig can't bypass the cap. JPY pairs are
+    // slightly different ($6.8/pip-per-lot) but the over-estimate errs safe.
+    if (lotSource === 'manual') {
+      const pipValuePerLot      = pair.includes('XAU') ? 10 : pair.includes('JPY') ? 6.8 : 10
+      const hardCapMult         = (typeof strategy.hardCapMultiplier === 'number' && strategy.hardCapMultiplier >= 1.0 && strategy.hardCapMultiplier <= 3.0)
+        ? strategy.hardCapMultiplier
+        : 1.25
+      const hardCapUsd          = balance * (strategy.riskPct / 100) * hardCapMult
+      const maxLossAtManualLots = lots * pipValuePerLot * safeSlPips
+      if (hardCapUsd > 0 && maxLossAtManualLots > hardCapUsd) {
+        const safeLots = hardCapUsd / (pipValuePerLot * safeSlPips)
+        console.warn(`[orders] ${pair} manual lots ${lots} would risk $${maxLossAtManualLots.toFixed(2)} > hard cap $${hardCapUsd.toFixed(2)} (1R×${hardCapMult}) — reduced to ${safeLots.toFixed(2)}`)
+        lots = Math.max(0.01, parseFloat(safeLots.toFixed(2)))
+      }
     }
     // ─── Profit-target safety check ───────────────────────────────────────
     // Warn when broker_configs.config.profitFixedUsd is 0 or null at order time
@@ -277,32 +342,9 @@ export async function POST(req: NextRequest) {
         console.warn(`[orders] profit-target safety check failed (continuing): ${e?.message}`)
       }
     }
-    // Broker min-stop-distance guard — prevents MT5 retcode 10016 (invalid stops).
-    // Brokers reject orders where SL/TP sit inside their freeze level, which can
-    // change with spread spikes. Conservative per-instrument floors below; if the
-    // strategy's SL/TP comes in tighter, widen with a 10% safety margin. The clamp
-    // also catches the 0.5R hard-cap floor (slPips=18 on XAU = 1.8 USD) being
-    // tighter than the broker accepts during volatile sessions.
-    const MIN_STOP_PIPS: Record<string, number> = {
-      XAU: 30,    // XAU/USD: 3.0 USD = 30 pips at pip=0.1
-      XAG: 10,    // XAG/USD: 0.10 USD = 10 pips at pip=0.01
-      JPY: 5,     // *JPY: 5 pips at pip=0.01
-      FX:  3,     // major FX: 3 pips at pip=0.0001
-    }
-    const minSlKey = pair.startsWith('XAU') ? 'XAU'
-                   : pair.startsWith('XAG') ? 'XAG'
-                   : pair.includes('JPY')   ? 'JPY' : 'FX'
-    const minStop  = MIN_STOP_PIPS[minSlKey]
-    let safeSlPips = strategy.slPips
-    let safeTpPips = strategy.tpPips
-    if (safeSlPips < minStop) {
-      console.warn(`[orders] ${pair} SL ${safeSlPips}p < broker min ${minStop}p — widening to ${Math.round(minStop * 1.1)}p`)
-      safeSlPips = Math.round(minStop * 1.1)
-    }
-    if (safeTpPips < minStop) {
-      console.warn(`[orders] ${pair} TP ${safeTpPips}p < broker min ${minStop}p — widening to ${Math.round(minStop * 1.1)}p`)
-      safeTpPips = Math.round(minStop * 1.1)
-    }
+    // (safeSlPips/safeTpPips computed above — see broker min-stop-distance guard
+    // hoisted to the start of the position-sizing block so manual and auto sizing
+    // both use the actual stop distance the broker will accept.)
     // ─── Cross-source dedup guard ────────────────────────────────────────
     // Reject any order with same user+pair+direction placed in the prior 2s.
     // Belt-and-braces against worker+browser racing or two-tab manual clicks —

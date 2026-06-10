@@ -43,7 +43,7 @@ const STRATEGY_REFRESH_MS = 5 * 60_000  // re-pull live strategy every 5 min
 // SL/TP clamp bounds — see AutoTradePage MIRROR_SL_CAP comment. Floor = user's
 // liveStrategy.slPips/tpPips; outer cap = these constants. Keep in sync with the
 // browser values; both code paths feed the same /api/orders endpoint.
-const MIRROR_SL_CAP = 35
+const MIRROR_SL_CAP = 25
 const MIRROR_TP_CAP = 70
 
 // Server-side auto-trade execution (Fix 6 — mirror execution audit).
@@ -545,7 +545,7 @@ async function tgSend(text) {
   }
 }
 
-function formatAlert(pair, strategy, session, signal, mode) {
+function formatAlert(pair, strategy, session, signal, mode, placement) {
   const dir    = signal.direction
   const emoji  = dir === 'BUY' ? '🟢' : '🔴'
   const dp     = decimals(pair)
@@ -561,6 +561,21 @@ function formatAlert(pair, strategy, session, signal, mode) {
   const badge  = mode === 'live' ? '💸 LIVE TRADE PLACED' : '📋 Paper Signal'
   const reasons = (signal.reasons || []).map(r => `  • ${r}`).join('\n')
 
+  // Optional placement block — only emitted on live placements that returned
+  // lot info. Shows lots + source (manual/auto) + max-loss USD so the operator
+  // can verify the position size matches the configured override.
+  let placementBlock = ''
+  if (mode === 'live' && placement && typeof placement.lots === 'number') {
+    const pipPerLot = pair.includes('XAU') ? 10 : pair.includes('JPY') ? 6.8 : 10
+    const maxLoss   = placement.lots * pipPerLot * (placement.slPips || +slPips)
+    const sourceTag = placement.source === 'manual' ? 'manual' : 'auto'
+    placementBlock = [
+      ``,
+      `Lots   : <b>${placement.lots}</b> (${sourceTag})`,
+      `Max loss: $${maxLoss.toFixed(2)}` + (placement.section ? `  [${placement.section}]` : ''),
+    ].join('\n')
+  }
+
   return [
     `${emoji} <b>${dir} ${pair}</b>  [${strategy} · ${session}]`,
     `Confidence: <b>${signal.confidence}%</b>  ${badge}`,
@@ -569,6 +584,7 @@ function formatAlert(pair, strategy, session, signal, mode) {
     `SL     : <code>${f(sl)}</code>  (${slPips} pips)`,
     `TP     : <code>${f(tp)}</code>  (${tpPips} pips)`,
     `R:R    : 1 : ${rr}`,
+    placementBlock,
     ``,
     reasons,
     signal.risk_note ? `\n⚠ ${signal.risk_note}` : '',
@@ -653,7 +669,10 @@ async function loadStrategy() {
       liveStrategy.autoTradeSections = Array.isArray(data.autoTrade.sections) ? data.autoTrade.sections : ['scalp']
       liveStrategy.autoTradePairs    = Array.isArray(data.autoTrade.pairs)    ? data.autoTrade.pairs    : ['XAU/USD','XAG/USD']
     }
-    console.log(`[strategy] loaded — minStrength=${liveStrategy.minStrength}% riskPct=${liveStrategy.riskPct}% SL=${liveStrategy.slPips}p TP=${liveStrategy.tpPips}p maxPos=${liveStrategy.maxPositions} | autoEnabled=${liveStrategy.autoTradeEnabled} sections=[${liveStrategy.autoTradeSections.join(',')}] pairs=[${liveStrategy.autoTradePairs.join(',')}]`)
+    const lotMode = (typeof liveStrategy.manualLots === 'number' && liveStrategy.manualLots > 0)
+      ? `manual=${liveStrategy.manualLots}lot`
+      : 'auto'
+    console.log(`[strategy] loaded — minStrength=${liveStrategy.minStrength}% riskPct=${liveStrategy.riskPct}% SL=${liveStrategy.slPips}p TP=${liveStrategy.tpPips}p maxPos=${liveStrategy.maxPositions} sizing=${lotMode} | autoEnabled=${liveStrategy.autoTradeEnabled} sections=[${liveStrategy.autoTradeSections.join(',')}] pairs=[${liveStrategy.autoTradePairs.join(',')}]`)
   } catch (e) {
     console.warn('[strategy] fetch failed — using cached values:', e.message)
   }
@@ -965,6 +984,10 @@ async function processSignal(pair, tick, strategy, session, direction) {
   // exists in parallel; this just makes the worker an independent autonomous
   // executor so closing the browser doesn't stop trading.
   let placed = false
+  // Captures the most recent successful placement so the Telegram alert below
+  // can show actual lots + sizing source (manual vs auto). Stays null on
+  // paper/blocked/halt paths.
+  let lastPlacement = null
 
   if (WORKER_MODE !== 'live') {
     logAutoTradeDecision('skipped-paper-mode', pair, dir, signal)
@@ -1027,6 +1050,9 @@ async function processSignal(pair, tick, strategy, session, direction) {
             // both can fire only if there's room for both.
             let openLocal   = risk.openCount
             let placedAny   = false
+            // lastPlacement declared at outer scope (above) so the formatAlert
+            // call after the loop can read it; updated below on each successful
+            // placement. Last writer wins if both sections fire.
             for (const section of liveStrategy.autoTradeSections) {
               if (section !== 'scalp' && section !== 'mirror') {
                 logAutoTradeDecision('skipped-section-disabled', pair, dir, signal, { section })
@@ -1047,12 +1073,19 @@ async function processSignal(pair, tick, strategy, session, direction) {
                   placedAny = true
                   openLocal++
                   stats.trades++
-                  console.log(`[order] ✓ [${ACCOUNT_TYPE.toUpperCase()}] ${section.toUpperCase()} ${pair} ${sectionDir} → trade ${result.tradeId} @ ${result.filledPrice} lots=${result.lots}`)
+                  lastPlacement = {
+                    lots:   result.lots,
+                    source: (typeof liveStrategy.manualLots === 'number' && liveStrategy.manualLots > 0) ? 'manual' : 'auto',
+                    section,
+                    slPips: result.stopLossPips ?? null,
+                  }
+                  console.log(`[order] ✓ [${ACCOUNT_TYPE.toUpperCase()}] ${section.toUpperCase()} ${pair} ${sectionDir} → trade ${result.tradeId} @ ${result.filledPrice} lots=${result.lots} (${lastPlacement.source})`)
                   await logAutoTradeDecision('executed', pair, sectionDir, signal, {
                     section,
                     tradeId:     result.tradeId,
                     filledPrice: result.filledPrice,
                     lots:        result.lots,
+                    lotSource:   lastPlacement.source,
                   })
                 } else {
                   console.log(`[order] blocked (${section}): ${(result.reasons || []).join(', ')}`)
@@ -1076,8 +1109,9 @@ async function processSignal(pair, tick, strategy, session, direction) {
     }
   }
 
-  // Telegram alert
-  await tgSend(formatAlert(pair, strategy, session, signal, placed ? 'live' : 'paper'))
+  // Telegram alert — pass lastPlacement so live alerts include lots + source.
+  // Null on paper/blocked/halt paths; formatAlert ignores it for non-'live' mode.
+  await tgSend(formatAlert(pair, strategy, session, signal, placed ? 'live' : 'paper', lastPlacement))
 
   // Signal already saved to DB earlier (before the confidence gate) for ML training
 }
