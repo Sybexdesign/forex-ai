@@ -22,7 +22,7 @@
 //|   close threshold itself — identical to app-side calculation.    |
 //+------------------------------------------------------------------+
 #property strict
-#property description "SybexForexAI v9.2 -- profit target formula"
+#property description "SybexForexAI v9.3 -- MFE/MAE excursion tracking"
 
 //--- Inputs -----------------------------------------------------------
 input string WebhookToken        = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
@@ -166,13 +166,24 @@ string BuildClosedPositionsJSON()
          int    dp         = (int)SymbolInfoInteger(sym + SymbolSuffix, SYMBOL_DIGITS);
          if(dp == 0) dp    = 5; // fallback
 
+         // v9.3: look up MFE/MAE from ProtState before it gets purged below.
+         // FindProtState returns -1 if the ticket was never tracked (e.g. EA
+         // restart mid-trade) — emit zeros in that case so mt5-sync can still
+         // mark the trade closed without MFE/MAE attribution.
+         int piIdx = FindProtState(closedTicket);
+         double mfe = (piIdx >= 0) ? g_prot[piIdx].peakProfit   : 0.0;
+         double mae = (piIdx >= 0) ? g_prot[piIdx].troughProfit : 0.0;
+
          if(!first) out += ",";
-         out += "{\"symbol\":\""     + sym                                    + "\""
+         out += "{\"ticket\":\""     + IntegerToString((long)closedTicket)    + "\""
+              + ",\"symbol\":\""     + sym                                    + "\""
               + ",\"type\":\""       + g_prevPos[i].direction                 + "\""
               + ",\"openPrice\":"    + DoubleToString(g_prevPos[i].openPrice, dp)
               + ",\"closePrice\":"   + DoubleToString(closePrice,             dp)
               + ",\"lots\":"         + DoubleToString(g_prevPos[i].lots,      2)
               + ",\"profit\":"       + DoubleToString(pnl,                    2)
+              + ",\"mfe\":"          + DoubleToString(mfe,                    2)
+              + ",\"mae\":"          + DoubleToString(mae,                    2)
               + "}";
          first = false;
          break; // found the close deal for this position
@@ -190,7 +201,8 @@ struct ProtState {
    ulong    ticket;
    double   origEntry;
    double   origSl;
-   double   peakProfit;
+   double   peakProfit;     // max favorable excursion (USD)
+   double   troughProfit;   // v9.3: max adverse excursion (USD) — most negative profit seen
    bool     beApplied;
    bool     partialLocked;
    datetime openedAt;
@@ -230,6 +242,7 @@ int EnsureProtState(ulong ticket, double entry, double sl)
    g_prot[i].origEntry     = entry;
    g_prot[i].origSl        = sl;
    g_prot[i].peakProfit    = 0.0;
+   g_prot[i].troughProfit  = 0.0;   // v9.3: tracks MAE; stays 0 if profit never goes adverse
    g_prot[i].beApplied     = false;
    g_prot[i].partialLocked = false;
    g_prot[i].openedAt      = TimeCurrent();
@@ -353,7 +366,10 @@ bool IsSafeToAct(string sym)
 
 void RunProfitProtection()
 {
-   PurgeClosedStates();
+   // v9.3: PurgeClosedStates() moved to AFTER BuildClosedPositionsJSON() in
+   // OnTimer so MFE/MAE can be read from g_prot[] when reporting closed positions.
+   // Purging before the report would lose the peak/trough data for tickets that
+   // closed during this tick.
 
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -383,6 +399,14 @@ void RunProfitProtection()
 
       if(profit > g_prot[si].peakProfit)
          g_prot[si].peakProfit = profit;
+
+      // v9.3 — track most adverse excursion. troughProfit init = 0.0, so the
+      // first negative profit sets it; if price never goes negative, trough
+      // stays 0 (= no adverse excursion). Diverges from the original snippet
+      // (which had `|| trough == 0.0`) — that latch overwrote trough with the
+      // first positive profit sample, mis-reporting MAE on pure-winner trades.
+      if(profit < g_prot[si].troughProfit)
+         g_prot[si].troughProfit = profit;
 
       double origEntry = g_prot[si].origEntry;
       double origSl    = g_prot[si].origSl;
@@ -491,11 +515,13 @@ int OnInit()
    g_profitTargetPct = ProfitTargetPct;
 
    EventSetTimer(1);  // 1s tick — profit target checks every second, not every 2s
-   Print("SybexForexAI v9.2 started | FillMode=", EnumToString(FillMode),
+   Print("SybexForexAI v9.3 started | FillMode=", EnumToString(FillMode),
          " | OrderPoll=", OrderPollSeconds, "s | DataSync=", DataSyncSeconds, "s",
          " | Suffix='", SymbolSuffix, "'",
          " | MinHold=", MinHoldSeconds, "s",
          " | MaxSpread=", MaxSpreadPips, "pip",
+         " | BE=0.5R | PartialLock=1.0R | Decay=50%peak (min $", DoubleToString(DecayMinPeakUsd, 2), ")",
+         " | MFE/MAE tracking enabled",
          " | Token prefix: ", StringSubstr(WebhookToken, 0, 8));
    return INIT_SUCCEEDED;
 }
@@ -545,6 +571,12 @@ void OnTimer()
    // ── v9: detect positions that closed since last snapshot ────────
    // Must run before SnapshotOpenPositions to capture the disappearance
    g_closedJson = BuildClosedPositionsJSON();
+
+   // v9.3: purge closed-position ProtStates AFTER the JSON is built, so MFE/MAE
+   // for tickets that just closed are available to BuildClosedPositionsJSON.
+   // Previously PurgeClosedStates ran at the start of RunProfitProtection,
+   // which discarded the peak/trough data before it could be reported.
+   PurgeClosedStates();
 
    // ── Order poll: every OrderPollSeconds (not every 1s tick) ──────
    // Profit target check above runs every tick; PULL is gated here.

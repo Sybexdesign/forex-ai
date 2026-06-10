@@ -57,7 +57,7 @@ export async function POST(req: NextRequest) {
     console.log('[mt5-sync] POST received — token prefix:', token.slice(0, 8))
 
     const body = await req.json()
-    const { balance, equity, currency, login, server, completedOrders, openPositions, prices, candles } = body
+    const { balance, equity, currency, login, server, completedOrders, openPositions, prices, candles, closedPositions } = body
 
     if (typeof balance !== 'number') {
       return NextResponse.json({ error: 'balance must be a number' }, { status: 400 })
@@ -134,11 +134,97 @@ export async function POST(req: NextRequest) {
       if (p?.ticket !== undefined) prevPositionsByTicket[String(p.ticket)] = p
     }
 
+    // ── v9.3 — process closedPositions payload (carries MFE/MAE per ticket) ──
+    // EA emits closedPositions with { ticket, symbol, type, openPrice, closePrice,
+    // lots, profit, mfe, mae }. Match each entry to a DB OPEN trade by
+    // (pair, direction, entry_price ≈ openPrice) and flip to CLOSED with all
+    // close fields populated. Unmatched entries (e.g. trades opened before this
+    // EA version) fall through to the legacy pair+direction reconciliation below.
+    if (Array.isArray(closedPositions) && closedPositions.length > 0 && userId) {
+      const nowStr = new Date().toISOString()
+      const cbTriggerUsd_post = oneRusd > 0 ? oneRusd : 0   // realised >1R loss arms CB
+      let cbArmedAt_post: string | null = null
+      for (const cp of closedPositions as any[]) {
+        const symbol  = String(cp.symbol || '').trim()
+        const dirRaw  = String(cp.type   || '').toUpperCase()
+        const direction = dirRaw === 'BUY' || dirRaw === 'SELL' ? dirRaw : null
+        if (!symbol || !direction) continue
+        const pair = mt5SymbolToPair(symbol)
+        const openPriceN = typeof cp.openPrice === 'number' ? cp.openPrice : parseFloat(cp.openPrice)
+        if (!isFinite(openPriceN)) continue
+        // Match: same pair+direction, OPEN, recent (12h), entry_price within 2 pips.
+        const since = new Date(Date.now() - 12 * 60 * 60_000).toISOString()
+        const { data: candidates } = await sb.from('trades')
+          .select('id, entry_price, opened_at')
+          .eq('user_id', userId)
+          .eq('pair', pair)
+          .eq('direction', direction)
+          .eq('result', 'OPEN')
+          .gte('opened_at', since)
+          .order('opened_at', { ascending: false })
+          .limit(8)
+        if (!candidates || candidates.length === 0) continue
+        const pip = pair.startsWith('XAU') ? 0.1
+                  : pair.startsWith('XAG') ? 0.01
+                  : pair.includes('JPY')   ? 0.01 : 0.0001
+        const tolerance = pip * 2   // 2 pips slack for spread + rounding
+        const matched = candidates.find(c => {
+          const ep = typeof c.entry_price === 'number' ? c.entry_price : parseFloat(c.entry_price as any)
+          return isFinite(ep) && Math.abs(ep - openPriceN) < tolerance
+        })
+        if (!matched) {
+          console.log(`[mt5-sync] closedPosition ${pair} ${direction} @ ${openPriceN} — no OPEN trade within ${tolerance} of entry`)
+          continue
+        }
+        const plUsd  = typeof cp.profit === 'number' ? cp.profit : null
+        const mfeUsd = typeof cp.mfe    === 'number' ? cp.mfe    : null
+        const maeUsd = typeof cp.mae    === 'number' ? cp.mae    : null
+        await sb.from('trades').update({
+          result:     'CLOSED',
+          closed_at:  nowStr,
+          exit_price: typeof cp.closePrice === 'number' ? cp.closePrice : null,
+          pl_usd:     plUsd,
+          mfe_usd:    mfeUsd,
+          mae_usd:    maeUsd,
+        }).eq('id', matched.id)
+        console.log(`[mt5-sync] CLOSED via closedPosition — ${pair} ${direction} pl=$${plUsd} mfe=$${mfeUsd} mae=$${maeUsd} → trade ${matched.id}`)
+        // Realised >1R loss → fire alert + arm CB once (matches the unrealised path
+        // in the legacy reconciliation below; either can arm, last-write wins).
+        if (cbTriggerUsd_post > 0 && plUsd !== null && plUsd < -cbTriggerUsd_post) {
+          alertRiskBreach({
+            pair, ticket: cp.ticket ?? null, pl: plUsd, cap: oneRusd, reason: 'post-close-1R',
+          }).catch(() => {})
+          if (!cbArmedAt_post) {
+            const until = new Date(Date.now() + 15 * 60_000).toISOString()
+            cbArmedAt_post = until
+            console.warn(`[mt5-sync] CIRCUIT BREAKER ARMED (realised) — ${pair} pl=$${plUsd.toFixed(2)} < -$${cbTriggerUsd_post.toFixed(2)} (1R); pausing until ${until}`)
+            alertCircuitBreaker({
+              pair, loss: plUsd, oneR: oneRusd,
+              pauseUntil: new Date(until).toUTCString().slice(17, 25) + ' UTC',
+              pauseMin: 15,
+            }).catch(() => {})
+          }
+        }
+      }
+      if (cbArmedAt_post) {
+        try {
+          const { data: cur } = await sb.from('broker_configs').select('config').eq('id', row.id).single()
+          const merged = { ...(cur?.config || {}), circuitBreakerUntil: cbArmedAt_post }
+          await sb.from('broker_configs').update({ config: merged }).eq('id', row.id)
+        } catch (e: any) {
+          console.error('[mt5-sync] failed to persist circuitBreakerUntil (realised path):', e?.message)
+        }
+      }
+    }
+
     // ── Reconcile DB open trades against EA's actual open positions ──────────
     // EA sends openPositions on every sync (empty array = no positions open).
     // Compare against DB trades marked OPEN: any DB trade that no longer has
     // a matching EA position was closed by MT5 (SL/TP hit or profit-protection)
     // and must be marked CLOSED so the max-trade guard stays accurate.
+    // Note: trades already CLOSED via the closedPositions path above won't
+    // appear in the dbOpenTrades query (filter is result='OPEN'), so the two
+    // paths don't double-update.
     if (Array.isArray(openPositions) && userId) {
       const cutoff = new Date(Date.now() - 2 * 60_000).toISOString()
       const { data: dbOpenTrades } = await sb
