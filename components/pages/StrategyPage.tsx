@@ -123,9 +123,17 @@ function HardRuleRow({ icon, label, description, enabled, onChange }: HardRuleRo
 interface StrategyPageProps {
   strategy: StrategySettings
   onSave: (s: StrategySettings) => Promise<void>
+  // Live account snapshot from useAccount(). Optional — the page renders fine
+  // without it, but the manual-lots dollar-risk preview uses balance +
+  // profitFixedUsd/profitTargetPct from this object when present.
+  account?: {
+    balance?: number
+    profitFixedUsd?: number | null
+    profitTargetPct?: number | null
+  } | null
 }
 
-export default function StrategyPage({ strategy, onSave }: StrategyPageProps) {
+export default function StrategyPage({ strategy, onSave, account }: StrategyPageProps) {
   const [local, setLocal] = useState<StrategySettings>({ ...strategy })
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -317,33 +325,52 @@ export default function StrategyPage({ strategy, onSave }: StrategyPageProps) {
               </div>
 
               {/* Risk preview — only when override is active.
-                  Reference balance is $10k (matches AUTO POSITION SIZE above);
-                  hardCapMultiplier defaults to 1.25 if unset; 25p SL = MIRROR_SL_CAP. */}
+                  Reads live balance + profitFixedUsd + profitTargetPct from /api/account
+                  via the `account` prop (set on AutoTrade page). Falls back to $10k
+                  reference balance if account isn't synced; profit-target shows
+                  "not configured" if profitFixedUsd hasn't been set. */}
               {typeof local.manualLots === 'number' && local.manualLots > 0 && (() => {
-                const refBalance       = 10000
+                const liveBalance      = typeof account?.balance === 'number' && account.balance > 0 ? account.balance : 0
+                const refBalance       = liveBalance > 0 ? liveBalance : 10000
+                const usingLiveBalance = liveBalance > 0
                 const pipPerLotXau     = 10
                 const slCap            = 25      // MIRROR_SL_CAP
-                const profitTargetUsd  = 22.50   // typical profitFixedUsd exit
+                const fixedUsd         = typeof account?.profitFixedUsd  === 'number' ? account.profitFixedUsd  : 0
+                const targetPct        = typeof account?.profitTargetPct === 'number' ? account.profitTargetPct : 75
+                const profitExit       = fixedUsd > 0 ? fixedUsd * (targetPct / 100) : 0
                 const hardCapMult      = local.hardCapMultiplier ?? 1.25
                 const maxWin           = local.manualLots * pipPerLotXau * local.tpPips
                 const maxLoss          = local.manualLots * pipPerLotXau * slCap
                 const hardCapUsd       = refBalance * (local.riskPct / 100) * hardCapMult
                 const overCap          = maxLoss > hardCapUsd
+                // Auto-lots that the orders route would compute for this balance/risk/SL.
+                // Used to scale the profit target proportionally: manualLots:autoLots
+                // should equal idealFixedUsd:currentFixedUsd. Suggestion only shown
+                // when a target is actually configured (fixedUsd > 0).
+                const autoLotsRaw      = (refBalance * (local.riskPct / 100)) / (slCap * pipPerLotXau)
+                const autoLots         = Math.max(0.01, Math.min(10, autoLotsRaw))
+                const idealFixedUsd    = autoLots > 0 ? fixedUsd * (local.manualLots / autoLots) : fixedUsd
+                const targetConfigured = fixedUsd > 0
+                const isAligned        = targetConfigured && Math.abs(fixedUsd - idealFixedUsd) < 5
                 return (
                   <div style={{
                     background: 'rgba(0,0,0,0.2)', borderRadius: 3, padding: '10px 14px',
                     fontSize: 11, lineHeight: 1.7,
                   }}>
                     <div style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 6 }}>
-                      AT {local.manualLots} LOTS ON XAU/USD (REF $10K BALANCE)
+                      AT {local.manualLots} LOTS ON XAU/USD ({usingLiveBalance ? `LIVE $${refBalance.toLocaleString()} BAL` : 'REF $10K BAL — connect broker for live'})
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                       <span style={{ color: 'var(--text-muted)' }}>Max win ({local.tpPips}p TP)</span>
                       <span className="mono" style={{ color: '#00ff87' }}>+${maxWin.toFixed(2)}</span>
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span style={{ color: 'var(--text-muted)' }}>Profit-target exit (~)</span>
-                      <span className="mono" style={{ color: '#ffb800' }}>+${profitTargetUsd.toFixed(2)}</span>
+                      <span style={{ color: 'var(--text-muted)' }}>
+                        Profit-target exit{targetConfigured ? ` (${targetPct}% of $${fixedUsd.toFixed(2)})` : ''}
+                      </span>
+                      <span className="mono" style={{ color: targetConfigured ? '#ffb800' : 'var(--text-dim)' }}>
+                        {targetConfigured ? `+$${profitExit.toFixed(2)}` : 'not configured'}
+                      </span>
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                       <span style={{ color: 'var(--text-muted)' }}>Max loss ({slCap}p SL)</span>
@@ -360,6 +387,17 @@ export default function StrategyPage({ strategy, onSave }: StrategyPageProps) {
                         borderRadius: 3, color: '#ffb800', fontSize: 11, fontWeight: 600,
                       }}>
                         ⚠ Manual lots exceed hard cap — orders route will reduce to ~{(hardCapUsd / (pipPerLotXau * slCap)).toFixed(2)} lots
+                      </div>
+                    )}
+                    {targetConfigured && !isAligned && (
+                      <div style={{
+                        marginTop: 8, padding: '6px 8px',
+                        background: 'rgba(0,229,180,0.06)', border: '1px solid rgba(0,229,180,0.25)',
+                        borderRadius: 3, color: '#00e5b4', fontSize: 11,
+                      }}>
+                        ℹ Profit target ${fixedUsd.toFixed(2)} is sized for ~{autoLots.toFixed(2)} auto-lots.
+                        For {local.manualLots} lots, suggested target ≈ <b>${idealFixedUsd.toFixed(2)}</b>
+                        {' '}— update on AutoTrade page.
                       </div>
                     )}
                   </div>
