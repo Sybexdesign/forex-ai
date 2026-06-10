@@ -22,7 +22,7 @@
 //|   close threshold itself — identical to app-side calculation.    |
 //+------------------------------------------------------------------+
 #property strict
-#property description "SybexForexAI v9.3 -- MFE/MAE excursion tracking"
+#property description "SybexForexAI v9.3 -- MFE/MAE + PartialLock=1.5R"
 
 //--- Inputs -----------------------------------------------------------
 input string WebhookToken        = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
@@ -433,7 +433,7 @@ void RunProfitProtection()
             Print("[pp] ", rawSym, "#", ticket, " BE skipped: R=", DoubleToString(rMult, 2), " — choppy market");
       }
 
-      if(!g_prot[si].partialLocked && rMult >= 1.0)
+      if(!g_prot[si].partialLocked && rMult >= 1.5)
       {
          g_prot[si].partialLocked = true;
          double lockSl   = isBuy ? origEntry + 0.5 * riskDist : origEntry - 0.5 * riskDist;
@@ -520,7 +520,7 @@ int OnInit()
          " | Suffix='", SymbolSuffix, "'",
          " | MinHold=", MinHoldSeconds, "s",
          " | MaxSpread=", MaxSpreadPips, "pip",
-         " | BE=0.5R | PartialLock=1.0R | Decay=50%peak (min $", DoubleToString(DecayMinPeakUsd, 2), ")",
+         " | BE=0.5R | PartialLock=1.5R | Decay=50%peak (min $", DoubleToString(DecayMinPeakUsd, 2), ")",
          " | MFE/MAE tracking enabled",
          " | Token prefix: ", StringSubstr(WebhookToken, 0, 8));
    return INIT_SUCCEEDED;
