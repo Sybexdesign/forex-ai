@@ -395,7 +395,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                     ↓ Download SybexForexAI_EA_v9.3.mq5
                   </a>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
-                    v9.3 — MFE/MAE excursion tracking + closed position recording. Peak and trough profit captured per trade for SL-distance optimisation.
+                    v9.3 — MFE/MAE excursion tracking + closed position recording + per-symbol price-skip log (Experts tab shows which symbols were dropped from the price push and why). Peak and trough profit captured per trade for SL-distance optimisation.
                   </div>
                 </div>
               )

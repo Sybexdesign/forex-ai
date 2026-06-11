@@ -22,7 +22,7 @@
 //|   close threshold itself — identical to app-side calculation.    |
 //+------------------------------------------------------------------+
 #property strict
-#property description "SybexForexAI v9.3 -- MFE/MAE + PartialLock=1.5R"
+#property description "SybexForexAI v9.3 -- MFE/MAE + PartialLock=1.5R + price-skip log"
 
 //--- Inputs -----------------------------------------------------------
 input string WebhookToken        = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
@@ -757,7 +757,13 @@ string BuildPricesJSON()
       string fullSym = SYMBOLS[i] + SymbolSuffix;
       double bid = SymbolInfoDouble(fullSym, SYMBOL_BID);
       double ask = SymbolInfoDouble(fullSym, SYMBOL_ASK);
-      if(bid <= 0 || ask <= 0) continue;
+      if(bid <= 0 || ask <= 0)
+      {
+         Print("SybexForexAI v9.3: SKIP ", SYMBOLS[i],
+               " (suffix='", SymbolSuffix,
+               "') -- bid=", bid, " ask=", ask);
+         continue;
+      }
       int dp = (int)SymbolInfoInteger(fullSym, SYMBOL_DIGITS);
       if(!first) out += ",";
       out += "\"" + SYMBOLS[i] + "\":{\"bid\":" + DoubleToString(bid,dp)
