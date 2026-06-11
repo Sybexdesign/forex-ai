@@ -207,8 +207,29 @@ export class Mt5DirectBroker implements IBroker {
     const pip      = getPipValue(req.pair)
     const sign     = req.direction === 'BUY' ? 1 : -1
     const dp       = req.pair.includes('JPY') ? 3 : req.pair.startsWith('XA') ? 2 : 5
-    const slPrice  = +(req.currentPrice - req.stopLossPips * pip * sign).toFixed(dp)
-    const tpPrice  = +(req.currentPrice + req.takeProfitPips * pip * sign).toFixed(dp)
+
+    // Re-anchor SL/TP to the EA's live bid/ask when available and FRESH. The
+    // signal-time `req.currentPrice` can drift while the order sits in the
+    // pendingOrders queue (EA polls every 2s; data sync every 10s). On volatile
+    // instruments (XAU) a 25-pip SL anchored to a stale signal price can land
+    // on the wrong side of the broker's current quote → retcode 10013/10016.
+    // Freshness gate: 15s (1.5× EA sync). Beyond that we trust the signal price
+    // rather than risk a worse anchor. Symbol key in latestPrices has no slash.
+    const sym      = req.pair.replace('/', '')
+    const live     = this.config?.latestPrices?.[sym]
+    const liveAgeMs = live?.updatedAt ? Date.now() - new Date(live.updatedAt).getTime() : Infinity
+    const useLive  = !!live && liveAgeMs < 15_000 && live.bid > 0 && live.ask > 0
+    const anchor   = useLive
+      ? (req.direction === 'BUY' ? live!.ask : live!.bid)
+      : req.currentPrice
+    if (useLive) {
+      const drift = Math.abs(anchor - req.currentPrice).toFixed(dp)
+      console.log(`[mt5direct] ${req.pair} ${req.direction} SL/TP anchored to live ${req.direction === 'BUY' ? 'ask' : 'bid'}=${anchor} (signal was ${req.currentPrice}, drift ${drift}, age ${liveAgeMs}ms)`)
+    } else {
+      console.warn(`[mt5direct] ${req.pair} ${req.direction} no fresh live price (age ${liveAgeMs === Infinity ? 'n/a' : liveAgeMs+'ms'}) — anchoring SL/TP to signal price ${req.currentPrice}`)
+    }
+    const slPrice  = +(anchor - req.stopLossPips * pip * sign).toFixed(dp)
+    const tpPrice  = +(anchor + req.takeProfitPips * pip * sign).toFixed(dp)
 
     const newOrder = {
       id:        orderId,
@@ -231,7 +252,7 @@ export class Mt5DirectBroker implements IBroker {
       })
       if (error) throw new Error(error.message)
 
-      return { success: true, orderId, tradeId: orderId, filledPrice: req.currentPrice, tpPrice, slPrice }
+      return { success: true, orderId, tradeId: orderId, filledPrice: anchor, tpPrice, slPrice }
     } catch (e: any) {
       return { success: false, error: `Failed to queue order: ${e.message}` }
     }

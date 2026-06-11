@@ -43,7 +43,10 @@ const STRATEGY_REFRESH_MS = 5 * 60_000  // re-pull live strategy every 5 min
 // SL/TP clamp bounds — see AutoTradePage MIRROR_SL_CAP comment. Floor = user's
 // liveStrategy.slPips/tpPips; outer cap = these constants. Keep in sync with the
 // browser values; both code paths feed the same /api/orders endpoint.
-const MIRROR_SL_CAP = 25
+// TEMP DIAGNOSTIC 2026-06-11: raised 25 → 35 to test whether retcode 10013 on
+// XAU mirror orders is a broker stops-level issue. Revert to 25 once root
+// cause confirmed. Mirrored in components/pages/AutoTradePage.tsx:32.
+const MIRROR_SL_CAP = 35
 const MIRROR_TP_CAP = 70
 
 // Server-side auto-trade execution (Fix 6 — mirror execution audit).
@@ -922,13 +925,17 @@ async function processSignal(pair, tick, strategy, session, direction) {
     }).catch(() => {})
   }
 
-  // Dynamic minStrength: prefer regime-aware effectiveMinStrength from the signal
-  // (ranging=65, weak-trend=68, trending=72, strong=100 — strong suppresses) over
-  // the static configured minStrength. Falls back when the signal engine doesn't
-  // supply it (non-Scalp).
-  const effMin = typeof signal.effectiveMinStrength === 'number'
+  // Dynamic minStrength with user-strategy hard floor. Regime-aware
+  // effectiveMinStrength (ranging=65, weak-trend=68, trending=72, strong=100)
+  // can RAISE the bar (strong-trend → 100 suppresses) but never LOWER it below
+  // the user's configured minStrength — that field is the operator's floor.
+  // Previously the regime could lower the gate (e.g. weak-trend=68 < user 72),
+  // letting sub-threshold signals fire. Floor restored 2026-06-11 after live
+  // mirror cancellation diagnosis.
+  const regimeMin = typeof signal.effectiveMinStrength === 'number'
     ? signal.effectiveMinStrength
     : liveStrategy.minStrength
+  const effMin   = Math.max(liveStrategy.minStrength, regimeMin)
   if (dir === 'HOLD') {
     // Bug-fix 2026-06-08: previously a silent return. Now logged for audit.
     await logAutoTradeDecision('skipped-hold', pair, dir, signal, { conf, effMin })

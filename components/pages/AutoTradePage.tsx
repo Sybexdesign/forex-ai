@@ -29,8 +29,11 @@ const PAIR_COOLDOWN_MS = 5 * 60_000  // minimum gap between two auto-trades on t
 // 35-pip cap chosen because 5-day XAU ATR has a 5th percentile of ~24 pips,
 // so even calm-market signals will produce SLs below the cap. Above the cap
 // the position size becomes too small to be useful.
-const MIRROR_SL_CAP = 25
-const MIRROR_TP_CAP = 70  // = 2 × SL cap to preserve the 1:2 R:R target
+// TEMP DIAGNOSTIC 2026-06-11: raised 25 → 35 to test whether retcode 10013 on
+// XAU mirror orders is a broker stops-level issue. Revert to 25 once root
+// cause confirmed. Mirrored in workers/scalper.mjs:46 — keep in sync.
+const MIRROR_SL_CAP = 35
+const MIRROR_TP_CAP = 70  // unchanged; widening only SL for the test
 
 type MarketRegime = 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
 

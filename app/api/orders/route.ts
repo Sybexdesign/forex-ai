@@ -253,7 +253,7 @@ export async function POST(req: NextRequest) {
     // not the (pre-widening) strategy.slPips. Previously sized for tight SL but
     // placed at the wider safeSlPips → over-sized positions by up to 2×.
     const MIN_STOP_PIPS: Record<string, number> = {
-      XAU: 20,    // XAU/USD: 2.0 USD = 20 pips at pip=0.1 (lowered from 30 — live fills accepted 12-22 pip SLs)
+      XAU: 35,    // TEMP DIAGNOSTIC 2026-06-11: raised 20 → 35 alongside MIRROR_SL_CAP to test retcode 10013 on XAU. Revert to 20 once root cause confirmed.
       XAG: 10,    // XAG/USD: 0.10 USD = 10 pips at pip=0.01
       JPY: 5,     // *JPY: 5 pips at pip=0.01
       FX:  3,     // major FX: 3 pips at pip=0.0001
