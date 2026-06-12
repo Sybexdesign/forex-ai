@@ -15,13 +15,36 @@ export function useAuth() {
 
   useEffect(() => {
     const sb = getSupabase()
-    sb.auth.getSession().then(({ data: { session } }) => {
+    let resolved = false
+    const settle = (session: Session | null) => {
+      resolved = true
       setState({ user: session?.user ?? null, session, loading: false })
-    })
+    }
+    // Safety net: never let the LOADING… screen stick forever. If getSession
+    // hangs or rejects (corrupted localStorage token, Supabase outage, blocked
+    // by extension), unblock the UI after 5s so the user lands on AuthPage
+    // and can retry. onAuthStateChange will still update state if it fires.
+    const timeoutId = setTimeout(() => {
+      if (!resolved) {
+        console.warn('[useAuth] getSession() did not resolve within 5s — unblocking UI as signed-out')
+        settle(null)
+      }
+    }, 5000)
+    sb.auth.getSession()
+      .then(({ data: { session } }) => { if (!resolved) settle(session) })
+      .catch(err => {
+        if (!resolved) {
+          console.error('[useAuth] getSession failed', err)
+          settle(null)
+        }
+      })
     const { data: { subscription } } = sb.auth.onAuthStateChange((_event, session) => {
-      setState({ user: session?.user ?? null, session, loading: false })
+      settle(session)
     })
-    return () => subscription.unsubscribe()
+    return () => {
+      clearTimeout(timeoutId)
+      subscription.unsubscribe()
+    }
   }, [])
 
   const signIn = useCallback(async (email: string, password: string) => {
