@@ -103,6 +103,15 @@ const DECAY_MIN_PEAK_USD = 20
 const TRAIL_ATR_MULT_LOOSE = 1.0     // default trail distance when profit small
 const TRAIL_ATR_MULT_TIGHT = 0.5     // tighter trail when profit > PROFIT_TIGHTEN_USD
 const PROFIT_TIGHTEN_USD   = 15      // $-threshold to switch to tight trail
+// TRAIL_MIN_PROFIT_USD added 2026-06-16. Previously the only gate on the ATR
+// trail was `trailSl > entry`, so trail tightened SL into +5-7 pips of profit
+// before the EA's fixed-USD target ($37.50 trigger at 50×75%) could fire. A
+// +$9.63/100s exit on 2026-06-16 12:02 confirmed the bypass. Trail now waits
+// for the trade to clear $15 unrealised so the fixed-target ladder has a
+// chance to bind on shallow wins. Mirror EA gate: input TrailMinUsd in
+// SybexForexAI_EA_v9.3.mq5 — both layers must agree or whichever fires first
+// wins the per-tick SL race.
+const TRAIL_MIN_PROFIT_USD = 15
 const REVERSAL_ALERT_USD   = 10      // peak must exceed this before reversal alert can fire
 const REVERSAL_ALERT_FRAC  = 0.30    // alert when profit falls below 30% of peak (i.e. pulled back >70%? — see comment)
 // REVERSAL_ALERT_FRAC interpretation: alert when current profit drops below
@@ -294,7 +303,7 @@ export function manageTrades(
     // Multiplier switches from 1.0×ATR (loose, room to run) to 0.5×ATR (tight,
     // protect profit) once the trade exceeds PROFIT_TIGHTEN_USD = $15 unrealised.
     const trailMult = pos.profit > PROFIT_TIGHTEN_USD ? TRAIL_ATR_MULT_TIGHT : TRAIL_ATR_MULT_LOOSE
-    if (atr > 0 && midPx > 0) {
+    if (atr > 0 && midPx > 0 && pos.profit > TRAIL_MIN_PROFIT_USD) {
       const trailSl = dir === 'BUY'
         ? midPx - atr * trailMult
         : midPx + atr * trailMult

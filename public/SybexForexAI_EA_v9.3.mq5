@@ -44,6 +44,15 @@ input int    MinHoldSeconds      = 60;   // no BE / trail / decay until trade is
 // the 50% target ($10) survives typical XAU slippage of $1-3 per close.
 input double DecayMinPeakUsd     = 20.0;
 
+// v9.5 - TRAIL ACTIVATION MIN PROFIT (USD)
+// Added 2026-06-16 after a +$9.63/100s exit on a XAU BUY: ATR-trail tightened
+// SL into +5-7 pips of profit and a small pullback closed before the EA's
+// fixed-USD target ($37.50 trigger at $50 × 75%) could fire. Trail now waits
+// for the trade to clear this many unrealised USD before any SL move. Mirror
+// of TRAIL_MIN_PROFIT_USD in lib/trade-manager.ts — both layers must agree.
+// Set to 0 to disable the gate and restore pre-v9.5 behaviour.
+input double TrailMinUsd         = 15.0;
+
 // v8.1 FIX - SPREAD + SESSION PROTECTION
 input int    MaxSpreadPips       = 30;   // skip SL actions if spread exceeds this
 input bool   UseRolloverFilter   = true; // skip actions during broker rollover 21:55-22:05
@@ -447,17 +456,25 @@ void RunProfitProtection()
          }
       }
 
-      double trailSl = CalcTrailSL(sym, isBuy, midPx);
-      if(trailSl > 0.0)
+      // v9.5 — gate trail by TrailMinUsd so the fixed-USD profit target gets
+      // first dibs on shallow wins. Without the gate, ATR×1.5 on XAU tightens
+      // SL into +5-7 pips of profit and small pullbacks close the trade well
+      // before the ProfitFixedUsd × ProfitTargetPct trigger can fire.
+      if(profit > TrailMinUsd)
       {
-         bool inProfit = isBuy ? trailSl > origEntry : trailSl < origEntry;
-         double baseline = (newSl > 0.0) ? newSl : currentSl;
-         bool improves   = isBuy ? trailSl > baseline : trailSl < baseline;
-         if(inProfit && improves)
+         double trailSl = CalcTrailSL(sym, isBuy, midPx);
+         if(trailSl > 0.0)
          {
-            newSl = trailSl;
-            Print("[pp] ", rawSym, "#", ticket, " trail: px=", DoubleToString(midPx, dp),
-                  " → SL=", DoubleToString(trailSl, dp));
+            bool inProfit = isBuy ? trailSl > origEntry : trailSl < origEntry;
+            double baseline = (newSl > 0.0) ? newSl : currentSl;
+            bool improves   = isBuy ? trailSl > baseline : trailSl < baseline;
+            if(inProfit && improves)
+            {
+               newSl = trailSl;
+               Print("[pp] ", rawSym, "#", ticket, " trail: px=", DoubleToString(midPx, dp),
+                     " profit=$", DoubleToString(profit, 2),
+                     " → SL=", DoubleToString(trailSl, dp));
+            }
          }
       }
 
@@ -521,6 +538,7 @@ int OnInit()
          " | MinHold=", MinHoldSeconds, "s",
          " | MaxSpread=", MaxSpreadPips, "pip",
          " | BE=0.5R | PartialLock=1.5R | Decay=50%peak (min $", DoubleToString(DecayMinPeakUsd, 2), ")",
+         " | TrailMinUsd=$", DoubleToString(TrailMinUsd, 2),
          " | MFE/MAE tracking enabled",
          " | Token prefix: ", StringSubstr(WebhookToken, 0, 8));
    return INIT_SUCCEEDED;
