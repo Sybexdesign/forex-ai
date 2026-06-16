@@ -112,6 +112,15 @@ const PROFIT_TIGHTEN_USD   = 15      // $-threshold to switch to tight trail
 // SybexForexAI_EA_v9.3.mq5 — both layers must agree or whichever fires first
 // wins the per-tick SL race.
 const TRAIL_MIN_PROFIT_USD = 15
+// PEAK_BE_THRESHOLD_USD added 2026-06-16. The $15 trail floor (above) closed a
+// gap where shallow wins got squeezed by the trail, but opened a new one: a
+// trade can peak below $15 (e.g. +$14.02 / +$9.43 on 2026-06-16 13:45) and
+// fully round-trip to -$55 with nothing engaging — BE only fires at 0.5R, trail
+// is gated at $15, decay-exit gated at peak ≥ $20. Peak-BE catches the mid-band:
+// if peak reached this much profit then the trade returned to break-even or
+// below, close at the current price (≈ entry) to lock zero rather than ride
+// the full reversal to SL.
+const PEAK_BE_THRESHOLD_USD = 8
 const REVERSAL_ALERT_USD   = 10      // peak must exceed this before reversal alert can fire
 const REVERSAL_ALERT_FRAC  = 0.30    // alert when profit falls below 30% of peak (i.e. pulled back >70%? — see comment)
 // REVERSAL_ALERT_FRAC interpretation: alert when current profit drops below
@@ -331,7 +340,28 @@ export function manageTrades(
       })
     }
 
-    // ── 4. Time-based exit ───────────────────────────────────────────────────
+    // ── 4. Peak-BE close (mid-band protection) ───────────────────────────────
+    // Catches trades that reached a meaningful peak then reversed back to or
+    // below entry. BE/trail/decay-exit all have higher activation thresholds,
+    // leaving an unprotected band where peak $8-$19 + full round-trip ate the
+    // entire 1R loss (real fills 2026-06-16 13:45: peaks +$14 and +$9 closed
+    // at -$55 and -$60). Fires only when the trade is now at or below entry
+    // so it never closes a still-winning position.
+    if (peakProfit >= PEAK_BE_THRESHOLD_USD && pos.profit <= 0) {
+      log.push(`[tm] ${sym}#${key} PEAK-BE-CLOSE: peak=$${peakProfit.toFixed(2)} → profit=$${pos.profit.toFixed(2)} (≤0) — close at current to lock BE`)
+      commands.push({
+        id:        crypto.randomUUID(),
+        type:      'close',
+        symbol:    sym,
+        ticket:    pos.ticket,
+        createdAt: new Date(now).toISOString(),
+        expiresAt: nowSec + CMD_TTL_S,
+      })
+      nextState[key] = state
+      continue
+    }
+
+    // ── 5. Time-based exit ───────────────────────────────────────────────────
     const durationMs = now - new Date(state.openedAt).getTime()
     if (durationMs > MAX_HOLD_MS && currentR < MIN_PROFIT_R) {
       log.push(`[tm] ${sym}#${key} TIME-EXIT: ${Math.round(durationMs / 60000)}m elapsed, R=${currentR.toFixed(2)} < ${MIN_PROFIT_R}`)
@@ -347,7 +377,7 @@ export function manageTrades(
       continue
     }
 
-    // ── 5. Profit decay exit ─────────────────────────────────────────────────
+    // ── 6. Profit decay exit ─────────────────────────────────────────────────
     // Activation gate: peak must reach DECAY_MIN_PEAK_USD ($20). Below that the
     // 50% threshold is too small a cushion — a +$14 → +$7 trigger has historically
     // filled at -$2 after the ~2s queue lag (real fill 2026-06-08).

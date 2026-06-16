@@ -53,6 +53,15 @@ input double DecayMinPeakUsd     = 20.0;
 // Set to 0 to disable the gate and restore pre-v9.5 behaviour.
 input double TrailMinUsd         = 15.0;
 
+// v9.6 - PEAK-BE THRESHOLD (USD)
+// Added 2026-06-16 to plug the gap between TrailMinUsd ($15) and the decay-exit
+// min peak ($20). Trades peaking at $8-$19 had no protection — peak +$14 and
+// +$9 fills on 2026-06-16 13:45 round-tripped to -$55 / -$60. If peak reaches
+// this value AND profit later returns to ≤ $0, close immediately so we lock
+// roughly break-even instead of riding the reversal to SL. Mirror of
+// PEAK_BE_THRESHOLD_USD in lib/trade-manager.ts. Set to 0 to disable.
+input double PeakBeThreshold     = 8.0;
+
 // v8.1 FIX - SPREAD + SESSION PROTECTION
 input int    MaxSpreadPips       = 30;   // skip SL actions if spread exceeds this
 input bool   UseRolloverFilter   = true; // skip actions during broker rollover 21:55-22:05
@@ -486,12 +495,26 @@ void RunProfitProtection()
       }
 
       double peak = g_prot[si].peakProfit;
+
+      // v9.6 — Peak-BE close. Bridges the gap between TrailMinUsd ($15) and
+      // DecayMinPeakUsd ($20). A trade that reached PeakBeThreshold USD then
+      // returned to ≤ $0 has shown the AI direction was initially correct but
+      // the trend reversed — close at current price (≈ entry) to lock BE
+      // instead of riding the round-trip to SL. Evaluated before decay-exit
+      // because decay-exit gate ($20 peak) excludes this band entirely.
+      if(peak >= PeakBeThreshold && profit <= 0.0)
+      {
+         Print("[pp] ", rawSym, "#", ticket, " PEAK-BE-CLOSE: peak=$", DoubleToString(peak, 2),
+               " → profit=$", DoubleToString(profit, 2), " (<=0) — close at current to lock BE held=", holdSecs, "s");
+         doClose = true;
+      }
+
       // v9.4 — decay only activates after peak ≥ DecayMinPeakUsd. Below the gate
       // the trade is too thin to safely decay-exit (a +$14 → +$5 trigger filled
       // at -$2 on 2026-06-08 due to ~2s queue lag). Threshold raised 0.40 → 0.50
       // to match lib/trade-manager.ts DECAY_THRESHOLD — the two layers should
       // agree on when a trade is "decaying enough" to close.
-      if(peak >= DecayMinPeakUsd && profit < peak * 0.50)
+      if(!doClose && peak >= DecayMinPeakUsd && profit < peak * 0.50)
       {
          Print("[pp] ", rawSym, "#", ticket, " DECAY-EXIT: profit=$", DoubleToString(profit, 2),
                " < 50% of peak=$", DoubleToString(peak, 2), " (peak>=$", DoubleToString(DecayMinPeakUsd, 2), ") held=", holdSecs, "s");
@@ -539,6 +562,7 @@ int OnInit()
          " | MaxSpread=", MaxSpreadPips, "pip",
          " | BE=0.5R | PartialLock=1.5R | Decay=50%peak (min $", DoubleToString(DecayMinPeakUsd, 2), ")",
          " | TrailMinUsd=$", DoubleToString(TrailMinUsd, 2),
+         " | PeakBE=$", DoubleToString(PeakBeThreshold, 2),
          " | MFE/MAE tracking enabled",
          " | Token prefix: ", StringSubstr(WebhookToken, 0, 8));
    return INIT_SUCCEEDED;
