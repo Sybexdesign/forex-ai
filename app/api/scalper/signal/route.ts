@@ -345,6 +345,30 @@ export async function POST(req: NextRequest) {
       ...body,
     }
 
+    // ── ADX floor — block chop sessions before any AI / ML spend ────────────
+    // Added 2026-06-16 after two BUY losses (peaks +$9 / +$14 → SL -$55 / -$60)
+    // in the 13:31-13:46 UTC window. classifyRegime() still drove
+    // effectiveMinStrength but didn't reject the signal outright, so a 72-conf
+    // print in the trending band still fired in chop. This gate refuses to
+    // emit any tradable signal when ADX < 22.
+    if (t.adx < 22) {
+      return NextResponse.json({
+        direction:            'HOLD' as Direction,
+        confidence:           0,
+        reasons:              [`ADX ${t.adx.toFixed(1)} below minimum 22 — market too choppy`],
+        risk_note:            '',
+        entry:                t.price,
+        sl:                   t.price,
+        tp:                   t.price,
+        fallback:             false,
+        ml:                   null,
+        marketRegime:         'ranging',
+        effectiveMinStrength: 100,
+        suggestedSection:     null,
+        adx:                  t.adx,
+      })
+    }
+
     const decimals = dp(pair)
     const pip      = pipSize(pair)
     const maxSl    = maxSlDistance(pair)
