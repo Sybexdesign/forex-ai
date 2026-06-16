@@ -481,6 +481,102 @@ async function evaluateSectionBias() {
   )
 }
 
+// ── Direction-loss streak gate ────────────────────────────────────────────────
+// Blocks placement when 3 consecutive LOSSes have been recorded on a given
+// broker-side direction. Counter is in-memory, seeded from history on startup,
+// then maintained per-trade by reconcileClosedTrades() which polls the trades
+// table for rows closed since lastReconciledAt. Direction = executionDirection
+// = broker side (sectionDir after mirror inversion), matching trades.direction.
+
+const directionLosses = { BUY: 0, SELL: 0 }
+const directionStreakAlerted = { BUY: false, SELL: false }
+let   lastReconciledAt          = null              // ISO timestamp; null = uninitialised
+const DIRECTION_RECONCILE_MS    = 60_000
+
+async function fetchRecentTradesByDirection(direction, n = 3) {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return []
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/trades`
+      + `?user_id=eq.${WORKER_USER_ID}`
+      + `&pair=eq.XAU%2FUSD`
+      + `&direction=eq.${direction}`
+      + `&result=in.%28WIN%2CLOSS%29`
+      + `&order=closed_at.desc.nullslast`
+      + `&limit=${n}`
+      + `&select=direction,result,pl_usd,closed_at,created_at`
+    const res = await fetch(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+      signal:  AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return []
+    return await res.json()
+  } catch (e) {
+    console.warn('[dir-loss] trade-fetch failed:', e.message)
+    return []
+  }
+}
+
+// Seed counters from history so the gate reflects an ongoing streak across
+// worker restarts. Sets lastReconciledAt to now so reconcileClosedTrades only
+// processes truly new closures from here forward.
+async function seedDirectionLosses() {
+  for (const d of ['BUY', 'SELL']) {
+    const recent = await fetchRecentTradesByDirection(d, 3)
+    let streak = 0
+    for (const t of recent) {
+      if (t.result === 'LOSS') streak++
+      else break
+    }
+    directionLosses[d] = streak
+    directionStreakAlerted[d] = streak >= 3
+  }
+  lastReconciledAt = new Date().toISOString()
+  console.log(`[dir-loss] seeded — BUY=${directionLosses.BUY} SELL=${directionLosses.SELL} since=${lastReconciledAt}`)
+}
+
+// Polls for trades closed since lastReconciledAt and applies per-trade
+// increment/reset. Ascending order so streaks update in the same sequence the
+// broker recorded them.
+async function reconcileClosedTrades() {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return
+  if (!lastReconciledAt) return
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/trades`
+      + `?user_id=eq.${WORKER_USER_ID}`
+      + `&pair=eq.XAU%2FUSD`
+      + `&result=in.%28WIN%2CLOSS%29`
+      + `&closed_at=gt.${encodeURIComponent(lastReconciledAt)}`
+      + `&order=closed_at.asc`
+      + `&select=direction,result,pl_usd,closed_at`
+    const res = await fetch(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+      signal:  AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return
+    const rows = await res.json()
+    for (const trade of rows) {
+      if (trade.result === 'LOSS') {
+        directionLosses[trade.direction] = (directionLosses[trade.direction] || 0) + 1
+        if (directionLosses[trade.direction] >= 3 && !directionStreakAlerted[trade.direction]) {
+          directionStreakAlerted[trade.direction] = true
+          console.log(`[auto] ${trade.direction} direction blocked — 3 consecutive losses`)
+          await tgSend(
+            `⚠️ <b>DIRECTION BLOCK</b>\n` +
+            `${trade.direction} blocked after 3 consecutive losses\n` +
+            `Mirror will skip ${trade.direction} signals until a win`
+          ).catch(() => {})
+        }
+      } else if (trade.result === 'WIN') {
+        directionLosses[trade.direction] = 0
+        directionStreakAlerted[trade.direction] = false
+      }
+      if (trade.closed_at) lastReconciledAt = trade.closed_at
+    }
+  } catch (e) {
+    console.warn('[dir-loss] reconcile failed:', e.message)
+  }
+}
+
 // ── Outcome Tracker ───────────────────────────────────────────────────────────
 // Tracks open signals in memory and resolves them when TP/SL is hit.
 // signalId → { pair, direction, sl, tp, insertedAt }
@@ -1074,6 +1170,14 @@ async function processSignal(pair, tick, strategy, session, direction) {
                 : dir
               // Per-section session-bias check REMOVED 2026-06-08 — the 12-16
               // UTC overlap allowlist is the single session gate now.
+              if ((directionLosses[sectionDir] || 0) >= 3) {
+                await logAutoTradeDecision('skipped-direction-streak', pair, sectionDir, signal, {
+                  direction:         sectionDir,
+                  consecutiveLosses: directionLosses[sectionDir],
+                  section,
+                })
+                continue
+              }
               try {
                 const result = await placeOrder(pair, sectionDir, signal, section)
                 if (result.success) {
@@ -1474,6 +1578,11 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
 
   scheduleMidnightRestart()
   setInterval(sendHeartbeat, HEARTBEAT_MS)
+  // Seed direction-loss counters from history, then poll for newly-closed
+  // trades and apply per-trade increment/reset (telegram alert on first time
+  // a direction crosses 3 consecutive losses).
+  await seedDirectionLosses().catch(e => console.warn('[dir-loss] seed failed:', e.message))
+  setInterval(() => { reconcileClosedTrades().catch(() => {}) }, DIRECTION_RECONCILE_MS)
   // Direction-bias detector schedule REMOVED 2026-06-08. The function itself
   // early-returns now (see evaluateSectionBias). Operator policy: mirror is
   // the permanent default; direction is never auto-switched.

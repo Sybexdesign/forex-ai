@@ -118,7 +118,7 @@ export function classifyRegime(adx: number): {
 } {
   if (adx < 20)  return { regime: 'ranging',      effectiveMinStrength: 65,  suggestedSection: 'mirror' }
   if (adx < 25)  return { regime: 'weak-trend',   effectiveMinStrength: 68,  suggestedSection: 'mirror' }
-  if (adx < 35)  return { regime: 'trending',     effectiveMinStrength: 72,  suggestedSection: 'scalp'  }
+  if (adx < 28)  return { regime: 'trending',     effectiveMinStrength: 72,  suggestedSection: 'scalp'  }
   return           { regime: 'strong-trend', effectiveMinStrength: 100, suggestedSection: 'scalp'  }
 }
 
