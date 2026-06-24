@@ -351,6 +351,43 @@ async function sbInsertReturning(table, row) {
   }
 }
 
+// Latest unexpired direction-confirmation for (user, pair). Used by the
+// auto-trade gate — operator must have clicked TEST/CHECK MARKET DIRECTION
+// at most ~5min ago for the worker to be allowed to execute on this pair.
+// Returns null when no row exists, on transient DB errors, or when
+// WORKER_USER_ID isn't configured (worker can't be associated with a user).
+//
+// The table check constraint guarantees only 5m confirmations are persisted,
+// so the worker's gate is effectively "5m confirmations only" without needing
+// to filter on timeframe here. 1m confirmations are operator-advisory.
+async function fetchLatestDirectionConfirmation(pair) {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return null
+  try {
+    const nowIso = new Date().toISOString()
+    const url = `${SUPABASE_URL}/rest/v1/direction_confirmations`
+      + `?user_id=eq.${WORKER_USER_ID}`
+      + `&pair=eq.${encodeURIComponent(pair)}`
+      + `&expires_at=gt.${encodeURIComponent(nowIso)}`
+      + `&order=analyzed_at.desc&limit=1`
+    const res = await fetch(url, {
+      headers: {
+        'apikey':        SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+      },
+      signal: AbortSignal.timeout(5_000),
+    })
+    if (!res.ok) {
+      console.error(`[sb/direction_confirmations]`, res.status, await res.text())
+      return null
+    }
+    const rows = await res.json()
+    return Array.isArray(rows) && rows.length > 0 ? rows[0] : null
+  } catch (e) {
+    console.error('[sb/direction_confirmations]', e.message)
+    return null
+  }
+}
+
 async function sbUpdate(table, id, data) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return
   try {
@@ -1107,12 +1144,52 @@ async function processSignal(pair, tick, strategy, session, direction) {
   // paper/blocked/halt paths.
   let lastPlacement = null
 
+  // Direction-confirmation deadman-switch — auto-trade only runs when the
+  // operator has clicked TEST/CHECK MARKET DIRECTION in the last 5 minutes
+  // (= the 5m candle window the confirmation is bound to) AND the confirmed
+  // direction matches the current signal direction. Per operator brief:
+  // "Auto Trade may only execute when Signal Status = ACTIVE". Fetched only
+  // when the cheap upstream gates would otherwise have passed, so we don't
+  // waste DB round-trips during disabled / paper-mode / pair-filtered states.
+  let directionConfirmation = null
+  let confirmationGateBlocked = false
+  if (
+    WORKER_MODE === 'live' &&
+    liveStrategy.autoTradeEnabled &&
+    liveStrategy.autoTradePairs.includes(pair)
+  ) {
+    directionConfirmation = await fetchLatestDirectionConfirmation(pair)
+    if (!directionConfirmation) {
+      confirmationGateBlocked = true
+    } else if (directionConfirmation.direction !== dir) {
+      confirmationGateBlocked = true
+    }
+  }
+
   if (WORKER_MODE !== 'live') {
     logAutoTradeDecision('skipped-paper-mode', pair, dir, signal)
   } else if (!liveStrategy.autoTradeEnabled) {
     logAutoTradeDecision('skipped-disabled', pair, dir, signal)
   } else if (!liveStrategy.autoTradePairs.includes(pair)) {
     logAutoTradeDecision('skipped-pair-filter', pair, dir, signal, { allowedPairs: liveStrategy.autoTradePairs })
+  } else if (!directionConfirmation) {
+    // No unexpired confirmation row for this pair — operator hasn't clicked
+    // TEST/CHECK MARKET DIRECTION in the last 5 min (or WORKER_USER_ID is
+    // unset, or the DB query failed transiently — all surface here).
+    logAutoTradeDecision('skipped-no-confirmation', pair, dir, signal, {
+      hint: WORKER_USER_ID
+        ? 'No active 5m direction confirmation. Click TEST/CHECK MARKET DIRECTION to enable auto-trade for the next 5 min.'
+        : 'WORKER_USER_ID not configured — worker cannot associate confirmations',
+    })
+  } else if (directionConfirmation.direction !== dir) {
+    // Confirmation exists but disagrees with the worker's current signal —
+    // operator confirmed BUY, worker is now seeing SELL (or vice versa).
+    // Conservative: skip and wait for the operator to re-confirm.
+    logAutoTradeDecision('skipped-confirmation-direction-mismatch', pair, dir, signal, {
+      confirmedDirection: directionConfirmation.direction,
+      confirmedAt:        directionConfirmation.analyzed_at,
+      confirmedExpires:   directionConfirmation.expires_at,
+    })
   } else if (tradingHalted) {
     logAutoTradeDecision('skipped-daily-loss-halted', pair, dir, signal)
   } else if (!isLondonNYOverlap()) {
