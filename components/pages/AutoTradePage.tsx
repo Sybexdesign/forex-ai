@@ -35,7 +35,33 @@ const PAIR_COOLDOWN_MS = 5 * 60_000  // minimum gap between two auto-trades on t
 const MIRROR_SL_CAP = 35
 const MIRROR_TP_CAP = 70  // unchanged; widening only SL for the test
 
-type MarketRegime = 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
+type MarketRegime = 'chop' | 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
+
+// Regime badge — chop/strong-trend are HOLD-only (red), ranging is our highest-edge
+// tradable condition (green), weak/trending are middle bands. Tooltip shows ADX +
+// gate so the operator can see why the signal passed or failed at a glance.
+const REGIME_BADGE: Record<MarketRegime, { label: string; bg: string; fg: string }> = {
+  'chop':         { label: '〰 CHOP',        bg: 'rgba(255,48,86,0.18)',  fg: 'var(--color-sell)' },
+  'ranging':      { label: '↔ RANGING',      bg: 'rgba(0,200,83,0.18)',   fg: 'var(--color-buy)'  },
+  'weak-trend':   { label: '↗ WEAK TREND',   bg: 'rgba(255,170,0,0.18)',  fg: '#ffaa00'           },
+  'trending':     { label: '↑ TRENDING',     bg: 'rgba(255,140,0,0.18)',  fg: '#ff8c00'           },
+  'strong-trend': { label: '⬆ STRONG TREND', bg: 'rgba(255,48,86,0.18)',  fg: 'var(--color-sell)' },
+}
+
+interface DirCheckResult {
+  pair: string
+  marketType: string
+  regime: MarketRegime | null
+  adx: number
+  bias: 'BUY' | 'SELL' | 'NEUTRAL'
+  recommended: 'scalp' | 'mirror'
+  direction: 'BUY' | 'SELL' | 'HOLD'
+  confidence: number
+  reasons: string[]
+  analyzedAt: string
+  error?: string
+  simulated?: boolean
+}
 
 interface ScalpSignal {
   pair: string
@@ -122,6 +148,13 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   const [placingMirrorScalp, setPlacingMirrorScalp] = useState<string | null>(null)
   const [pfEnabled, setPfEnabled]     = useState(false)
   const [pfRiskCap, setPfRiskCap]     = useState<number | null>(null)  // null = not yet loaded
+
+  // Direction-confirmation analysis: per-pair result of the 5+5 strategy
+  // fan-out (see /api/scalper/direction-check). Re-runs only when the user
+  // clicks the button — no auto-polling because each click costs 5 Claude
+  // calls × number of metals (=10 calls per analysis).
+  const [dirCheck, setDirCheck] = useState<Record<string, DirCheckResult | null>>({})
+  const [dirCheckLoading, setDirCheckLoading] = useState(false)
 
   // Auto-trading toggles + sections + pairs now live in Supabase (top-level
   // columns on strategies via onSaveAutoTrade). UI-only preferences (profit
@@ -257,6 +290,37 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         return { ...prev, [pair]: { pair, direction: 'HOLD', confidence: 0, entry: 0, sl: 0, tp: 0,
           reasons: [], expiresAt: 0, fetchedAt: Date.now(), fallback: false, fetchError: msg } }
       })
+    }
+  }, [userId])
+
+  // Direction-confirmation runner. Fires the 5-strategy fan-out for each
+  // metal in parallel. Triggered only by the manual button — does not poll.
+  const runDirectionCheck = useCallback(async () => {
+    setDirCheckLoading(true)
+    try {
+      await Promise.all(METALS_ONLY.map(async pair => {
+        try {
+          const r = await fetch('/api/scalper/direction-check', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ pair, userId }),
+          })
+          const j: DirCheckResult & { error?: string } = await r.json()
+          setDirCheck(prev => ({ ...prev, [pair]: j }))
+        } catch (err: any) {
+          setDirCheck(prev => ({
+            ...prev,
+            [pair]: {
+              pair, marketType: '—', regime: null, adx: 0, bias: 'NEUTRAL',
+              recommended: 'scalp', direction: 'HOLD', confidence: 0,
+              reasons: [], analyzedAt: new Date().toISOString(),
+              error: err?.message || 'Network error',
+            },
+          }))
+        }
+      }))
+    } finally {
+      setDirCheckLoading(false)
     }
   }, [userId])
 
@@ -1074,6 +1138,130 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         </div>
       </div>
 
+      {/* Direction confirmation — manual 5+5 strategy fan-out per metal */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingLeft: 2, gap: 12 }}>
+          <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2, fontWeight: 700 }}>
+            CURRENT MARKET &amp; SIGNAL DIRECTION CONFIRMATION
+          </div>
+          <button
+            className="btn btn-ghost"
+            onClick={runDirectionCheck}
+            disabled={dirCheckLoading}
+            style={{ fontSize: 11, padding: '6px 14px', letterSpacing: 1 }}
+          >
+            {dirCheckLoading ? 'ANALYSING…' : 'TEST / CHECK MARKET DIRECTION'}
+          </button>
+        </div>
+        <div className="scalp-signal-grid">
+          {METALS_ONLY.map(pair => {
+            const r = dirCheck[pair]
+            const name = pair === 'XAU/USD' ? 'Gold' : 'Silver'
+            const placeholder = !r && !dirCheckLoading
+            const dirColor =
+              r?.direction === 'BUY'  ? 'var(--color-buy)'  :
+              r?.direction === 'SELL' ? 'var(--color-sell)' :
+                                        'var(--text-muted)'
+            const confColor =
+              !r ? 'var(--text-muted)' :
+              r.confidence >= 75 ? 'var(--color-buy)'  :
+              r.confidence >= 50 ? '#ffaa00'           :
+                                   'var(--color-sell)'
+            const recoTag = r?.recommended === 'mirror' ? 'MIRROR' : 'SCALP'
+            const recoColor = r?.recommended === 'mirror' ? '#42a5f5' : 'var(--color-accent)'
+
+            return (
+              <div key={pair} style={{
+                padding: '14px 16px', borderRadius: 4,
+                background: 'rgba(0,85,176,0.04)',
+                border: '1px solid rgba(0,85,176,0.18)',
+                display: 'flex', flexDirection: 'column', gap: 10,
+                opacity: placeholder ? 0.7 : 1,
+              }}>
+                {/* Header */}
+                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, fontWeight: 700, marginBottom: 2 }}>
+                      {name} · DIRECTION CONFIRMATION
+                    </div>
+                    <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'Rajdhani', letterSpacing: 1.5, color: 'var(--text)' }}>
+                      {r?.marketType ?? '— awaiting analysis —'}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-muted)' }}>
+                    {r?.analyzedAt && (
+                      <>
+                        <div style={{ fontFamily: 'JetBrains Mono' }}>
+                          {new Date(r.analyzedAt).toLocaleTimeString()}
+                        </div>
+                        <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>last analysis</div>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Error or simulated states */}
+                {r?.error && (
+                  <div style={{ fontSize: 11, color: 'var(--color-sell)', fontStyle: 'italic' }}>
+                    {r.error}
+                  </div>
+                )}
+                {r?.simulated && (
+                  <div style={{ fontSize: 11, color: 'var(--color-sell)', fontStyle: 'italic' }}>
+                    Live MT5 feed required
+                  </div>
+                )}
+
+                {/* Main metrics grid */}
+                {r && !r.error && !r.simulated && (
+                  <>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <div style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                        <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>RECOMMENDED</div>
+                        <div style={{ fontSize: 13, color: recoColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                          {recoTag}
+                        </div>
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                        <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>DIRECTION</div>
+                        <div style={{ fontSize: 13, color: dirColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                          {r.direction}
+                        </div>
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                        <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>CONFIDENCE</div>
+                        <div style={{ fontSize: 13, color: confColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                          {r.confidence}%
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Reasoning */}
+                    {r.reasons.length > 0 && (
+                      <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+                        {r.reasons.map((reason, i) => (
+                          <div key={i} style={{ display: 'flex', gap: 4, alignItems: 'flex-start' }}>
+                            <span style={{ color: recoColor, flexShrink: 0, marginTop: 1 }}>›</span>
+                            <span style={{ wordBreak: 'break-word' }}>{reason}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {/* Placeholder when no analysis yet */}
+                {placeholder && (
+                  <div style={{ fontSize: 11, color: 'var(--text-dim)', fontStyle: 'italic' }}>
+                    Click <b>TEST / CHECK MARKET DIRECTION</b> to run the 5-strategy fan-out for {name}.
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
       {/* Live scalp signals — always-on direction panel for Gold and Silver */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2, fontWeight: 700, paddingLeft: 2 }}>
@@ -1127,26 +1315,18 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                         {conf}%
                       </span>
                     )}
-                    {sig?.marketRegime && (
+                    {sig?.marketRegime && REGIME_BADGE[sig.marketRegime] && (
                       <span
                         title={`ADX ${sig.adx?.toFixed?.(1) ?? '?'} — gate ≥${sig.effectiveMinStrength}%`}
                         style={{
                           fontSize: 9, fontWeight: 700, letterSpacing: 1,
                           padding: '2px 6px', borderRadius: 2,
                           textTransform: 'uppercase',
-                          background:
-                            sig.marketRegime === 'strong-trend' ? 'rgba(0,200,83,0.18)' :
-                            sig.marketRegime === 'trending'     ? 'rgba(0,150,255,0.18)' :
-                            sig.marketRegime === 'weak-trend'   ? 'rgba(255,170,0,0.18)' :
-                                                                  'rgba(255,255,255,0.08)',
-                          color:
-                            sig.marketRegime === 'strong-trend' ? 'var(--color-buy)' :
-                            sig.marketRegime === 'trending'     ? '#42a5f5' :
-                            sig.marketRegime === 'weak-trend'   ? '#ffaa00' :
-                                                                  'var(--text-muted)',
+                          background: REGIME_BADGE[sig.marketRegime].bg,
+                          color:      REGIME_BADGE[sig.marketRegime].fg,
                         }}
                       >
-                        {sig.marketRegime}
+                        {REGIME_BADGE[sig.marketRegime].label}
                       </span>
                     )}
                   </div>
@@ -1328,26 +1508,18 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                           {conf}%
                         </span>
                       )}
-                      {sig?.marketRegime && (
+                      {sig?.marketRegime && REGIME_BADGE[sig.marketRegime] && (
                         <span
                           title={`ADX ${sig.adx?.toFixed?.(1) ?? '?'} — gate ≥${sig.effectiveMinStrength}%`}
                           style={{
                             fontSize: 9, fontWeight: 700, letterSpacing: 1,
                             padding: '2px 6px', borderRadius: 2,
                             textTransform: 'uppercase',
-                            background:
-                              sig.marketRegime === 'strong-trend' ? 'rgba(0,200,83,0.18)' :
-                              sig.marketRegime === 'trending'     ? 'rgba(0,150,255,0.18)' :
-                              sig.marketRegime === 'weak-trend'   ? 'rgba(255,170,0,0.18)' :
-                                                                    'rgba(255,255,255,0.08)',
-                            color:
-                              sig.marketRegime === 'strong-trend' ? 'var(--color-buy)' :
-                              sig.marketRegime === 'trending'     ? '#42a5f5' :
-                              sig.marketRegime === 'weak-trend'   ? '#ffaa00' :
-                                                                    'var(--text-muted)',
+                            background: REGIME_BADGE[sig.marketRegime].bg,
+                            color:      REGIME_BADGE[sig.marketRegime].fg,
                           }}
                         >
-                          {sig.marketRegime}
+                          {REGIME_BADGE[sig.marketRegime].label}
                         </span>
                       )}
                     </div>

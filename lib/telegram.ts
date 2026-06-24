@@ -91,6 +91,8 @@ export async function alertNewSignal(opts: {
   slPrice: number
   lots: number
   reasons: string[]
+  marketRegime?: string | null
+  adx?: number | null
 }) {
   // Cooldown: skip if the same pair+direction was alerted within the last 15 min
   const coolKey  = `${opts.pair}:${opts.direction}`
@@ -103,6 +105,9 @@ export async function alertNewSignal(opts: {
 
   const dir = opts.direction === 'BUY' ? '🟢 BUY' : '🔴 SELL'
   const dp  = opts.pair.includes('JPY') ? 3 : opts.pair.startsWith('XA') ? 2 : 5
+  const regimeLine = opts.marketRegime
+    ? `📊 Regime: ${opts.marketRegime}${typeof opts.adx === 'number' ? ` (ADX ${opts.adx.toFixed(1)})` : ''}`
+    : null
   const text = [
     `⚡ <b>NEW SIGNAL — ${opts.pair}</b>`,
     ``,
@@ -113,11 +118,12 @@ export async function alertNewSignal(opts: {
     `🛑 SL:     <code>${opts.slPrice.toFixed(dp)}</code>`,
     `📦 Size:   <code>${opts.lots.toFixed(2)} lots</code>`,
     `⏱ TF:     ${opts.timeframe}`,
+    regimeLine,
     ``,
     opts.reasons.slice(0, 2).map(r => `• ${r}`).join('\n'),
     ``,
     `<i>⚠️ Review in the Sybex ForexAI terminal before trading.</i>`,
-  ].join('\n')
+  ].filter(Boolean).join('\n')
 
   await broadcast(text)
 }

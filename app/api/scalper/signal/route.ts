@@ -96,28 +96,28 @@ Respond ONLY with valid JSON — no markdown, no prose.`,
 }
 
 // ─── Market-regime classifier ────────────────────────────────────────────────
-// Maps ADX(14) to one of four regimes, each with its own minStrength threshold.
-// Operator policy 2026-06-08: mirror is the only auto-traded section, and
-// strong-trend regimes (ADX ≥35) are where the AI is statistically calibrated
-// — i.e. exactly where mirror is fighting the move. Setting strong-trend's
-// threshold to 100 hard-suppresses all auto-trades there. Manual scalp/mirror
-// buttons in the UI bypass this gate and still work.
+// Maps ADX(14) to one of five regimes, each with its own minStrength threshold.
+// Updated 2026-06-24: split ranging band into 'chop' (ADX<15, true random) and
+// 'ranging' (15-19, structured range). Ranging shows 75-84% historical win rate
+// — blocking it with HOLD was leaving our best trading condition on the table.
 //
-//   ranging       ADX < 20    threshold 65   — chop, AI miscalibrated, mirror wins
-//   weak-trend    ADX 20-24   threshold 68   — developing trend
-//   trending      ADX 25-34   threshold 72   — confirmed trend (default 72)
-//   strong-trend  ADX ≥ 35    threshold 100  — momentum dominant, mirror SUPPRESSED
+//   chop          ADX < 15    threshold 100  — true chop, no edge, HOLD
+//   ranging       ADX 15-19   threshold 78   — structured ranging, high confidence only
+//   weak-trend    ADX 20-24   threshold 75   — developing trend
+//   trending      ADX 25-27   threshold 72   — confirmed trend (default 72)
+//   strong-trend  ADX ≥ 28    threshold 100  — strong trend, AI too accurate, HOLD
 //
 // suggestedSection is informational only — execution is always mirror by policy.
-export type MarketRegime = 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
+export type MarketRegime = 'chop' | 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
 
 export function classifyRegime(adx: number): {
   regime: MarketRegime
   effectiveMinStrength: number
   suggestedSection: 'mirror' | 'scalp'
 } {
-  if (adx < 20)  return { regime: 'ranging',      effectiveMinStrength: 65,  suggestedSection: 'mirror' }
-  if (adx < 25)  return { regime: 'weak-trend',   effectiveMinStrength: 68,  suggestedSection: 'mirror' }
+  if (adx < 15)  return { regime: 'chop',         effectiveMinStrength: 100, suggestedSection: 'mirror' }
+  if (adx < 20)  return { regime: 'ranging',      effectiveMinStrength: 78,  suggestedSection: 'mirror' }
+  if (adx < 25)  return { regime: 'weak-trend',   effectiveMinStrength: 75,  suggestedSection: 'mirror' }
   if (adx < 28)  return { regime: 'trending',     effectiveMinStrength: 72,  suggestedSection: 'scalp'  }
   return           { regime: 'strong-trend', effectiveMinStrength: 100, suggestedSection: 'scalp'  }
 }
@@ -345,24 +345,24 @@ export async function POST(req: NextRequest) {
       ...body,
     }
 
-    // ── ADX floor — block chop sessions before any AI / ML spend ────────────
-    // Added 2026-06-16 after two BUY losses (peaks +$9 / +$14 → SL -$55 / -$60)
-    // in the 13:31-13:46 UTC window. classifyRegime() still drove
-    // effectiveMinStrength but didn't reject the signal outright, so a 72-conf
-    // print in the trending band still fired in chop. This gate refuses to
-    // emit any tradable signal when ADX < 22.
-    if (t.adx < 22) {
+    // ── ADX floor — block true chop before any AI / ML spend ───────────────
+    // Updated 2026-06-24: lowered threshold from 22 → 15. ADX 15-19 ('ranging')
+    // historically shows 75-84% win rate and is our highest-edge condition.
+    // The regime-aware effectiveMinStrength gate (78 for ranging) filters weak
+    // signals downstream while letting strong ranging setups through. Only true
+    // chop (ADX<15, random moves) is blocked outright here.
+    if (t.adx < 15) {
       return NextResponse.json({
         direction:            'HOLD' as Direction,
         confidence:           0,
-        reasons:              [`ADX ${t.adx.toFixed(1)} below minimum 22 — market too choppy`],
+        reasons:              [`ADX ${t.adx.toFixed(1)} below 15 — true chop, no edge`],
         risk_note:            '',
         entry:                t.price,
         sl:                   t.price,
         tp:                   t.price,
         fallback:             false,
         ml:                   null,
-        marketRegime:         'ranging',
+        marketRegime:         'chop',
         effectiveMinStrength: 100,
         suggestedSection:     null,
         adx:                  t.adx,

@@ -409,6 +409,7 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
     entryLow: signal.entryZone.low, entryHigh: signal.entryZone.high,
     tpPrice, slPrice, lots,
     reasons: rec.reasons || [],
+    adx: typeof indicators.adx === 'number' ? indicators.adx : null,
   })
 
   return { signal, blockedBy: null }

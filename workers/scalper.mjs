@@ -675,9 +675,14 @@ function formatAlert(pair, strategy, session, signal, mode, placement) {
     ].join('\n')
   }
 
+  const regimeLine = signal.marketRegime
+    ? `Regime: ${signal.marketRegime}${typeof signal.adx === 'number' ? ` (ADX ${signal.adx.toFixed(1)})` : ''}`
+    : ''
+
   return [
     `${emoji} <b>${dir} ${pair}</b>  [${strategy} · ${session}]`,
     `Confidence: <b>${signal.confidence}%</b>  ${badge}`,
+    regimeLine,
     ``,
     `Entry  : <code>${f(entry)}</code>`,
     `SL     : <code>${f(sl)}</code>  (${slPips} pips)`,
@@ -688,7 +693,7 @@ function formatAlert(pair, strategy, session, signal, mode, placement) {
     reasons,
     signal.risk_note ? `\n⚠ ${signal.risk_note}` : '',
     `⏱ ${new Date().toUTCString()}`,
-  ].join('\n').replace(/\n{3,}/g, '\n\n')
+  ].filter(Boolean).join('\n').replace(/\n{3,}/g, '\n\n')
 }
 
 // ── API Helpers ───────────────────────────────────────────────────────────────
@@ -1032,6 +1037,16 @@ async function processSignal(pair, tick, strategy, session, direction) {
     ? signal.effectiveMinStrength
     : liveStrategy.minStrength
   const effMin   = Math.max(liveStrategy.minStrength, regimeMin)
+
+  // Per-signal regime audit log — shows the gate decision for every signal so
+  // the operator can see exactly why each one passed or skipped.
+  const regimeLabel = signal.marketRegime ?? 'n/a'
+  const adxLabel    = typeof signal.adx === 'number'
+    ? signal.adx.toFixed(1)
+    : (typeof tick.adx === 'number' ? tick.adx.toFixed(1) : 'n/a')
+  console.log(`[signal] ${pair} ADX=${adxLabel} regime=${regimeLabel} ` +
+      `conf=${conf} effMin=${effMin} → ${dir !== 'HOLD' && conf >= effMin ? 'PASS' : 'SKIP'}`)
+
   if (dir === 'HOLD') {
     // Bug-fix 2026-06-08: previously a silent return. Now logged for audit.
     await logAutoTradeDecision('skipped-hold', pair, dir, signal, { conf, effMin })
