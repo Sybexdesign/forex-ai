@@ -62,6 +62,7 @@ interface DirCheckResult {
   confidence: number
   reasons: string[]
   analyzedAt: string
+  expiresAt?: string
   error?: string
   simulated?: boolean
 }
@@ -156,6 +157,14 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   // fan-out (see /api/scalper/direction-check). Re-runs only when the user
   // clicks the button — no auto-polling because each click costs 5 Claude
   // calls × number of metals (=10 calls per analysis).
+  //
+  // Cache-prevention guarantee (per operator brief): direction-check state
+  // is held strictly in React useState — never written to localStorage,
+  // sessionStorage, IndexedDB, or any persistent store. On page reload it
+  // initialises empty, which renders the explicit "--" / "Awaiting Fresh
+  // Analysis" default state in every card field. Do NOT add a persistence
+  // layer here without re-reading that brief — it exists to keep stale
+  // confirmations from influencing trade decisions across sessions.
   const [dirCheck, setDirCheck] = useState<Record<string, DirCheckResult | null>>({})
   const [dirCheckLoading, setDirCheckLoading] = useState(false)
   // Operator-selectable timeframe for the direction check. 5m matches the rest
@@ -1212,9 +1221,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         </div>
         <div className="scalp-signal-grid">
           {METALS_ONLY.map(pair => {
-            void scalpTick   // force per-second re-render so the age below ages live
+            void scalpTick   // force per-second re-render so age + status update live
             const r = dirCheck[pair]
             const name = pair === 'XAU/USD' ? 'Gold' : 'Silver'
+            const hasResult = !!r && !r.error && !r.simulated
             const placeholder = !r && !dirCheckLoading
             const dirColor =
               r?.direction === 'BUY'  ? 'var(--color-buy)'  :
@@ -1227,22 +1237,42 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                                    'var(--color-sell)'
             const recoTag = r?.recommended === 'mirror' ? 'MIRROR' : 'SCALP'
             const recoColor = r?.recommended === 'mirror' ? '#42a5f5' : 'var(--color-accent)'
-            // Staleness: fresh <60s muted, ageing 60s-5m amber, stale 5-10m red,
-            // STALE label after 10m. Boundaries chosen for the 1-5min scalping
-            // window — the analysis is reliable inside the trade-decision window
-            // and visibly degrades past it.
+            // Age — used for the soft-fade colour on the analysed-time label.
             const ageMs    = r?.analyzedAt ? Date.now() - new Date(r.analyzedAt).getTime() : 0
             const ageSec   = Math.floor(ageMs / 1000)
             const ageColor = !r ? 'var(--text-muted)' :
                              ageSec < 60   ? 'var(--text-muted)' :
                              ageSec < 300  ? '#ffaa00'           :
                                              'var(--color-sell)'
-            const isStale  = !!r && ageSec >= 600
             const ageLabel = ageSec < 60
               ? `${ageSec}s ago`
               : ageSec < 3600
                 ? `${Math.floor(ageSec / 60)}m ${ageSec % 60}s ago`
                 : `${Math.floor(ageSec / 3600)}h ago`
+            // Expiry + status — driven by the analysed timeframe (1m = 60s
+            // validity, 5m = 300s validity). Re-derived per tick so the badge
+            // flips from ACTIVE -> EXPIRED at the exact second the candle window
+            // closes. Server emits expiresAt; if missing (old payloads) we fall
+            // back to analyzedAt + timeframe span on the client.
+            const expiresAtMs = r?.expiresAt
+              ? new Date(r.expiresAt).getTime()
+              : r?.analyzedAt
+                ? new Date(r.analyzedAt).getTime() + (r.timeframe === '1m' ? 60_000 : 300_000)
+                : 0
+            const isExpired = hasResult && Date.now() >= expiresAtMs
+            const secsLeft  = hasResult ? Math.max(0, Math.ceil((expiresAtMs - Date.now()) / 1000)) : 0
+            const statusLabel = !hasResult ? 'AWAITING'
+                              : isExpired   ? 'EXPIRED'
+                                            : 'ACTIVE'
+            const statusColor = !hasResult ? 'var(--text-muted)'
+                              : isExpired   ? 'var(--color-sell)'
+                                            : 'var(--color-buy)'
+            const statusBg    = !hasResult ? 'rgba(255,255,255,0.06)'
+                              : isExpired   ? 'rgba(255,48,86,0.18)'
+                                            : 'rgba(0,200,83,0.18)'
+            const fmtTime = (iso?: string) => iso
+              ? new Date(iso).toLocaleTimeString([], { hour12: false })
+              : '--'
 
             return (
               <div key={pair} style={{
@@ -1275,33 +1305,36 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                         )}
                       </div>
                       <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'Rajdhani', letterSpacing: 1.5, color: 'var(--text)' }}>
-                        {r?.marketType ?? '— awaiting analysis —'}
+                        {hasResult ? r!.marketType : '— awaiting fresh analysis —'}
                       </div>
                     </div>
-                    {isStale && (
-                      <span
-                        title="Analysis is older than 10 minutes — re-run before acting on it"
-                        style={{
-                          fontSize: 9, fontWeight: 700, letterSpacing: 1,
-                          padding: '2px 6px', borderRadius: 2,
-                          background: 'rgba(255,48,86,0.18)',
-                          color:      'var(--color-sell)',
-                          textTransform: 'uppercase',
-                          alignSelf: 'center',
-                        }}
-                      >
-                        ⚠ STALE
-                      </span>
-                    )}
+                    {/* Status badge — ACTIVE / EXPIRED / AWAITING. Replaces the old
+                        STALE badge with a precise expiry-driven readout. */}
+                    <span
+                      title={
+                        statusLabel === 'ACTIVE'  ? `Valid for ${secsLeft}s — re-run before acting if you wait longer`
+                        : statusLabel === 'EXPIRED' ? 'Signal validity period has ended. Run a new market confirmation.'
+                                                    : 'Awaiting fresh analysis. Click TEST / CHECK MARKET DIRECTION.'
+                      }
+                      style={{
+                        fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                        padding: '2px 6px', borderRadius: 2,
+                        background: statusBg, color: statusColor,
+                        textTransform: 'uppercase', alignSelf: 'center',
+                      }}
+                    >
+                      {statusLabel}
+                      {statusLabel === 'ACTIVE' && ` · ${secsLeft}s left`}
+                    </span>
                   </div>
                   <div style={{ textAlign: 'right', fontSize: 10, flexShrink: 0 }}>
                     {r?.analyzedAt && (
                       <>
-                        <div style={{ fontFamily: 'JetBrains Mono', color: ageColor, fontWeight: isStale ? 700 : 400 }}>
+                        <div style={{ fontFamily: 'JetBrains Mono', color: ageColor, fontWeight: isExpired ? 700 : 400 }}>
                           {ageLabel}
                         </div>
                         <div style={{ color: 'var(--text-dim)', marginTop: 1, fontFamily: 'JetBrains Mono' }}>
-                          {new Date(r.analyzedAt).toLocaleTimeString()}
+                          {new Date(r.analyzedAt).toLocaleTimeString([], { hour12: false })}
                         </div>
                       </>
                     )}
@@ -1320,45 +1353,88 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                   </div>
                 )}
 
-                {/* Main metrics grid */}
-                {r && !r.error && !r.simulated && (
-                  <>
-                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                      <div style={{ flex: '1 1 80px', minWidth: 80, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
-                        <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>RECOMMENDED</div>
-                        <div style={{ fontSize: 13, color: recoColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
-                          {recoTag}
-                        </div>
-                      </div>
-                      <div style={{ flex: '1 1 70px', minWidth: 70, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
-                        <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>DIRECTION</div>
-                        <div style={{ fontSize: 13, color: dirColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
-                          {r.direction}
-                        </div>
-                      </div>
-                      <div style={{ flex: '1 1 70px', minWidth: 70, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
-                        <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>CONFIDENCE</div>
-                        <div style={{ fontSize: 13, color: confColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
-                          {r.confidence}%
-                        </div>
+                {/* Top metrics row — recommended / direction / confidence. Always
+                    rendered (even in placeholder state) so the field labels are
+                    visible and consistent. -- shown when no result yet. */}
+                {!r?.error && !r?.simulated && (
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    <div style={{ flex: '1 1 80px', minWidth: 80, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                      <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>RECOMMENDED</div>
+                      <div style={{ fontSize: 13, color: hasResult ? recoColor : 'var(--text-muted)', fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                        {hasResult ? recoTag : '--'}
                       </div>
                     </div>
-
-                    {/* Reasoning */}
-                    {r.reasons.length > 0 && (
-                      <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.6 }}>
-                        {r.reasons.map((reason, i) => (
-                          <div key={i} style={{ display: 'flex', gap: 4, alignItems: 'flex-start' }}>
-                            <span style={{ color: recoColor, flexShrink: 0, marginTop: 1 }}>›</span>
-                            <span style={{ wordBreak: 'break-word' }}>{reason}</span>
-                          </div>
-                        ))}
+                    <div style={{ flex: '1 1 70px', minWidth: 70, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                      <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>DIRECTION</div>
+                      <div style={{ fontSize: 13, color: dirColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                        {hasResult ? r!.direction : '--'}
                       </div>
-                    )}
-                  </>
+                    </div>
+                    <div style={{ flex: '1 1 70px', minWidth: 70, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                      <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>CONFIDENCE</div>
+                      <div style={{ fontSize: 13, color: confColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                        {hasResult ? `${r!.confidence}%` : '--'}
+                      </div>
+                    </div>
+                  </div>
                 )}
 
-                {/* Placeholder when no analysis yet */}
+                {/* Time + timeframe + status row — required by the spec. Same
+                    -- placeholder treatment when no result. */}
+                {!r?.error && !r?.simulated && (
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    <div style={{ flex: '1 1 70px', minWidth: 70, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                      <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>TIMEFRAME</div>
+                      <div style={{ fontSize: 13, color: hasResult ? 'var(--color-accent)' : 'var(--text-muted)', fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                        {hasResult ? r!.timeframe!.toUpperCase() : 'Not Selected'}
+                      </div>
+                    </div>
+                    <div style={{ flex: '1 1 80px', minWidth: 80, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                      <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>ANALYSIS TIME</div>
+                      <div style={{ fontSize: 13, color: hasResult ? 'var(--text)' : 'var(--text-muted)', fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                        {hasResult ? fmtTime(r!.analyzedAt) : '--'}
+                      </div>
+                    </div>
+                    <div style={{ flex: '1 1 80px', minWidth: 80, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                      <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>EST. EXPIRY</div>
+                      <div style={{
+                        fontSize: 13,
+                        color: !hasResult ? 'var(--text-muted)' : isExpired ? 'var(--color-sell)' : 'var(--text)',
+                        fontWeight: 700, fontFamily: 'JetBrains Mono',
+                      }}>
+                        {hasResult ? fmtTime(new Date(expiresAtMs).toISOString()) : '--'}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* AI reasoning bullets — shown when present; otherwise the
+                    placeholder line below explains how to populate the card. */}
+                {hasResult && r!.reasons.length > 0 && (
+                  <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+                    <div style={{
+                      fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1,
+                      marginBottom: 3, fontWeight: 700,
+                    }}>
+                      AI ANALYSIS
+                    </div>
+                    {r!.reasons.map((reason, i) => (
+                      <div key={i} style={{ display: 'flex', gap: 4, alignItems: 'flex-start' }}>
+                        <span style={{ color: recoColor, flexShrink: 0, marginTop: 1 }}>›</span>
+                        <span style={{ wordBreak: 'break-word' }}>{reason}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Expired warning — exactly as specified by the operator brief */}
+                {isExpired && (
+                  <div style={{ fontSize: 10, color: 'var(--color-sell)', fontStyle: 'italic', lineHeight: 1.5 }}>
+                    Signal validity period has ended. Run a new market confirmation.
+                  </div>
+                )}
+
+                {/* Awaiting state — replaces the previous prose placeholder */}
                 {placeholder && (
                   <div style={{ fontSize: 11, color: 'var(--text-dim)', fontStyle: 'italic' }}>
                     Click <b>TEST / CHECK MARKET DIRECTION</b> to run the 5-strategy fan-out for {name}.

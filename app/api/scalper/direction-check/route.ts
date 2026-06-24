@@ -206,6 +206,13 @@ export async function POST(req: NextRequest) {
       reasons.push('Market bias is neutral — both groups score 0; recommendation falls back to confidence tiebreak')
     }
 
+    // Expiry is bound to the timeframe — confirmation is valid for exactly one
+    // candle period from the moment it was generated. 1m -> 60s, 5m -> 300s.
+    // The frontend re-derives ACTIVE/EXPIRED status per tick from these times.
+    const analyzedAtMs = Date.now()
+    const expirySpanMs = timeframe === '1m' ? 60_000 : 300_000
+    const expiresAtMs  = analyzedAtMs + expirySpanMs
+
     return NextResponse.json({
       pair,
       timeframe,
@@ -218,7 +225,8 @@ export async function POST(req: NextRequest) {
       direction,             // 'BUY' | 'SELL' | 'HOLD'
       confidence,            // blended 0-100
       reasons,
-      analyzedAt: new Date().toISOString(),
+      analyzedAt: new Date(analyzedAtMs).toISOString(),
+      expiresAt:  new Date(expiresAtMs).toISOString(),
       breakdown: {
         scalp:  { results: scalpResults,  agreement: scalpAgreement,  avgConfidence: scalpAvgConf  },
         mirror: { results: mirrorResults, agreement: mirrorAgreement, avgConfidence: mirrorAvgConf },
