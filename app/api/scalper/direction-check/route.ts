@@ -95,6 +95,11 @@ export async function POST(req: NextRequest) {
     const body = await req.json()
     const pair: string = body?.pair
     const userId: string | undefined = body?.userId
+    // Timeframe is operator-controlled (1m or 5m). Default to 5m to match the
+    // rest of the scalp pipeline; 1m gives finer-grained reads at the cost of
+    // noisier ADX/MACD signals.
+    const requestedTf = String(body?.timeframe ?? '5m').toLowerCase()
+    const timeframe: '1m' | '5m' = requestedTf === '1m' ? '1m' : '5m'
     if (!pair) return NextResponse.json({ error: 'pair required' }, { status: 400 })
 
     const origin = req.nextUrl.origin
@@ -102,7 +107,7 @@ export async function POST(req: NextRequest) {
 
     // Step 1: fetch tick once — used as input to all 5 strategy signal calls
     const tickResp = await fetch(
-      `${origin}/api/scalper/tick?pair=${encodeURIComponent(pair)}&timeframe=5m`,
+      `${origin}/api/scalper/tick?pair=${encodeURIComponent(pair)}&timeframe=${timeframe}`,
       { headers: { Authorization: authHeader }, cache: 'no-store' },
     )
     if (!tickResp.ok) {
@@ -203,6 +208,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       pair,
+      timeframe,
       marketType,
       regime:               regimeInfo.regime,
       effectiveMinStrength: regimeInfo.effectiveMinStrength,

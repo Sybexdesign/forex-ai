@@ -48,8 +48,11 @@ const REGIME_BADGE: Record<MarketRegime, { label: string; bg: string; fg: string
   'strong-trend': { label: '⬆ STRONG TREND', bg: 'rgba(255,48,86,0.18)',  fg: 'var(--color-sell)' },
 }
 
+type DirCheckTimeframe = '1m' | '5m'
+
 interface DirCheckResult {
   pair: string
+  timeframe?: DirCheckTimeframe
   marketType: string
   regime: MarketRegime | null
   adx: number
@@ -155,6 +158,9 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   // calls × number of metals (=10 calls per analysis).
   const [dirCheck, setDirCheck] = useState<Record<string, DirCheckResult | null>>({})
   const [dirCheckLoading, setDirCheckLoading] = useState(false)
+  // Operator-selectable timeframe for the direction check. 5m matches the rest
+  // of the scalp pipeline; 1m gives faster reads but noisier ADX/MACD.
+  const [dirCheckTimeframe, setDirCheckTimeframe] = useState<DirCheckTimeframe>('5m')
 
   // Auto-trading toggles + sections + pairs now live in Supabase (top-level
   // columns on strategies via onSaveAutoTrade). UI-only preferences (profit
@@ -303,7 +309,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           const r = await fetch('/api/scalper/direction-check', {
             method:  'POST',
             headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ pair, userId }),
+            body:    JSON.stringify({ pair, userId, timeframe: dirCheckTimeframe }),
           })
           const j: DirCheckResult & { error?: string } = await r.json()
           setDirCheck(prev => ({ ...prev, [pair]: j }))
@@ -322,7 +328,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     } finally {
       setDirCheckLoading(false)
     }
-  }, [userId])
+  }, [userId, dirCheckTimeframe])
 
   // Poll scalp signals for each metal pair
   useEffect(() => {
@@ -1140,21 +1146,73 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
 
       {/* Direction confirmation — manual 5+5 strategy fan-out per metal */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingLeft: 2, gap: 12 }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          paddingLeft: 2, gap: 12, flexWrap: 'wrap',
+        }}>
           <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2, fontWeight: 700 }}>
             CURRENT MARKET &amp; SIGNAL DIRECTION CONFIRMATION
           </div>
-          <button
-            className="btn btn-ghost"
-            onClick={runDirectionCheck}
-            disabled={dirCheckLoading}
-            style={{ fontSize: 11, padding: '6px 14px', letterSpacing: 1 }}
-          >
-            {dirCheckLoading ? 'ANALYSING…' : 'TEST / CHECK MARKET DIRECTION'}
-          </button>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'stretch' }}>
+            {/* 1m / 5m segmented toggle — picks the candle timeframe the fan-out
+                runs against. Disabled while an analysis is in flight. */}
+            <div
+              role="group"
+              aria-label="Timeframe"
+              style={{
+                display: 'flex', alignItems: 'stretch',
+                border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2,
+                overflow: 'hidden',
+              }}
+            >
+              {(['1m', '5m'] as const).map(tf => {
+                const active = dirCheckTimeframe === tf
+                return (
+                  <button
+                    key={tf}
+                    type="button"
+                    onClick={() => setDirCheckTimeframe(tf)}
+                    disabled={dirCheckLoading}
+                    title={tf === '1m'
+                      ? 'Run analysis on 1-minute candles — faster reads, noisier indicators'
+                      : 'Run analysis on 5-minute candles — matches the rest of the scalp pipeline'}
+                    style={{
+                      fontSize: 11, padding: '6px 12px', letterSpacing: 1,
+                      fontWeight: 700, fontFamily: 'JetBrains Mono',
+                      background: active ? 'rgba(0,85,176,0.25)' : 'transparent',
+                      color:      active ? 'var(--color-accent)' : 'var(--text-muted)',
+                      border:     'none', cursor: 'pointer',
+                      borderRight: tf === '1m' ? '1px solid rgba(255,255,255,0.12)' : 'none',
+                      minWidth: 40, minHeight: 32,
+                    }}
+                  >
+                    {tf.toUpperCase()}
+                  </button>
+                )
+              })}
+            </div>
+            <button
+              className="btn btn-ghost"
+              onClick={() => setDirCheck({})}
+              disabled={dirCheckLoading || Object.keys(dirCheck).length === 0}
+              title="Discard current analysis result so the next decision uses a fresh fetch"
+              style={{ fontSize: 11, padding: '6px 12px', letterSpacing: 1, minHeight: 32 }}
+            >
+              CLEAR
+            </button>
+            <button
+              className="btn btn-ghost"
+              onClick={runDirectionCheck}
+              disabled={dirCheckLoading}
+              style={{ fontSize: 11, padding: '6px 14px', letterSpacing: 1, minHeight: 32 }}
+            >
+              {dirCheckLoading ? 'ANALYSING…' : 'TEST / CHECK MARKET DIRECTION'}
+            </button>
+          </div>
         </div>
         <div className="scalp-signal-grid">
           {METALS_ONLY.map(pair => {
+            void scalpTick   // force per-second re-render so the age below ages live
             const r = dirCheck[pair]
             const name = pair === 'XAU/USD' ? 'Gold' : 'Silver'
             const placeholder = !r && !dirCheckLoading
@@ -1169,6 +1227,22 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                                    'var(--color-sell)'
             const recoTag = r?.recommended === 'mirror' ? 'MIRROR' : 'SCALP'
             const recoColor = r?.recommended === 'mirror' ? '#42a5f5' : 'var(--color-accent)'
+            // Staleness: fresh <60s muted, ageing 60s-5m amber, stale 5-10m red,
+            // STALE label after 10m. Boundaries chosen for the 1-5min scalping
+            // window — the analysis is reliable inside the trade-decision window
+            // and visibly degrades past it.
+            const ageMs    = r?.analyzedAt ? Date.now() - new Date(r.analyzedAt).getTime() : 0
+            const ageSec   = Math.floor(ageMs / 1000)
+            const ageColor = !r ? 'var(--text-muted)' :
+                             ageSec < 60   ? 'var(--text-muted)' :
+                             ageSec < 300  ? '#ffaa00'           :
+                                             'var(--color-sell)'
+            const isStale  = !!r && ageSec >= 600
+            const ageLabel = ageSec < 60
+              ? `${ageSec}s ago`
+              : ageSec < 3600
+                ? `${Math.floor(ageSec / 60)}m ${ageSec % 60}s ago`
+                : `${Math.floor(ageSec / 3600)}h ago`
 
             return (
               <div key={pair} style={{
@@ -1179,22 +1253,56 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                 opacity: placeholder ? 0.7 : 1,
               }}>
                 {/* Header */}
-                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, fontWeight: 700, marginBottom: 2 }}>
-                      {name} · DIRECTION CONFIRMATION
+                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                  <div style={{ minWidth: 0, display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{
+                        fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5,
+                        fontWeight: 700, marginBottom: 2, display: 'flex',
+                        alignItems: 'center', gap: 6, flexWrap: 'wrap',
+                      }}>
+                        <span>{name} · DIRECTION CONFIRMATION</span>
+                        {r?.timeframe && (
+                          <span style={{
+                            fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                            padding: '1px 5px', borderRadius: 2,
+                            background: 'rgba(0,85,176,0.25)',
+                            color: 'var(--color-accent)',
+                            fontFamily: 'JetBrains Mono',
+                          }}>
+                            {r.timeframe.toUpperCase()}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'Rajdhani', letterSpacing: 1.5, color: 'var(--text)' }}>
+                        {r?.marketType ?? '— awaiting analysis —'}
+                      </div>
                     </div>
-                    <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'Rajdhani', letterSpacing: 1.5, color: 'var(--text)' }}>
-                      {r?.marketType ?? '— awaiting analysis —'}
-                    </div>
+                    {isStale && (
+                      <span
+                        title="Analysis is older than 10 minutes — re-run before acting on it"
+                        style={{
+                          fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                          padding: '2px 6px', borderRadius: 2,
+                          background: 'rgba(255,48,86,0.18)',
+                          color:      'var(--color-sell)',
+                          textTransform: 'uppercase',
+                          alignSelf: 'center',
+                        }}
+                      >
+                        ⚠ STALE
+                      </span>
+                    )}
                   </div>
-                  <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-muted)' }}>
+                  <div style={{ textAlign: 'right', fontSize: 10, flexShrink: 0 }}>
                     {r?.analyzedAt && (
                       <>
-                        <div style={{ fontFamily: 'JetBrains Mono' }}>
+                        <div style={{ fontFamily: 'JetBrains Mono', color: ageColor, fontWeight: isStale ? 700 : 400 }}>
+                          {ageLabel}
+                        </div>
+                        <div style={{ color: 'var(--text-dim)', marginTop: 1, fontFamily: 'JetBrains Mono' }}>
                           {new Date(r.analyzedAt).toLocaleTimeString()}
                         </div>
-                        <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>last analysis</div>
                       </>
                     )}
                   </div>
@@ -1215,20 +1323,20 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                 {/* Main metrics grid */}
                 {r && !r.error && !r.simulated && (
                   <>
-                    <div style={{ display: 'flex', gap: 6 }}>
-                      <div style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      <div style={{ flex: '1 1 80px', minWidth: 80, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
                         <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>RECOMMENDED</div>
                         <div style={{ fontSize: 13, color: recoColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
                           {recoTag}
                         </div>
                       </div>
-                      <div style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                      <div style={{ flex: '1 1 70px', minWidth: 70, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
                         <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>DIRECTION</div>
                         <div style={{ fontSize: 13, color: dirColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
                           {r.direction}
                         </div>
                       </div>
-                      <div style={{ flex: 1, minWidth: 0, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
+                      <div style={{ flex: '1 1 70px', minWidth: 70, background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px' }}>
                         <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>CONFIDENCE</div>
                         <div style={{ fontSize: 13, color: confColor, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
                           {r.confidence}%
