@@ -379,20 +379,55 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // ─── Anchor refresh: pull a fresh quote from the broker right before
+    // placing. Callers send `currentPrice` from their own snapshot — for the
+    // worker that's the candle close from the most recent /api/scalper/signal
+    // response, which can be 5-30s stale by the time it reaches here. SL/TP
+    // are computed off this anchor inside the OANDA/Capital adapters; a stale
+    // anchor makes them land at the wrong absolute prices relative to the
+    // actual fill. MT5 Direct adapter does its own EA-based re-anchor and is
+    // idempotent under this — getting a fresh anchor here just brings the
+    // fallback path (when the EA's latestPrices is stale) up to date too.
+    //
+    // Fall back to the caller-supplied currentPrice on any failure — never
+    // block an otherwise-valid order on a transient quote-feed problem.
+    let effectivePrice = currentPrice
+    let anchorDriftPips: number | null = null
+    let anchorSource: 'live-broker' | 'caller-fallback' = 'caller-fallback'
+    try {
+      const liveQuotes = await broker.getPrices([pair])
+      const liveRow    = liveQuotes.find(p => p.pair === pair)
+      if (liveRow && liveRow.bid > 0 && liveRow.ask > 0) {
+        const live = direction === 'BUY' ? liveRow.ask : liveRow.bid
+        const pip  = pair.includes('JPY')   ? 0.01
+                   : pair.startsWith('XAU') ? 0.1
+                   : pair.startsWith('XAG') ? 0.01
+                   : 0.0001
+        anchorDriftPips = (live - currentPrice) / pip
+        effectivePrice  = live
+        anchorSource    = 'live-broker'
+        console.log(`[orders] anchor refreshed: ${pair} ${direction} signal=${currentPrice} → live=${live} drift=${anchorDriftPips.toFixed(1)}p`)
+      } else {
+        console.warn(`[orders] live quote unavailable for ${pair} (broker=${broker.name}) — using caller-supplied currentPrice ${currentPrice}`)
+      }
+    } catch (e: any) {
+      console.warn(`[orders] live quote fetch failed for ${pair}: ${e?.message} — using caller-supplied currentPrice ${currentPrice}`)
+    }
+
     // Explicit pre-fire log so it's impossible to miss when a real order is about
     // to hit a live account. Same line format on demo so the operator can grep
     // either trail. ACCOUNT_TYPE comes from env — set ACCOUNT_TYPE=live in prod.
     const accountType = (process.env.ACCOUNT_TYPE || 'demo').toLowerCase()
     if (accountType === 'live') {
-      console.warn(`[orders] LIVE ORDER placing — pair=${pair} direction=${direction} lots=${lots} sl=${safeSlPips}p tp=${safeTpPips}p balance=$${balance.toFixed(2)} broker=${broker.name}`)
+      console.warn(`[orders] LIVE ORDER placing — pair=${pair} direction=${direction} lots=${lots} sl=${safeSlPips}p tp=${safeTpPips}p anchor=${effectivePrice}(${anchorSource}) balance=$${balance.toFixed(2)} broker=${broker.name}`)
     } else {
-      console.log(`[orders] DEMO order placing — pair=${pair} direction=${direction} lots=${lots} sl=${safeSlPips}p tp=${safeTpPips}p balance=$${balance.toFixed(2)} broker=${broker.name}`)
+      console.log(`[orders] DEMO order placing — pair=${pair} direction=${direction} lots=${lots} sl=${safeSlPips}p tp=${safeTpPips}p anchor=${effectivePrice}(${anchorSource}) balance=$${balance.toFixed(2)} broker=${broker.name}`)
     }
     const orderResult = await broker.placeOrder({
       pair, direction, lots,
       takeProfitPips: safeTpPips,
       stopLossPips: safeSlPips,
-      currentPrice,
+      currentPrice: effectivePrice,
     })
 
     if (!orderResult.success) {
@@ -443,7 +478,7 @@ export async function POST(req: NextRequest) {
     // Fire Telegram alert (non-blocking)
     alertOrderPlaced({
       pair, direction, lots,
-      filledPrice: orderResult.filledPrice || currentPrice,
+      filledPrice: orderResult.filledPrice || effectivePrice,
       tpPrice: orderResult.tpPrice || 0,
       slPrice: orderResult.slPrice || 0,
       confidence: aiConfidence || 0,
