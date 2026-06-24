@@ -35,6 +35,46 @@ const PAIR_COOLDOWN_MS = 5 * 60_000  // minimum gap between two auto-trades on t
 const MIRROR_SL_CAP = 35
 const MIRROR_TP_CAP = 70  // unchanged; widening only SL for the test
 
+// Re-anchor scalp/mirror entry/SL/TP onto the live bid/ask quote when a
+// fresh price exists in the OANDA prices feed. The signal-time values
+// (sig.entry/sl/tp) come from the most recent 5m candle close and can be
+// 5-15s stale by the time the operator looks at the card; using them at
+// face value made the displayed ENTRY drift from what the broker would
+// actually fill at, and made OANDA/Capital adapters anchor SL/TP off a
+// stale price (MT5 Direct does its own re-anchoring server-side).
+//
+// SL/TP DISTANCES are preserved — only the absolute prices shift. If the
+// live feed is missing/stale (bid<=0), falls back to sig.entry exactly as
+// before, so the card never shows a worse value than the signal price.
+function liveAnchoredLevels(
+  sig: { pair: string; entry: number; sl: number; tp: number; direction: 'BUY' | 'SELL' | 'HOLD' },
+  prices: Record<string, { bid?: number; ask?: number } | undefined> | undefined,
+  forDirection: 'BUY' | 'SELL',
+): { entry: number; sl: number; tp: number; isLive: boolean } {
+  const slDist = Math.abs(sig.entry - sig.sl)
+  const tpDist = Math.abs(sig.entry - sig.tp)
+  const px  = prices?.[sig.pair]
+  const bid = Number(px?.bid ?? 0)
+  const ask = Number(px?.ask ?? 0)
+  const liveOk = bid > 0 && ask > 0
+  const sign   = forDirection === 'BUY' ? 1 : -1
+  if (!liveOk) {
+    return {
+      entry: sig.entry,
+      sl:    sig.entry - slDist * sign,
+      tp:    sig.entry + tpDist * sign,
+      isLive: false,
+    }
+  }
+  const anchor = forDirection === 'BUY' ? ask : bid
+  return {
+    entry: anchor,
+    sl:    anchor - slDist * sign,
+    tp:    anchor + tpDist * sign,
+    isLive: true,
+  }
+}
+
 type MarketRegime = 'chop' | 'ranging' | 'weak-trend' | 'trending' | 'strong-trend'
 
 // Regime badge — chop/strong-trend are HOLD-only (red), ranging is our highest-edge
@@ -63,6 +103,16 @@ interface DirCheckResult {
   reasons: string[]
   analyzedAt: string
   expiresAt?: string
+  // Background confirmation done server-side AFTER the AI fan-out, using a
+  // fresh live-price fetch. Status surfaces on the card so the operator can
+  // see whether the recommendation was independently corroborated.
+  confirmation?: {
+    status: 'confirmed' | 'contradicted' | 'neutral' | 'unavailable'
+    livePrice: number | null
+    candleClose: number
+    driftPips: number | null
+    adjustment: number   // confidence delta already applied
+  }
   error?: string
   simulated?: boolean
 }
@@ -334,10 +384,17 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           }))
         }
       }))
+      // After the dir-check completes, re-fetch the scalp signal cards so both
+      // the confirmation result and the per-pair signal cards reflect data
+      // pulled from the same moment. Operator brief: "after each test check
+      // is done reload the signal cards this way we have a fresh data for
+      // both signal and market direction." Fire-and-forget — failures here
+      // surface on the scalp cards via their own fetchError handling.
+      METALS_ONLY.forEach(p => fetchScalpSignalForPair(p))
     } finally {
       setDirCheckLoading(false)
     }
-  }, [userId, dirCheckTimeframe])
+  }, [userId, dirCheckTimeframe, fetchScalpSignalForPair])
 
   // Poll scalp signals for each metal pair
   useEffect(() => {
@@ -527,13 +584,19 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
       const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
       const scalpSlPips   = Math.min(MIRROR_SL_CAP, Math.max(strategy.slPips, derivedSlPips))
       const scalpTpPips   = Math.min(MIRROR_TP_CAP, Math.max(strategy.tpPips, derivedTpPips))
+      // Re-anchor to live bid/ask so OANDA/Capital adapters compute SL/TP off
+      // the actual fill price, not the candle close. MT5 Direct does its own
+      // re-anchoring server-side; this is a no-op there.
+      const live = liveAnchoredLevels(sig, prices, sig.direction === 'BUY' ? 'BUY' : 'SELL')
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
           pair:            sig.pair,
           direction:       sig.direction,
           strategy:        { ...strategy, slPips: scalpSlPips, tpPips: scalpTpPips },
-          currentPrice:    sig.entry,
+          currentPrice:    live.entry,
+          signalPrice:     sig.entry,
+          livePriceUsed:   live.isLive,
           newsInWindow,
           aiConfidence:    sig.confidence,
           checklistScore:  5,
@@ -571,22 +634,27 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     if (placingMirrorScalp) return
     setPlacingMirrorScalp(sig.pair)
     try {
-      const mirrorDir = sig.direction === 'BUY' ? 'SELL' : 'BUY'
-      const mirrorSl  = 2 * sig.entry - sig.sl
-      const mirrorTp  = 2 * sig.entry - sig.tp
+      const mirrorDir: 'BUY' | 'SELL' = sig.direction === 'BUY' ? 'SELL' : 'BUY'
       const pip = getPipValue(sig.pair)
       // Option C clamp: strategy.slPips/tpPips floor, MIRROR_*_CAP outer ceiling.
       const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
       const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
       const slPips        = Math.min(MIRROR_SL_CAP, Math.max(strategy.slPips, derivedSlPips))
       const tpPips        = Math.min(MIRROR_TP_CAP, Math.max(strategy.tpPips, derivedTpPips))
+      // Re-anchor to live bid/ask in the mirror direction so the mirrored
+      // SL/TP track the actual fill price instead of the candle close.
+      const live = liveAnchoredLevels(sig, prices, mirrorDir)
+      const mirrorSl = live.sl
+      const mirrorTp = live.tp
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
           pair:           sig.pair,
           direction:      mirrorDir,
           strategy:       { ...strategy, slPips, tpPips },
-          currentPrice:   sig.entry,
+          currentPrice:   live.entry,
+          signalPrice:    sig.entry,
+          livePriceUsed:  live.isLive,
           newsInWindow,
           aiConfidence:   sig.confidence,
           checklistScore: 5,
@@ -629,13 +697,20 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
     const slPips        = Math.min(MIRROR_SL_CAP, Math.max(strategy.slPips, derivedSlPips))
     const tpPips        = Math.min(MIRROR_TP_CAP, Math.max(strategy.tpPips, derivedTpPips))
-    const direction = isMirror ? (sig.direction === 'BUY' ? 'SELL' : 'BUY') : sig.direction
+    const direction: 'BUY' | 'SELL' = isMirror
+      ? (sig.direction === 'BUY' ? 'SELL' : 'BUY')
+      : (sig.direction as 'BUY' | 'SELL')
     const prefix    = isMirror ? 'mirror' : 'scalp'
     const signalRef = `${prefix}-${sig.pair.replace('/', '')}-${sig.fetchedAt}`
+    // Re-anchor to live bid/ask in the order direction so the broker adapter
+    // computes SL/TP off the actual fill price.
+    const live = liveAnchoredLevels(sig, prices, direction)
     const body: Record<string, any> = {
       pair: sig.pair, direction,
       strategy:             { ...strategy, slPips, tpPips },
-      currentPrice:         sig.entry,
+      currentPrice:         live.entry,
+      signalPrice:          sig.entry,
+      livePriceUsed:        live.isLive,
       newsInWindow,
       aiConfidence:         sig.confidence,
       checklistScore:       5,
@@ -650,8 +725,8 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
       signal_id_ref:        signalRef,
     }
     if (isMirror) {
-      body.mirrorSl = 2 * sig.entry - sig.sl
-      body.mirrorTp = 2 * sig.entry - sig.tp
+      body.mirrorSl = live.sl
+      body.mirrorTp = live.tp
     }
     try {
       const data = await authFetch('/api/orders', { method: 'POST', body: JSON.stringify(body) }).then(r => r.json())
@@ -1408,6 +1483,59 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                   </div>
                 )}
 
+                {/* Background confirmation badge — surfaces the live-price
+                    verification done server-side after the AI fan-out. Shows
+                    confirmed (green) / contradicted (red) / neutral (muted)
+                    / unavailable (amber) so the operator can see the result
+                    of the independent check at a glance, without having to
+                    parse the reasoning bullets. */}
+                {hasResult && r!.confirmation && (() => {
+                  const c = r!.confirmation
+                  const cf = c.status
+                  const cfBg = cf === 'confirmed'    ? 'rgba(0,200,83,0.18)'
+                             : cf === 'contradicted' ? 'rgba(255,48,86,0.18)'
+                             : cf === 'unavailable'  ? 'rgba(255,170,0,0.18)'
+                                                     : 'rgba(255,255,255,0.06)'
+                  const cfFg = cf === 'confirmed'    ? 'var(--color-buy)'
+                             : cf === 'contradicted' ? 'var(--color-sell)'
+                             : cf === 'unavailable'  ? '#ffaa00'
+                                                     : 'var(--text-muted)'
+                  const cfLabel = cf === 'confirmed'    ? '✓ LIVE CONFIRMED'
+                                : cf === 'contradicted' ? '✗ LIVE CONTRADICTED'
+                                : cf === 'unavailable'  ? '⚠ LIVE UNAVAILABLE'
+                                                        : '— LIVE NEUTRAL'
+                  const driftStr = c.driftPips !== null && c.driftPips !== undefined
+                    ? `${c.driftPips >= 0 ? '+' : ''}${c.driftPips.toFixed(1)} pips`
+                    : '—'
+                  return (
+                    <div style={{
+                      display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+                      padding: '6px 8px', borderRadius: 2,
+                      background: cfBg, border: `1px solid ${cfFg}33`,
+                    }}>
+                      <span style={{
+                        fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                        color: cfFg, fontFamily: 'JetBrains Mono',
+                      }}>
+                        {cfLabel}
+                      </span>
+                      <span style={{ fontSize: 10, color: 'var(--text-dim)', fontFamily: 'JetBrains Mono' }}>
+                        drift {driftStr}
+                      </span>
+                      {c.livePrice !== null && (
+                        <span style={{ fontSize: 10, color: 'var(--text-dim)', fontFamily: 'JetBrains Mono' }}>
+                          live {c.livePrice.toFixed(pair === 'XAU/USD' ? 2 : 3)} vs close {c.candleClose.toFixed(pair === 'XAU/USD' ? 2 : 3)}
+                        </span>
+                      )}
+                      {c.adjustment !== 0 && (
+                        <span style={{ fontSize: 10, color: cfFg, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                          {c.adjustment > 0 ? `+${c.adjustment}` : c.adjustment} conf
+                        </span>
+                      )}
+                    </div>
+                  )
+                })()}
+
                 {/* AI reasoning bullets — shown when present; otherwise the
                     placeholder line below explains how to populate the card. */}
                 {hasResult && r!.reasons.length > 0 && (
@@ -1533,26 +1661,32 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                 </div>
               </div>
 
-              {/* Price levels: entry / SL / TP — each with copy button */}
-              {sig && !sig.blocked && dir !== 'HOLD' && (
-                <div style={{ display: 'flex', gap: 6 }}>
-                  {([
-                    { label: 'ENTRY', val: sig.entry, color: 'var(--color-accent)' },
-                    { label: 'SL',    val: sig.sl,    color: 'var(--color-loss)' },
-                    { label: 'TP',    val: sig.tp,    color: 'var(--color-profit)' },
-                  ] as const).map(({ label, val, color }) => (
-                    <div key={label} style={{
-                      flex: 1, minWidth: 0,
-                      background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px',
-                    }}>
-                      <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>{label}</div>
-                      <div style={{ fontSize: 11, color, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
-                        <CopyValue value={val.toFixed(dp)}>{val.toFixed(dp)}</CopyValue>
+              {/* Price levels: entry / SL / TP — re-anchored to live bid/ask
+                  every render so the displayed values match what the broker
+                  will actually fill at. Falls back to signal levels if the
+                  live OANDA feed is missing or zero. */}
+              {sig && !sig.blocked && dir !== 'HOLD' && (() => {
+                const live = liveAnchoredLevels(sig, prices, dir as 'BUY' | 'SELL')
+                return (
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {([
+                      { label: live.isLive ? 'ENTRY · LIVE' : 'ENTRY', val: live.entry, color: 'var(--color-accent)' },
+                      { label: 'SL',                                    val: live.sl,    color: 'var(--color-loss)' },
+                      { label: 'TP',                                    val: live.tp,    color: 'var(--color-profit)' },
+                    ] as const).map(({ label, val, color }) => (
+                      <div key={label} style={{
+                        flex: 1, minWidth: 0,
+                        background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px',
+                      }}>
+                        <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>{label}</div>
+                        <div style={{ fontSize: 11, color, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                          <CopyValue value={val.toFixed(dp)}>{val.toFixed(dp)}</CopyValue>
+                        </div>
                       </div>
-                    </div>
-                  ))}
-                </div>
-              )}
+                    ))}
+                  </div>
+                )
+              })()}
 
               {/* Lot size / risk row */}
               {sig && !sig.blocked && dir !== 'HOLD' && (() => {
@@ -1656,9 +1790,6 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
             const bgColor     = dir === 'BUY' ? 'rgba(0,200,83,0.03)' : dir === 'SELL' ? 'rgba(255,48,86,0.03)' : 'rgba(255,255,255,0.01)'
             const dp = pair.startsWith('XAU') ? 2 : 3
 
-            const mirrorSl = sig && sig.sl !== sig.entry ? 2 * sig.entry - sig.sl : 0
-            const mirrorTp = sig && sig.tp !== sig.entry ? 2 * sig.entry - sig.tp : 0
-
             const signalSlPips = sig && dir !== 'HOLD' && sig.entry !== sig.sl
               ? Math.abs(sig.entry - sig.sl) / getPipValue(pair)
               : strategy.slPips
@@ -1726,26 +1857,30 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                   </div>
                 </div>
 
-                {/* Price levels with mirrored SL/TP */}
-                {sig && !sig.blocked && dir !== 'HOLD' && (
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    {([
-                      { label: 'ENTRY', val: sig.entry, color: 'var(--color-accent)' },
-                      { label: 'SL',    val: mirrorSl,  color: 'var(--color-loss)' },
-                      { label: 'TP',    val: mirrorTp,  color: 'var(--color-profit)' },
-                    ] as const).map(({ label, val, color }) => (
-                      <div key={label} style={{
-                        flex: 1, minWidth: 0,
-                        background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px',
-                      }}>
-                        <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>{label}</div>
-                        <div style={{ fontSize: 11, color, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
-                          <CopyValue value={val.toFixed(dp)}>{val.toFixed(dp)}</CopyValue>
+                {/* Price levels with mirrored SL/TP — re-anchored to live
+                    bid/ask in the mirror direction every render. */}
+                {sig && !sig.blocked && dir !== 'HOLD' && (() => {
+                  const live = liveAnchoredLevels(sig, prices, dir as 'BUY' | 'SELL')
+                  return (
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      {([
+                        { label: live.isLive ? 'ENTRY · LIVE' : 'ENTRY', val: live.entry, color: 'var(--color-accent)' },
+                        { label: 'SL',                                    val: live.sl,    color: 'var(--color-loss)' },
+                        { label: 'TP',                                    val: live.tp,    color: 'var(--color-profit)' },
+                      ] as const).map(({ label, val, color }) => (
+                        <div key={label} style={{
+                          flex: 1, minWidth: 0,
+                          background: 'rgba(0,0,0,0.15)', borderRadius: 2, padding: '6px 8px',
+                        }}>
+                          <div style={{ fontSize: 9, color: 'var(--text-dim)', letterSpacing: 1, marginBottom: 3 }}>{label}</div>
+                          <div style={{ fontSize: 11, color, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>
+                            <CopyValue value={val.toFixed(dp)}>{val.toFixed(dp)}</CopyValue>
+                          </div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                      ))}
+                    </div>
+                  )
+                })()}
 
                 {/* Lot size / risk row */}
                 {sig && !sig.blocked && dir !== 'HOLD' && (() => {

@@ -14,6 +14,7 @@ export const dynamic = 'force-dynamic'
 
 import { NextRequest, NextResponse } from 'next/server'
 import { classifyRegime, type MarketRegime } from '@/app/api/scalper/signal/route'
+import { getAdminClient } from '@/lib/supabase'
 
 type Direction = 'BUY' | 'SELL' | 'HOLD'
 type StrategyName = 'Momentum' | 'Mean Reversion' | 'Breakout' | 'Order Flow' | 'Scalp'
@@ -187,9 +188,71 @@ export async function POST(req: NextRequest) {
     const agreementCount = recommended === 'scalp' ? scalpAgreement : mirrorAgreement
     const agreementRate  = agreementCount / 5
     const groupAvgConf   = recommended === 'scalp' ? scalpAvgConf : mirrorAvgConf
-    const confidence = Math.round((agreementRate * 0.6 + (groupAvgConf / 100) * 0.4) * 100)
+    let confidence = Math.round((agreementRate * 0.6 + (groupAvgConf / 100) * 0.4) * 100)
 
-    // Step 7: reasoning
+    // Step 7: background confirmation against live price
+    // ────────────────────────────────────────────────────────────────────────
+    // Independent verification before we return a recommendation. Re-fetches
+    // the live bid/ask AFTER the AI fan-out so we can confirm the recommended
+    // direction aligns with the most recent real-time price drift, not just
+    // the candle-close indicators the AI saw. Three outcomes:
+    //
+    //   confirmed    — live drift matches direction (+5 conf, cap 100)
+    //   contradicted — live drift opposes direction (-20 conf, never below 0)
+    //   neutral      — drift inside epsilon (no change)
+    //   unavailable  — live fetch failed; reasoning notes it, no auto-pass
+    //
+    // Epsilon = 0.1 × ATR (tick's own ATR field) so the threshold scales with
+    // volatility. No hardcoded per-pair epsilons; everything derives from
+    // live indicators on this tick.
+    type ConfirmationStatus = 'confirmed' | 'contradicted' | 'neutral' | 'unavailable'
+    let confirmationStatus: ConfirmationStatus = 'unavailable'
+    let livePrice:   number | null = null
+    let priceDrift:  number | null = null
+    let driftPips:   number | null = null
+    try {
+      const priceResp = await fetch(
+        `${origin}/api/oanda/prices?pairs=${encodeURIComponent(pair)}`,
+        { headers: { Authorization: authHeader }, cache: 'no-store' },
+      )
+      if (priceResp.ok) {
+        const priceData = await priceResp.json()
+        const row = (priceData?.prices || []).find((p: any) => p.pair === pair)
+        if (row && typeof row.bid === 'number' && row.bid > 0) {
+          const lp: number = direction === 'SELL' ? row.bid : (typeof row.ask === 'number' ? row.ask : row.bid)
+          livePrice = lp
+          // Drift = (live - candle close) signed; positive = price moved up
+          priceDrift = lp - Number(tick.price ?? 0)
+          const pipFor = pair.includes('JPY') ? 0.01
+                       : pair.startsWith('XAU') ? 0.1
+                       : pair.startsWith('XAG') ? 0.01
+                       : 0.0001
+          driftPips = priceDrift / pipFor
+          const atr     = Number(tick.atr ?? 0)
+          const epsilon = atr > 0 ? atr * 0.1 : Math.abs(lp) * 0.0001 // fallback: 1 bp of price
+          if (Math.abs(priceDrift) < epsilon) {
+            confirmationStatus = 'neutral'
+          } else if (direction === 'BUY') {
+            confirmationStatus = priceDrift > 0 ? 'confirmed' : 'contradicted'
+          } else if (direction === 'SELL') {
+            confirmationStatus = priceDrift < 0 ? 'confirmed' : 'contradicted'
+          } else {
+            // direction = HOLD — drift doesn't confirm or contradict a non-stance
+            confirmationStatus = 'neutral'
+          }
+        }
+      }
+    } catch (e: any) {
+      console.warn('[direction-check] confirmation fetch failed:', e?.message)
+    }
+
+    // Apply confidence adjustment from confirmation. Capped to [0, 100].
+    let confidenceAdj = 0
+    if (confirmationStatus === 'confirmed')    confidenceAdj = +5
+    if (confirmationStatus === 'contradicted') confidenceAdj = -20
+    confidence = Math.max(0, Math.min(100, confidence + confidenceAdj))
+
+    // Step 8: reasoning
     const reasons: string[] = [
       `Market: ${marketType} (ADX ${adx.toFixed(1)}, regime=${regimeInfo.regime})`,
       `Bias from indicators: ${bias} (${bullVotes} bull / ${bearVotes} bear votes out of 5)`,
@@ -205,6 +268,17 @@ export async function POST(req: NextRequest) {
     if (bias === 'NEUTRAL') {
       reasons.push('Market bias is neutral — both groups score 0; recommendation falls back to confidence tiebreak')
     }
+    // Background confirmation line — always present so the operator sees the
+    // verification step ran. "unavailable" is explicit, not silently passed.
+    if (confirmationStatus === 'confirmed' && livePrice !== null && driftPips !== null) {
+      reasons.push(`Live confirmation: drift ${driftPips >= 0 ? '+' : ''}${driftPips.toFixed(1)} pips matches ${direction} — confirmed (+${confidenceAdj} conf)`)
+    } else if (confirmationStatus === 'contradicted' && driftPips !== null) {
+      reasons.push(`Live confirmation: drift ${driftPips >= 0 ? '+' : ''}${driftPips.toFixed(1)} pips contradicts ${direction} — demoted (${confidenceAdj} conf)`)
+    } else if (confirmationStatus === 'neutral') {
+      reasons.push('Live confirmation: drift inside epsilon — neutral, no adjustment')
+    } else {
+      reasons.push('Live confirmation: live-price fetch unavailable — confirmation skipped')
+    }
 
     // Expiry is bound to the timeframe — confirmation is valid for exactly one
     // candle period from the moment it was generated. 1m -> 60s, 5m -> 300s.
@@ -212,6 +286,33 @@ export async function POST(req: NextRequest) {
     const analyzedAtMs = Date.now()
     const expirySpanMs = timeframe === '1m' ? 60_000 : 300_000
     const expiresAtMs  = analyzedAtMs + expirySpanMs
+
+    // Worker deadman-switch: persist 5m confirmations so the 24/7 scalper
+    // worker can read the latest unexpired row before auto-executing. 1m is
+    // operator-advisory only — gating auto-trade on a 60-second window would
+    // be impractical, and the migration check constraint mirrors that policy.
+    // Failures here MUST NOT abort the response; the analysis itself succeeded
+    // and the operator still gets the card. Worker just won't see this row.
+    if (userId && timeframe === '5m') {
+      try {
+        const admin = getAdminClient()
+        await admin.from('direction_confirmations').insert({
+          user_id:      userId,
+          pair,
+          timeframe,
+          direction,
+          recommended,
+          confidence,
+          regime:       regimeInfo.regime,
+          adx,
+          market_type:  marketType,
+          analyzed_at:  new Date(analyzedAtMs).toISOString(),
+          expires_at:   new Date(expiresAtMs).toISOString(),
+        })
+      } catch (e: any) {
+        console.error('[direction-check] persist failed', e?.message)
+      }
+    }
 
     return NextResponse.json({
       pair,
@@ -223,10 +324,18 @@ export async function POST(req: NextRequest) {
       bias,
       recommended,           // 'scalp' | 'mirror'
       direction,             // 'BUY' | 'SELL' | 'HOLD'
-      confidence,            // blended 0-100
+      confidence,            // blended 0-100 (after confirmation adjustment)
       reasons,
       analyzedAt: new Date(analyzedAtMs).toISOString(),
       expiresAt:  new Date(expiresAtMs).toISOString(),
+      // Background confirmation surfaced so the UI/operator can audit it.
+      confirmation: {
+        status:    confirmationStatus,
+        livePrice,
+        candleClose: Number(tick.price ?? 0),
+        driftPips,
+        adjustment:  confidenceAdj,
+      },
       breakdown: {
         scalp:  { results: scalpResults,  agreement: scalpAgreement,  avgConfidence: scalpAvgConf  },
         mirror: { results: mirrorResults, agreement: mirrorAgreement, avgConfidence: mirrorAvgConf },
