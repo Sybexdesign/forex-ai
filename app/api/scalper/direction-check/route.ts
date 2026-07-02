@@ -26,6 +26,11 @@ interface PerStrategyResult {
   direction: Direction
   confidence: number
   fallback: boolean
+  // True when the signal call itself failed (HTTP error / network throw) —
+  // distinct from fallback, which also covers a successful call that used the
+  // rule-based engine. Failed results carry no market information and must
+  // not count toward the quorum.
+  failed?: boolean
 }
 
 // Volatility override threshold. ATR/price ratios above this read as
@@ -131,7 +136,7 @@ export async function POST(req: NextRequest) {
           headers: { 'Content-Type': 'application/json', Authorization: authHeader },
           body:    JSON.stringify({ ...tick, pair, strategy, userId }),
         })
-        if (!r.ok) return { strategy, direction: 'HOLD', confidence: 0, fallback: true }
+        if (!r.ok) return { strategy, direction: 'HOLD', confidence: 0, fallback: true, failed: true }
         const j = await r.json()
         return {
           strategy,
@@ -140,7 +145,7 @@ export async function POST(req: NextRequest) {
           fallback:   Boolean(j.fallback),
         }
       } catch {
-        return { strategy, direction: 'HOLD', confidence: 0, fallback: true }
+        return { strategy, direction: 'HOLD', confidence: 0, fallback: true, failed: true }
       }
     })
     const scalpResults = await Promise.all(signalCalls)
@@ -182,7 +187,18 @@ export async function POST(req: NextRequest) {
     }
 
     const winningGroup = recommended === 'scalp' ? scalpResults : mirrorResults
-    const direction = majorityDirection(winningGroup)
+    let direction = majorityDirection(winningGroup)
+
+    // Quorum guard: with fewer than 3 of 5 strategy calls succeeding, the
+    // recommendation would rest on 1-2 signals — abstain rather than persist
+    // a direction the worker could act on. HOLD rows still block auto-trade
+    // (deadman-switch stays conservative).
+    const succeededCalls = scalpResults.filter(r => !r.failed).length
+    const quorumMet = succeededCalls >= 3
+    if (!quorumMet) {
+      console.warn(`[direction-check] ${pair}: only ${succeededCalls}/5 strategy calls succeeded — abstaining with HOLD`)
+      direction = 'HOLD'
+    }
 
     // Step 6: blended confidence — 60% agreement rate, 40% signal quality
     const agreementCount = recommended === 'scalp' ? scalpAgreement : mirrorAgreement
@@ -262,7 +278,9 @@ export async function POST(req: NextRequest) {
         ? 'Scalp side better aligned with current market structure'
         : 'Mirror side better aligned with current market structure',
     ]
-    if (direction === 'HOLD') {
+    if (!quorumMet) {
+      reasons.push(`Quorum not met: only ${succeededCalls}/5 strategy calls succeeded — abstaining (HOLD)`)
+    } else if (direction === 'HOLD') {
       reasons.push('Winning group is split with no majority — direction inconclusive')
     }
     if (bias === 'NEUTRAL') {
