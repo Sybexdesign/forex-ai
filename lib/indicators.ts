@@ -78,9 +78,14 @@ export function calculateIndicators(candles: Candle[]): IndicatorValues {
   })
   const lastMacd  = macdArr[macdArr.length - 1]
   const prevMacd  = macdArr[macdArr.length - 2]
-  const macdLine      = +(lastMacd?.MACD      ?? 0).toFixed(6)
-  const macdSignal    = +(lastMacd?.signal    ?? 0).toFixed(6)
-  const macdHistogram = +(lastMacd?.histogram ?? 0).toFixed(6)
+  // Throw instead of defaulting — a silent 0 here would feed a fake "flat
+  // momentum" reading into the signal engines (audit 2026-07-02).
+  if (lastMacd?.MACD === undefined || lastMacd?.signal === undefined || lastMacd?.histogram === undefined) {
+    throw new Error(`MACD not formed: ${macdArr.length} values from ${closes.length} candles`)
+  }
+  const macdLine      = +lastMacd.MACD.toFixed(6)
+  const macdSignal    = +lastMacd.signal.toFixed(6)
+  const macdHistogram = +lastMacd.histogram.toFixed(6)
   const prevHistogram = prevMacd?.histogram ?? 0
   const macdCrossover: 'BULLISH' | 'BEARISH' | 'FLAT' =
     macdHistogram > 0 && prevHistogram <= 0 ? 'BULLISH'
@@ -91,7 +96,13 @@ export function calculateIndicators(candles: Candle[]): IndicatorValues {
   const adxArr: Array<{ adx: number }> = ti.ADX.calculate({
     close: closes, high: highs, low: lows, period: 14,
   })
-  const adx = +(adxArr[adxArr.length - 1]?.adx ?? 20).toFixed(1)
+  const lastAdx = adxArr[adxArr.length - 1]?.adx
+  // A defaulted ADX of 20 silently mapped garbage input to the 'weak-trend'
+  // regime and passed the chop gate — throw instead (audit 2026-07-02).
+  if (lastAdx === undefined) {
+    throw new Error(`ADX not formed: ${adxArr.length} values from ${closes.length} candles`)
+  }
+  const adx = +lastAdx.toFixed(1)
   const adxStrength: 'STRONG' | 'MODERATE' | 'WEAK' =
     adx > 25 ? 'STRONG' : adx > 15 ? 'MODERATE' : 'WEAK'
 
@@ -99,10 +110,13 @@ export function calculateIndicators(candles: Candle[]): IndicatorValues {
   const bbArr: Array<{ upper: number; middle: number; lower: number }> = ti.BollingerBands.calculate({
     period: 20, values: closes, stdDev: 2,
   })
-  const lastBB   = bbArr[bbArr.length - 1]
-  const bbUpper  = +(lastBB?.upper  ?? 0).toFixed(6)
-  const bbMiddle = +(lastBB?.middle ?? 0).toFixed(6)
-  const bbLower  = +(lastBB?.lower  ?? 0).toFixed(6)
+  const lastBB = bbArr[bbArr.length - 1]
+  if (lastBB?.upper === undefined || lastBB?.middle === undefined || lastBB?.lower === undefined) {
+    throw new Error(`Bollinger Bands not formed: ${bbArr.length} values from ${closes.length} candles`)
+  }
+  const bbUpper  = +lastBB.upper.toFixed(6)
+  const bbMiddle = +lastBB.middle.toFixed(6)
+  const bbLower  = +lastBB.lower.toFixed(6)
   const bbWidth  = +(bbUpper - bbLower).toFixed(6)
 
   const currentPrice = closes[closes.length - 1]

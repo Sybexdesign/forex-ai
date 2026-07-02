@@ -99,6 +99,11 @@ export async function GET(req: NextRequest) {
     stochRsiD,
     broker:         brokerName,
     simulated,
+    // Provenance for downstream integrity checks: how many bars the
+    // indicators were computed on and the close time of the final bar.
+    // `timestamp` is server time, NOT candle time — keep both.
+    candleCount:    candles.length,
+    lastCandleTime: candles[candles.length - 1]?.time ?? null,
     timestamp:      Date.now(),
   })
 }

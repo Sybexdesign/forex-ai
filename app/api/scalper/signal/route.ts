@@ -77,10 +77,11 @@ Generate a 1–5 minute directional scalp signal.
 You MUST always return BUY or SELL — never HOLD. The downstream gate filters
 weak signals by confidence based on the current ADX regime, so your job is to
 score the direction honestly and report the strength you actually see:
-  ADX < 20   → ranging   (low conviction is fine; downstream gate is 65)
-  ADX 20-24 → weak-trend (downstream gate is 68)
-  ADX 25-34 → trending   (downstream gate is 72)
-  ADX ≥ 35  → strong     (downstream gate is 75)
+  ADX < 15   → chop         (signals suppressed downstream — never traded)
+  ADX 15-19 → ranging      (downstream gate is 78)
+  ADX 20-24 → weak-trend   (downstream gate is 75)
+  ADX 25-27 → trending     (downstream gate is 72)
+  ADX ≥ 28  → strong-trend (signals suppressed downstream — never traded)
 Only return HOLD in an exact 2.5/2.5 vote tie (extremely rare).
 
 Score 5 momentum factors and pick the majority direction:
@@ -329,6 +330,24 @@ export async function POST(req: NextRequest) {
         entry: body.price || 0, sl: body.price || 0, tp: body.price || 0,
         fallback: false,
         simulationBlocked: true,
+        ml: null,
+      })
+    }
+
+    // Thin-history block: EMA50/ADX computed on <100 bars are poorly converged
+    // — a direction from half-warmed indicators is noise with a confidence
+    // number attached. Callers forward the tick verbatim, so candleCount is
+    // present whenever the tick route produced the data. Absent field (older
+    // callers / tests) is not blocked.
+    if (typeof body.candleCount === 'number' && body.candleCount < 100) {
+      return NextResponse.json({
+        direction:  'HOLD' as Direction,
+        confidence: 0,
+        reasons:    [`Only ${body.candleCount} bars available — indicators not fully warmed (need 100+)`],
+        risk_note:  'Signal blocked: insufficient candle history for reliable indicators.',
+        entry: body.price || 0, sl: body.price || 0, tp: body.price || 0,
+        fallback: false,
+        insufficientBars: true,
         ml: null,
       })
     }
