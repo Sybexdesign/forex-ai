@@ -502,7 +502,28 @@ def predict_daily_auto(pair: str = Query(..., description="XAU/USD or XAG/USD"))
         if feat_df.empty:
             raise HTTPException(status_code=503, detail="No complete feature rows available")
 
-        last_row  = feat_df.iloc[-1]
+        last_row = feat_df.iloc[-1]
+
+        # Freshness guard (audit 2026-07-02): a prediction from a stale CSV is
+        # a prediction about a market that no longer exists. The seed/worker
+        # updates data on a schedule, not per-request, so verify the last bar
+        # here. Allowance is weekend-aware — metals don't print Sat/Sun bars,
+        # so on Sun/Mon the freshest complete daily bar is Friday's.
+        try:
+            last_bar_date = last_row.name.date()
+        except AttributeError:
+            raise HTTPException(status_code=503, detail=f"Cannot determine last bar date from index {last_row.name!r} — data integrity issue")
+        today = datetime.utcnow().date()
+        age_days = (today - last_bar_date).days
+        # Max acceptable age in calendar days by weekday (Mon=0 .. Sun=6):
+        # Sat→1 (Fri bar), Sun→2 (Fri bar), Mon→3 (Fri bar), else 1 trading day.
+        max_age = {5: 1, 6: 2, 0: 3}.get(today.weekday(), 1)
+        if age_days > max_age:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Market data stale: last {metal} bar is {last_bar_date} ({age_days}d old, max {max_age}d). Data seed/worker may be down — no prediction emitted.",
+            )
+
         feat_dict = last_row.to_dict()
         X         = np.array([[feat_dict.get(f, 0.0) for f in DAILY_FEATURE_NAMES]])
 
