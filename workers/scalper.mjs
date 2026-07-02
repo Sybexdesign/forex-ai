@@ -244,6 +244,7 @@ function inferHTFDirection(htfTick) {
 
 const lastSigFetch   = new Map()   // pair → ms timestamp
 const alertCooldowns = new Map()   // `${pair}:${direction}` → ms timestamp
+const mlMissingAlerts = new Map()  // pair → ms timestamp of last ML-veto-missing Telegram alert
 const stalePriceTrack = new Map()  // pair → { price: number, count: number }
 const htfCache        = new Map()  // `${pair}:${tf}` → { tick, at }
 const STALE_SKIP_COUNT = 12        // skip signal after N identical consecutive prices (~2 min at 10s sweeps)
@@ -1104,6 +1105,28 @@ async function processSignal(pair, tick, strategy, session, direction) {
       await logAutoTradeDecision('skipped-simulated-data', pair, dir, signal, { broker: tick.broker })
     }
     return
+  }
+
+  // ML-veto visibility (audit 2026-07-02). The XGBoost win-probability gate in
+  // /api/scalper/signal only runs when the ML service answered — signal.ml is
+  // null when it was down or timed out, meaning this signal was NEVER vetted by
+  // the second engine. Alert-only for now (frequency data will decide whether
+  // to block); the trade itself proceeds unchanged.
+  if (
+    signal.ml == null &&
+    WORKER_MODE === 'live' &&
+    liveStrategy.autoTradeEnabled &&
+    liveStrategy.autoTradePairs.includes(pair)
+  ) {
+    console.warn(`[ml] ${pair} ${dir} ${conf}% passed gates WITHOUT ML veto — ML service unreachable at signal time`)
+    wlog('warn', `ML veto missing: ${pair} ${dir} ${conf}% — signal not vetted by XGBoost (service unreachable)`, {
+      pair, session, metadata: { direction: dir, confidence: conf, reason: 'ml_veto_missing' },
+    })
+    const lastMlAlert = mlMissingAlerts.get(pair) || 0
+    if (Date.now() - lastMlAlert > ALERT_COOL_MS) {
+      mlMissingAlerts.set(pair, Date.now())
+      tgSend(`⚠️ <b>ML veto missing</b>\n\n${pair} ${dir} ${conf}% passed all gates but was <b>not vetted by the XGBoost engine</b> (ML service unreachable at signal time).\nTrade handling is unchanged — alert only.\n⏱ ${new Date().toUTCString()}`)
+    }
   }
 
   // Telegram-alert cooldown — Bug-fix 2026-06-08: this used to `return` from the
