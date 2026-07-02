@@ -427,7 +427,22 @@ Return JSON only:
         })
         const text  = message.content.find(b => b.type === 'text')?.text || '{}'
         const clean = text.replace(/```json|```/g, '').trim()
-        result      = JSON.parse(clean)
+        const parsed = JSON.parse(clean)
+        // Schema validation — parseable-but-junk JSON ({} or a non-enum
+        // direction) must not flow downstream: an unvalidated direction skips
+        // the discipline gate and the worker's mirror inversion maps any
+        // non-'BUY' string to 'BUY'.
+        const validDirection = parsed?.direction === 'BUY' || parsed?.direction === 'SELL' || parsed?.direction === 'HOLD'
+        const numConfidence  = Number(parsed?.confidence)
+        const validConfidence = Number.isFinite(numConfidence) && numConfidence >= 0 && numConfidence <= 100
+        if (!validDirection || !validConfidence) {
+          console.warn(`[scalper/signal] Claude response failed validation (direction=${JSON.stringify(parsed?.direction)}, confidence=${JSON.stringify(parsed?.confidence)}) — using rule-based fallback. Raw: ${clean.slice(0, 500)}`)
+          result   = fallbackSignal(t, strategy, pair)
+          fallback = true
+        } else {
+          parsed.confidence = numConfidence
+          result = parsed
+        }
       } catch (e: any) {
         console.error('[scalper/signal] Claude error:', e?.status, e?.message)
         result   = fallbackSignal(t, strategy, pair)
