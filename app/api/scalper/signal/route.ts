@@ -397,6 +397,10 @@ export async function POST(req: NextRequest) {
     let result: any
     let fallback = false
     let mlData: Awaited<ReturnType<typeof queryMlService>> = null
+    // Spot-check audit trail — captures the raw engine output and every gate
+    // action so any persisted signal can be verified against a chart.
+    let rawResponse: string | null = null
+    let disciplineAction: string | null = null
 
     const hasKey = !!(
       process.env.ANTHROPIC_API_KEY &&
@@ -446,6 +450,7 @@ Return JSON only:
         })
         const text  = message.content.find(b => b.type === 'text')?.text || '{}'
         const clean = text.replace(/```json|```/g, '').trim()
+        rawResponse = clean.slice(0, 500)
         const parsed = JSON.parse(clean)
         // Schema validation — parseable-but-junk JSON ({} or a non-enum
         // direction) must not flow downstream: an unvalidated direction skips
@@ -469,6 +474,11 @@ Return JSON only:
       }
     }
 
+    // Engine output before any gate touches it — the discipline and ML gates
+    // below may demote direction/confidence; the audit block records both.
+    const preGateDirection:  Direction | null = result.direction  ?? null
+    const preGateConfidence: number | null    = typeof result.confidence === 'number' ? result.confidence : null
+
     // ── Directional discipline — Scalp only ───────────────────────────────
     // Prevents the AI from reversing a 4/5 or 5/5 indicator consensus.
     // Near-threshold readings (RSI 48-52, BP 45-55%, tiny EMA gap) are
@@ -484,6 +494,7 @@ Return JSON only:
         const side    = consensusDir === 'BUY' ? bullVotes : bearVotes
         const voteStr = `${side}/5 ${consensusDir === 'BUY' ? 'bullish' : 'bearish'} (${labels.join(' ')})`
         console.log(`[scalper/signal] Directional discipline: AI=${aiDir} conflicts with ${voteStr} → HOLD`)
+        disciplineAction = `demoted-to-HOLD: AI ${aiDir} vs consensus ${voteStr}`
         result.direction = 'HOLD' as Direction
         result.reasons   = [
           ...(result.reasons || []).slice(0, 3),
@@ -537,6 +548,18 @@ Return JSON only:
     if (!result.sl) result.sl = result.direction === 'BUY' ? t.price - slPips : result.direction === 'SELL' ? t.price + slPips : t.price
     if (!result.tp) result.tp = result.direction === 'BUY' ? t.price + tpPips : result.direction === 'SELL' ? t.price - tpPips : t.price
 
+    // Spot-check audit trail (audit 2026-07-02): everything needed to verify
+    // this prediction against a chart — which engine decided, what it said
+    // verbatim, and what each gate did to it afterwards.
+    const audit = {
+      engine:            fallback ? 'rules' : 'claude',
+      rawResponse,       // Claude's raw text (≤500 chars); null on rules engine
+      disciplineAction,  // non-null when the consensus guard demoted to HOLD
+      mlWinProb:         mlData?.win_probability ?? null,
+      preGateDirection,
+      preGateConfidence,
+    }
+
     // Persist to signals table
     if (userId && result.direction !== 'HOLD') {
       try {
@@ -555,6 +578,7 @@ Return JSON only:
           indicator_snapshot: {
             ...body,
             _computed: { entry: result.entry, sl: result.sl, tp: result.tp },
+            _audit:    audit,
           },
         })
       } catch { /* non-critical */ }
@@ -571,6 +595,7 @@ Return JSON only:
       ...result,
       fallback,
       ml: mlData,
+      _audit: audit,
       marketRegime:         regimeMeta?.regime ?? null,
       effectiveMinStrength: regimeMeta?.effectiveMinStrength ?? null,
       suggestedSection:     regimeMeta?.suggestedSection ?? null,

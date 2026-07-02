@@ -1058,6 +1058,9 @@ async function processSignal(pair, tick, strategy, session, direction) {
           suggestedSection:     signal.suggestedSection     ?? null,
           adx:                  signal.adx                  ?? tick.adx ?? null,
         },
+        // Engine/gate audit trail from /api/scalper/signal — spot-check
+        // mechanism for verifying predictions against a chart.
+        _audit: signal._audit ?? null,
       },
     }).then(row => {
       if (row?.id) trackSignal(row.id, pair, dir, entry, sl, tp)
