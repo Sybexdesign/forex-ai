@@ -8,6 +8,7 @@ import { runRiskGuards, isTradeAllowed, getBlockReasons } from '@/lib/risk'
 import { calcPropFirmStatus, applyPropFirmGuards, DEFAULT_PROP_FIRM } from '@/lib/propfirm'
 import type { PropFirmSettings } from '@/lib/propfirm'
 import { getAdminClient } from '@/lib/supabase'
+import { minStopPips } from '@/lib/trade-levels'
 import { alertOrderPlaced, alertOrderBlocked, alertOrderFailed, alertProfitTargetDisabled } from '@/lib/telegram'
 
 function dbToSettings(d: any): PropFirmSettings {
@@ -244,24 +245,15 @@ export async function POST(req: NextRequest) {
     }
 
     // ─── Broker min-stop-distance guard (hoisted above lot calc) ─────────
-    // Brokers reject orders where SL/TP sit inside their freeze level (MT5 retcode 10016),
-    // which can change with spread spikes. Conservative per-instrument floors below; if the
-    // strategy's SL/TP comes in tighter, widen with a 10% safety margin.
+    // Floors + widening logic live in lib/trade-levels.ts (shared with the
+    // AutoTrade page so cards display the same post-widening stop distance
+    // that gets placed here).
     //
     // Hoisted ABOVE the lot calculation so both manual-override and auto-sizing
     // dimension positions against the actual stop distance that will be placed,
     // not the (pre-widening) strategy.slPips. Previously sized for tight SL but
     // placed at the wider safeSlPips → over-sized positions by up to 2×.
-    const MIN_STOP_PIPS: Record<string, number> = {
-      XAU: 35,    // TEMP DIAGNOSTIC 2026-06-11: raised 20 → 35 alongside MIRROR_SL_CAP to test retcode 10013 on XAU. Revert to 20 once root cause confirmed.
-      XAG: 10,    // XAG/USD: 0.10 USD = 10 pips at pip=0.01
-      JPY: 5,     // *JPY: 5 pips at pip=0.01
-      FX:  3,     // major FX: 3 pips at pip=0.0001
-    }
-    const minSlKey = pair.startsWith('XAU') ? 'XAU'
-                   : pair.startsWith('XAG') ? 'XAG'
-                   : pair.includes('JPY')   ? 'JPY' : 'FX'
-    const minStop  = MIN_STOP_PIPS[minSlKey]
+    const minStop = minStopPips(pair)
     let safeSlPips = strategy.slPips
     let safeTpPips = strategy.tpPips
     if (safeSlPips < minStop) {

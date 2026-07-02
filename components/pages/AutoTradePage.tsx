@@ -5,6 +5,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Panel, LoadingDots, CopyValue } from '../ui'
 import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
+import { execSlTpPips } from '@/lib/trade-levels'
 import { authFetch } from '@/lib/api'
 import type { ScanSignal, ScanDiagnostic } from '@/hooks/useScanner'
 import { getSupabase } from '@/lib/supabase'
@@ -19,21 +20,9 @@ const SCALP_REFRESH_MS = 15_000  // refresh scalp signals every 15 seconds
 const SCALP_EXPIRY_MS  = 3 * 60_000  // 3-minute signal validity
 const PAIR_COOLDOWN_MS = 5 * 60_000  // minimum gap between two auto-trades on the same pair (any section) — caps the 30-60/hour overtrading
 
-// SL/TP clamp bounds for scalp + mirror auto paths (Option C — see ATR audit).
-// strategy.slPips/tpPips act as the FLOOR (minimum SL/TP). The engine's
-// ATR-derived value is allowed to widen up to MIRROR_*_CAP. This stops the
-// previous behaviour where strategy.slPips=18 was acting as a ceiling on top
-// of an engine that already produces 30-80 pip SLs — placing a tight stop
-// inside one bar of XAU/USD noise on every trade.
-//
-// 35-pip cap chosen because 5-day XAU ATR has a 5th percentile of ~24 pips,
-// so even calm-market signals will produce SLs below the cap. Above the cap
-// the position size becomes too small to be useful.
-// TEMP DIAGNOSTIC 2026-06-11: raised 25 → 35 to test whether retcode 10013 on
-// XAU mirror orders is a broker stops-level issue. Revert to 25 once root
-// cause confirmed. Mirrored in workers/scalper.mjs:46 — keep in sync.
-const MIRROR_SL_CAP = 35
-const MIRROR_TP_CAP = 70  // unchanged; widening only SL for the test
+// SL/TP clamp bounds (Option C) now live in lib/trade-levels.ts together with
+// the broker min-stop widening — shared with /api/orders so cards display the
+// exact post-clamp, post-widening stop distance that gets placed.
 
 // Re-anchor scalp/mirror entry/SL/TP onto the live bid/ask quote when a
 // fresh price exists in the OANDA prices feed. The signal-time values
@@ -43,16 +32,18 @@ const MIRROR_TP_CAP = 70  // unchanged; widening only SL for the test
 // actually fill at, and made OANDA/Capital adapters anchor SL/TP off a
 // stale price (MT5 Direct does its own re-anchoring server-side).
 //
-// SL/TP DISTANCES are preserved — only the absolute prices shift. If the
+// SL/TP levels are computed from the caller-supplied EXECUTION distances
+// (post clamp + min-stop widening via execSlTpPips) — not the raw engine
+// distances — so what renders on the card is what the broker places. If the
 // live feed is missing/stale (bid<=0), falls back to sig.entry exactly as
 // before, so the card never shows a worse value than the signal price.
 function liveAnchoredLevels(
   sig: { pair: string; entry: number; sl: number; tp: number; direction: 'BUY' | 'SELL' | 'HOLD' },
   prices: Record<string, { bid?: number; ask?: number } | undefined> | undefined,
   forDirection: 'BUY' | 'SELL',
+  dist: { slDist: number; tpDist: number },
 ): { entry: number; sl: number; tp: number; isLive: boolean } {
-  const slDist = Math.abs(sig.entry - sig.sl)
-  const tpDist = Math.abs(sig.entry - sig.tp)
+  const { slDist, tpDist } = dist
   const px  = prices?.[sig.pair]
   const bid = Number(px?.bid ?? 0)
   const ask = Number(px?.ask ?? 0)
@@ -577,17 +568,18 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     setPlacingScalp(sig.pair)
     try {
       const pip = getPipValue(sig.pair)
-      // Option C clamp: strategy.slPips/tpPips are the FLOOR, MIRROR_*_CAP is the
-      // outer ceiling, and the engine's ATR-derived value sits in between. The raw
-      // derived value is still passed as source_sl_pips for clamp-impact auditing.
+      // Option C clamp + broker min-stop widening (lib/trade-levels.ts) — the
+      // exact pips /api/orders will place. The raw derived value is still
+      // passed as source_sl_pips for clamp-impact auditing.
       const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
       const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
-      const scalpSlPips   = Math.min(MIRROR_SL_CAP, Math.max(strategy.slPips, derivedSlPips))
-      const scalpTpPips   = Math.min(MIRROR_TP_CAP, Math.max(strategy.tpPips, derivedTpPips))
+      const { slPips: scalpSlPips, tpPips: scalpTpPips } =
+        execSlTpPips(sig.pair, derivedSlPips, derivedTpPips, strategy.slPips, strategy.tpPips)
       // Re-anchor to live bid/ask so OANDA/Capital adapters compute SL/TP off
       // the actual fill price, not the candle close. MT5 Direct does its own
       // re-anchoring server-side; this is a no-op there.
-      const live = liveAnchoredLevels(sig, prices, sig.direction === 'BUY' ? 'BUY' : 'SELL')
+      const live = liveAnchoredLevels(sig, prices, sig.direction === 'BUY' ? 'BUY' : 'SELL',
+        { slDist: scalpSlPips * pip, tpDist: scalpTpPips * pip })
       const data = await authFetch('/api/orders', {
         method: 'POST',
         body: JSON.stringify({
@@ -636,14 +628,15 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     try {
       const mirrorDir: 'BUY' | 'SELL' = sig.direction === 'BUY' ? 'SELL' : 'BUY'
       const pip = getPipValue(sig.pair)
-      // Option C clamp: strategy.slPips/tpPips floor, MIRROR_*_CAP outer ceiling.
+      // Option C clamp + broker min-stop widening (lib/trade-levels.ts).
       const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
       const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
-      const slPips        = Math.min(MIRROR_SL_CAP, Math.max(strategy.slPips, derivedSlPips))
-      const tpPips        = Math.min(MIRROR_TP_CAP, Math.max(strategy.tpPips, derivedTpPips))
+      const { slPips, tpPips } =
+        execSlTpPips(sig.pair, derivedSlPips, derivedTpPips, strategy.slPips, strategy.tpPips)
       // Re-anchor to live bid/ask in the mirror direction so the mirrored
       // SL/TP track the actual fill price instead of the candle close.
-      const live = liveAnchoredLevels(sig, prices, mirrorDir)
+      const live = liveAnchoredLevels(sig, prices, mirrorDir,
+        { slDist: slPips * pip, tpDist: tpPips * pip })
       const mirrorSl = live.sl
       const mirrorTp = live.tp
       const data = await authFetch('/api/orders', {
@@ -692,11 +685,11 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   // Shared order placement for auto-trader — no UI loading state side-effects
   async function autoPlaceOrder(sig: ScalpSignal, isMirror: boolean): Promise<boolean> {
     const pip = getPipValue(sig.pair)
-    // Option C clamp: strategy.slPips/tpPips floor, MIRROR_*_CAP outer ceiling.
+    // Option C clamp + broker min-stop widening (lib/trade-levels.ts).
     const derivedSlPips = sig.sl !== sig.entry ? Math.abs(sig.entry - sig.sl) / pip : strategy.slPips
     const derivedTpPips = sig.tp !== sig.entry ? Math.abs(sig.entry - sig.tp) / pip : strategy.tpPips
-    const slPips        = Math.min(MIRROR_SL_CAP, Math.max(strategy.slPips, derivedSlPips))
-    const tpPips        = Math.min(MIRROR_TP_CAP, Math.max(strategy.tpPips, derivedTpPips))
+    const { slPips, tpPips } =
+      execSlTpPips(sig.pair, derivedSlPips, derivedTpPips, strategy.slPips, strategy.tpPips)
     const direction: 'BUY' | 'SELL' = isMirror
       ? (sig.direction === 'BUY' ? 'SELL' : 'BUY')
       : (sig.direction as 'BUY' | 'SELL')
@@ -704,7 +697,8 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     const signalRef = `${prefix}-${sig.pair.replace('/', '')}-${sig.fetchedAt}`
     // Re-anchor to live bid/ask in the order direction so the broker adapter
     // computes SL/TP off the actual fill price.
-    const live = liveAnchoredLevels(sig, prices, direction)
+    const live = liveAnchoredLevels(sig, prices, direction,
+      { slDist: slPips * pip, tpDist: tpPips * pip })
     const body: Record<string, any> = {
       pair: sig.pair, direction,
       strategy:             { ...strategy, slPips, tpPips },
@@ -1595,14 +1589,23 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           const bgColor     = dir === 'BUY' ? 'rgba(0,200,83,0.05)' : dir === 'SELL' ? 'rgba(255,48,86,0.05)' : 'rgba(255,255,255,0.02)'
           const dp = pair.startsWith('XAU') ? 2 : 3
 
-          // Lot size: derive SL pips from the signal's actual SL distance, apply prop firm risk cap
-          const signalSlPips = sig && dir !== 'HOLD' && sig.entry !== sig.sl
-            ? Math.abs(sig.entry - sig.sl) / getPipValue(pair)
+          // Execution pips: Option C clamp + broker min-stop widening
+          // (lib/trade-levels.ts) — the exact stop distance /api/orders will
+          // place. Displayed SL/TP, lots and risk all derive from these so
+          // the card matches execution instead of the raw engine distances.
+          const pipVal = getPipValue(pair)
+          const derivedSlPips = sig && dir !== 'HOLD' && sig.entry !== sig.sl
+            ? Math.abs(sig.entry - sig.sl) / pipVal
             : strategy.slPips
+          const derivedTpPips = sig && dir !== 'HOLD' && sig.entry !== sig.tp
+            ? Math.abs(sig.entry - sig.tp) / pipVal
+            : strategy.tpPips
+          const { slPips: execSlPips, tpPips: execTpPips } =
+            execSlTpPips(pair, derivedSlPips, derivedTpPips, strategy.slPips, strategy.tpPips)
           const effectiveRiskPct = pfEnabled && pfRiskCap !== null && pfRiskCap < strategy.riskPct
             ? pfRiskCap
             : strategy.riskPct
-          const scalpLots    = calcStandardPositionSize(accountBalance, effectiveRiskPct, Math.max(1, signalSlPips), pair)
+          const scalpLots    = calcStandardPositionSize(accountBalance, effectiveRiskPct, Math.max(1, execSlPips), pair)
           const scalpRiskAmt = accountBalance * effectiveRiskPct / 100
           const pfCapped     = pfEnabled && pfRiskCap !== null && pfRiskCap < strategy.riskPct
           return (
@@ -1662,11 +1665,13 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
               </div>
 
               {/* Price levels: entry / SL / TP — re-anchored to live bid/ask
-                  every render so the displayed values match what the broker
-                  will actually fill at. Falls back to signal levels if the
-                  live OANDA feed is missing or zero. */}
+                  every render, at the EXECUTION stop distances (clamp +
+                  min-stop widening), so the displayed values match what the
+                  broker will actually place. Falls back to the signal entry
+                  if the live OANDA feed is missing or zero. */}
               {sig && !sig.blocked && dir !== 'HOLD' && (() => {
-                const live = liveAnchoredLevels(sig, prices, dir as 'BUY' | 'SELL')
+                const live = liveAnchoredLevels(sig, prices, dir as 'BUY' | 'SELL',
+                  { slDist: execSlPips * pipVal, tpDist: execTpPips * pipVal })
                 return (
                   <div style={{ display: 'flex', gap: 6 }}>
                     {([
@@ -1692,7 +1697,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
               {sig && !sig.blocked && dir !== 'HOLD' && (() => {
                 const useManual    = typeof strategy.manualLots === 'number' && strategy.manualLots > 0
                 const displayLots  = useManual ? (strategy.manualLots as number) : scalpLots
-                const displayRisk  = useManual ? displayLots * 10 * Math.max(1, signalSlPips) : scalpRiskAmt
+                const displayRisk  = useManual ? displayLots * 10 * Math.max(1, execSlPips) : scalpRiskAmt
                 return (
                 <div style={{
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -1720,7 +1725,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                     <div style={{ color: 'var(--color-loss)' }}>${displayRisk.toFixed(2)} at risk</div>
                     <div>
                       {useManual
-                        ? `${signalSlPips.toFixed(1)}p SL × $10/pip-lot`
+                        ? `${execSlPips.toFixed(1)}p SL × $10/pip-lot`
                         : `${effectiveRiskPct}% of $${accountBalance.toLocaleString()}`}
                     </div>
                     {pfCapped && !useManual && (
@@ -1790,13 +1795,21 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
             const bgColor     = dir === 'BUY' ? 'rgba(0,200,83,0.03)' : dir === 'SELL' ? 'rgba(255,48,86,0.03)' : 'rgba(255,255,255,0.01)'
             const dp = pair.startsWith('XAU') ? 2 : 3
 
-            const signalSlPips = sig && dir !== 'HOLD' && sig.entry !== sig.sl
-              ? Math.abs(sig.entry - sig.sl) / getPipValue(pair)
+            // Execution pips — same clamp + min-stop widening as the scalp
+            // card and /api/orders (lib/trade-levels.ts).
+            const pipVal = getPipValue(pair)
+            const derivedSlPips = sig && dir !== 'HOLD' && sig.entry !== sig.sl
+              ? Math.abs(sig.entry - sig.sl) / pipVal
               : strategy.slPips
+            const derivedTpPips = sig && dir !== 'HOLD' && sig.entry !== sig.tp
+              ? Math.abs(sig.entry - sig.tp) / pipVal
+              : strategy.tpPips
+            const { slPips: execSlPips, tpPips: execTpPips } =
+              execSlTpPips(pair, derivedSlPips, derivedTpPips, strategy.slPips, strategy.tpPips)
             const effectiveRiskPct = pfEnabled && pfRiskCap !== null && pfRiskCap < strategy.riskPct
               ? pfRiskCap
               : strategy.riskPct
-            const scalpLots    = calcStandardPositionSize(accountBalance, effectiveRiskPct, Math.max(1, signalSlPips), pair)
+            const scalpLots    = calcStandardPositionSize(accountBalance, effectiveRiskPct, Math.max(1, execSlPips), pair)
             const scalpRiskAmt = accountBalance * effectiveRiskPct / 100
             const pfCapped     = pfEnabled && pfRiskCap !== null && pfRiskCap < strategy.riskPct
 
@@ -1858,9 +1871,11 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                 </div>
 
                 {/* Price levels with mirrored SL/TP — re-anchored to live
-                    bid/ask in the mirror direction every render. */}
+                    bid/ask in the mirror direction every render, at the
+                    EXECUTION stop distances (clamp + min-stop widening). */}
                 {sig && !sig.blocked && dir !== 'HOLD' && (() => {
-                  const live = liveAnchoredLevels(sig, prices, dir as 'BUY' | 'SELL')
+                  const live = liveAnchoredLevels(sig, prices, dir as 'BUY' | 'SELL',
+                    { slDist: execSlPips * pipVal, tpDist: execTpPips * pipVal })
                   return (
                     <div style={{ display: 'flex', gap: 6 }}>
                       {([
@@ -1886,7 +1901,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                 {sig && !sig.blocked && dir !== 'HOLD' && (() => {
                   const useManual    = typeof strategy.manualLots === 'number' && strategy.manualLots > 0
                   const displayLots  = useManual ? (strategy.manualLots as number) : scalpLots
-                  const displayRisk  = useManual ? displayLots * 10 * Math.max(1, signalSlPips) : scalpRiskAmt
+                  const displayRisk  = useManual ? displayLots * 10 * Math.max(1, execSlPips) : scalpRiskAmt
                   return (
                   <div style={{
                     display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -1914,7 +1929,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                       <div style={{ color: 'var(--color-loss)' }}>${displayRisk.toFixed(2)} at risk</div>
                       <div>
                         {useManual
-                          ? `${signalSlPips.toFixed(1)}p SL × $10/pip-lot`
+                          ? `${execSlPips.toFixed(1)}p SL × $10/pip-lot`
                           : `${effectiveRiskPct}% of $${accountBalance.toLocaleString()}`}
                       </div>
                       {pfCapped && !useManual && (

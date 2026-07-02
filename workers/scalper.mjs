@@ -1152,19 +1152,26 @@ async function processSignal(pair, tick, strategy, session, direction) {
   // when the cheap upstream gates would otherwise have passed, so we don't
   // waste DB round-trips during disabled / paper-mode / pair-filtered states.
   let directionConfirmation = null
-  let confirmationGateBlocked = false
   if (
     WORKER_MODE === 'live' &&
     liveStrategy.autoTradeEnabled &&
     liveStrategy.autoTradePairs.includes(pair)
   ) {
     directionConfirmation = await fetchLatestDirectionConfirmation(pair)
-    if (!directionConfirmation) {
-      confirmationGateBlocked = true
-    } else if (directionConfirmation.direction !== dir) {
-      confirmationGateBlocked = true
-    }
   }
+
+  // The confirmation row stores the WINNING group's direction — already
+  // inverted when recommended='mirror' (direction-check API persists the
+  // majority of the INVERTED results in that case). Translate back to
+  // scalp-signal space before comparing against the worker's signal `dir`,
+  // otherwise a mirror-recommended confirmation can never match and the gate
+  // silently blocks every trade it was meant to allow.
+  const invertDir = (d) => (d === 'BUY' ? 'SELL' : d === 'SELL' ? 'BUY' : 'HOLD')
+  const confirmationExpectedDir = directionConfirmation
+    ? (directionConfirmation.recommended === 'mirror'
+        ? invertDir(directionConfirmation.direction)
+        : directionConfirmation.direction)
+    : null
 
   if (WORKER_MODE !== 'live') {
     logAutoTradeDecision('skipped-paper-mode', pair, dir, signal)
@@ -1181,12 +1188,15 @@ async function processSignal(pair, tick, strategy, session, direction) {
         ? 'No active 5m direction confirmation. Click TEST/CHECK MARKET DIRECTION to enable auto-trade for the next 5 min.'
         : 'WORKER_USER_ID not configured — worker cannot associate confirmations',
     })
-  } else if (directionConfirmation.direction !== dir) {
+  } else if (confirmationExpectedDir !== dir) {
     // Confirmation exists but disagrees with the worker's current signal —
     // operator confirmed BUY, worker is now seeing SELL (or vice versa).
+    // Also covers HOLD confirmations (HOLD never matches BUY/SELL).
     // Conservative: skip and wait for the operator to re-confirm.
     logAutoTradeDecision('skipped-confirmation-direction-mismatch', pair, dir, signal, {
       confirmedDirection: directionConfirmation.direction,
+      recommended:        directionConfirmation.recommended,
+      expectedDir:        confirmationExpectedDir,
       confirmedAt:        directionConfirmation.analyzed_at,
       confirmedExpires:   directionConfirmation.expires_at,
     })
@@ -1251,6 +1261,16 @@ async function processSignal(pair, tick, strategy, session, direction) {
             for (const section of liveStrategy.autoTradeSections) {
               if (section !== 'scalp' && section !== 'mirror') {
                 logAutoTradeDecision('skipped-section-disabled', pair, dir, signal, { section })
+                continue
+              }
+              // Only the confirmation's recommended section may fire —
+              // otherwise a scalp-recommended BUY confirmation would also
+              // place the contradicting mirror SELL in the same pass.
+              if (section !== directionConfirmation.recommended) {
+                logAutoTradeDecision('skipped-section-not-recommended', pair, dir, signal, {
+                  section,
+                  recommended: directionConfirmation.recommended,
+                })
                 continue
               }
               if (openLocal >= liveStrategy.maxPositions) {
