@@ -218,6 +218,24 @@ export class Mt5DirectBroker implements IBroker {
     const sym      = req.pair.replace('/', '')
     const live     = this.config?.latestPrices?.[sym]
     const liveAgeMs = live?.updatedAt ? Date.now() - new Date(live.updatedAt).getTime() : Infinity
+
+    // Hard block on a stale EA quote for this symbol. The EA anchors OrderSend
+    // to SymbolInfoDouble, which returns 0 when the terminal can't price the
+    // symbol (wrong name/suffix, not in Market Watch) → retcode 10013. A feed
+    // that streams for other symbols but not this one means the order is
+    // guaranteed to be rejected EA-side, so fail fast with a diagnosable error.
+    const MAX_QUOTE_AGE_MS = 2 * 60_000
+    if (liveAgeMs > MAX_QUOTE_AGE_MS) {
+      const ageStr = liveAgeMs === Infinity
+        ? 'never received'
+        : `${Math.round(liveAgeMs / 60_000)} min old`
+      console.warn(`[mt5direct] BLOCKED ${req.pair} ${req.direction} — EA quote for ${sym} is ${ageStr}`)
+      return {
+        success: false,
+        error: `MT5 Direct: EA price feed for ${sym} is stale (${ageStr}) — the EA cannot price this symbol. Check MT5 is connected, ${sym} exists in Market Watch, and the EA SymbolSuffix input matches the broker's symbol naming.`,
+      }
+    }
+
     const useLive  = !!live && liveAgeMs < 15_000 && live.bid > 0 && live.ask > 0
     const anchor   = useLive
       ? (req.direction === 'BUY' ? live!.ask : live!.bid)
