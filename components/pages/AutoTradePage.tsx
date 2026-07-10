@@ -196,7 +196,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
 
   // Direction-confirmation analysis: per-pair result of the 5+5 strategy
   // fan-out (see /api/scalper/direction-check). Re-runs only when the user
-  // clicks the button — no auto-polling because each click costs 5 Claude
+  // clicks the button — no auto-polling because each click costs 5 LLM
   // calls × number of metals (=10 calls per analysis).
   //
   // Cache-prevention guarantee (per operator brief): direction-check state

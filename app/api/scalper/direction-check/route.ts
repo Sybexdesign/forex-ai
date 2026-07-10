@@ -8,7 +8,7 @@
 // blended confidence score, and human-readable reasoning.
 //
 // Pure server-side wiring — uses the existing /api/scalper/tick + signal
-// endpoints. No new Claude prompts here; the 5 strategy prompts are the
+// endpoints. No new LLM prompts here; the 5 strategy prompts are the
 // canonical ones that already power the per-strategy signal route.
 export const dynamic = 'force-dynamic'
 
