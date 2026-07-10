@@ -76,7 +76,12 @@ async function completeDeepseek(args: LlmCompleteArgs): Promise<LlmCompleteResul
     body: JSON.stringify({
       model:       DEEPSEEK_MODEL,
       max_tokens:  args.maxTokens,
-      temperature: 0.1,
+      // 0.35 not 0.1 — direction is enforced deterministically by the prompt
+      // rules; the entropy budget is spent on confidence-score calibration.
+      // Observed: temp 0.1 pinned every signal at confidence=72 across 33
+      // consecutive calls while the rules engine varied 64–95 on the same
+      // ticks. Higher temp restores variance without destabilising direction.
+      temperature: 0.35,
       messages: [
         { role: 'system', content: args.system },
         { role: 'user',   content: args.user },
