@@ -2,10 +2,8 @@
 export const dynamic = 'force-dynamic'
 
 import { NextRequest, NextResponse } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
 import { getAdminClient } from '@/lib/supabase'
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+import { llmComplete, hasLlmKey, providerLabel } from '@/lib/llm'
 
 type Strategy = 'Momentum' | 'Mean Reversion' | 'Breakout' | 'Order Flow' | 'Scalp'
 type Direction = 'BUY' | 'SELL' | 'HOLD'
@@ -402,13 +400,10 @@ export async function POST(req: NextRequest) {
     let rawResponse: string | null = null
     let disciplineAction: string | null = null
 
-    const hasKey = !!(
-      process.env.ANTHROPIC_API_KEY &&
-      process.env.ANTHROPIC_API_KEY !== 'your_anthropic_api_key_here'
-    )
+    const hasKey = hasLlmKey()
 
     if (!hasKey) {
-      console.warn('[scalper/signal] ANTHROPIC_API_KEY not set or is placeholder — using rule-based fallback')
+      console.warn(`[scalper/signal] LLM key for provider "${providerLabel()}" not set or is placeholder — using rule-based fallback`)
       result   = fallbackSignal(t, strategy, pair)
       fallback = true
     } else {
@@ -442,14 +437,12 @@ Return JSON only:
 }`
 
       try {
-        const message = await anthropic.messages.create({
-          model:      'claude-sonnet-4-6',
-          max_tokens: 600,
-          system:     systemPrompt,
-          messages:   [{ role: 'user', content: userMsg }],
+        const { text } = await llmComplete({
+          system:    systemPrompt,
+          user:      userMsg,
+          maxTokens: 600,
         })
-        const text  = message.content.find(b => b.type === 'text')?.text || '{}'
-        const clean = text.replace(/```json|```/g, '').trim()
+        const clean = (text || '{}').replace(/```json|```/g, '').trim()
         rawResponse = clean.slice(0, 500)
         const parsed = JSON.parse(clean)
         // Schema validation — parseable-but-junk JSON ({} or a non-enum
@@ -460,7 +453,7 @@ Return JSON only:
         const numConfidence  = Number(parsed?.confidence)
         const validConfidence = Number.isFinite(numConfidence) && numConfidence >= 0 && numConfidence <= 100
         if (!validDirection || !validConfidence) {
-          console.warn(`[scalper/signal] Claude response failed validation (direction=${JSON.stringify(parsed?.direction)}, confidence=${JSON.stringify(parsed?.confidence)}) — using rule-based fallback. Raw: ${clean.slice(0, 500)}`)
+          console.warn(`[scalper/signal] LLM response failed validation (direction=${JSON.stringify(parsed?.direction)}, confidence=${JSON.stringify(parsed?.confidence)}) — using rule-based fallback. Raw: ${clean.slice(0, 500)}`)
           result   = fallbackSignal(t, strategy, pair)
           fallback = true
         } else {
@@ -468,7 +461,7 @@ Return JSON only:
           result = parsed
         }
       } catch (e: any) {
-        console.error('[scalper/signal] Claude error:', e?.status, e?.message)
+        console.error(`[scalper/signal] LLM error (${providerLabel()}):`, e?.status, e?.message)
         result   = fallbackSignal(t, strategy, pair)
         fallback = true
       }
@@ -552,8 +545,8 @@ Return JSON only:
     // this prediction against a chart — which engine decided, what it said
     // verbatim, and what each gate did to it afterwards.
     const audit = {
-      engine:            fallback ? 'rules' : 'claude',
-      rawResponse,       // Claude's raw text (≤500 chars); null on rules engine
+      engine:            fallback ? 'rules' : providerLabel(),
+      rawResponse,       // LLM raw text (≤500 chars); null on rules engine
       disciplineAction,  // non-null when the consensus guard demoted to HOLD
       mlWinProb:         mlData?.win_probability ?? null,
       preGateDirection,

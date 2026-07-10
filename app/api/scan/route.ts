@@ -5,14 +5,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getMarketCandles } from '@/lib/marketdata'
 import { calculateIndicators, evaluateChecklist, buildIndicatorPrompt } from '@/lib/indicators'
-import Anthropic from '@anthropic-ai/sdk'
+import { llmComplete, hasLlmKey } from '@/lib/llm'
 import type { StrategySettings } from '@/lib/supabase'
 import { alertNewSignal, alertScanComplete } from '@/lib/telegram'
 import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { detectSupportResistance, calcATRIndicator } from '@/lib/advanced-indicators'
 import { isIndexInSession, getPairDecimalPlaces } from '@/lib/instruments'
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 // Only these two pairs are permitted
 const METALS_ONLY = ['XAU/USD', 'XAG/USD']
@@ -282,8 +280,7 @@ async function scanPair(
   // 9. AI analysis — with rule-based fallback if AI is unavailable (no key / out of credits)
   let rec: any = null
   let aiUnavailable = false
-  const hasKey = !!(process.env.ANTHROPIC_API_KEY &&
-    process.env.ANTHROPIC_API_KEY !== 'your_anthropic_api_key_here')
+  const hasKey = hasLlmKey()
 
   if (hasKey) {
     const assetName  = pair === 'XAU/USD' ? 'Gold' : 'Silver'
@@ -304,14 +301,12 @@ Only recommend BUY/SELL if confidence ≥ 55. For WAIT: explain the main reason 
 
     try {
       const prompt = buildIndicatorPrompt(pair, timeframe, indicators, checklist, direction)
-      const msg = await anthropic.messages.create({
-        model:      'claude-sonnet-4-6',
-        max_tokens: 600,
-        system:     systemPrompt,
-        messages:   [{ role: 'user', content: prompt }],
+      const { text } = await llmComplete({
+        system:    systemPrompt,
+        user:      prompt,
+        maxTokens: 600,
       })
-      const text = msg.content.find(b => b.type === 'text')?.text || '{}'
-      rec = JSON.parse(text.replace(/```json|```/g, '').trim())
+      rec = JSON.parse((text || '{}').replace(/```json|```/g, '').trim())
     } catch (e: any) {
       const msg = e?.message || ''
       if (msg.includes('credit') || msg.includes('billing') || msg.includes('quota') || msg.includes('429') || msg.includes('insufficient')) {

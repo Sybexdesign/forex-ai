@@ -1,14 +1,12 @@
 // app/api/analyze/route.ts
 import { NextRequest, NextResponse } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
 import { evaluateChecklist, buildIndicatorPrompt } from '@/lib/indicators'
 import { getAdminClient } from '@/lib/supabase'
 import { isMetal, goldAIContext } from '@/lib/metals'
 import { isIndex, getIndexSession, isIndexInSession, getPairDecimalPlaces } from '@/lib/instruments'
+import { llmComplete, hasLlmKey } from '@/lib/llm'
 import type { IndicatorValues } from '@/lib/indicators'
 import type { StrategySettings } from '@/lib/supabase'
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 // ── Instrument classification ─────────────────────────────────────────────────
 
@@ -161,17 +159,15 @@ JSON format:
 
     let recommendation: any
 
-    if (!process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY === 'your_anthropic_api_key_here') {
+    if (!hasLlmKey()) {
       recommendation = generateDemoRecommendation(indicators, checklist, direction, pair, strategy)
     } else {
-      const message = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1000,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMsg }],
+      const { text } = await llmComplete({
+        system:    systemPrompt,
+        user:      userMsg,
+        maxTokens: 1000,
       })
-      const text = message.content.find(b => b.type === 'text')?.text || '{}'
-      const clean = text.replace(/```json|```/g, '').trim()
+      const clean = (text || '{}').replace(/```json|```/g, '').trim()
       try {
         recommendation = JSON.parse(clean)
       } catch {
