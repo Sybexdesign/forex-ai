@@ -168,11 +168,13 @@ function useSignalReconciliation(userId?: string) {
 
   useEffect(() => {
     if (!userId) { setStats(null); return }
+    const uid = userId
     let cancelled = false
     async function fetch_() {
       setLoading(true)
       try {
-        const res = await fetch(`/api/signal-reconciliation?userId=${encodeURIComponent(userId)}`)
+        const res = await fetch(`/api/signal-reconciliation?userId=${encodeURIComponent(uid)}`)
+
         if (!res.ok) return
         const data = await res.json()
         if (!cancelled) setStats(data)
