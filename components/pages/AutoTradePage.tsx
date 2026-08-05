@@ -136,10 +136,94 @@ function Pager({ page, total, onPage }: { page: number; total: number; onPage: (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 10, paddingTop: 8 }}>
       <button onClick={() => onPage(page - 1)} disabled={page === 0} className="btn btn-ghost" style={{ fontSize: 11, padding: '4px 12px' }}>← Prev</button>
       <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{page + 1} / {pages}</span>
-      <button onClick={() => onPage(page + 1)} disabled={page >= pages - 1} className="btn btn-ghost" style={{ fontSize: 11, padding: '4px 12px' }}>Next →</button>
+      <button onClick={() => onPage(page >= pages - 1)} disabled={page >= pages - 1} className="btn btn-ghost" style={{ fontSize: 11, padding: '4px 12px' }}>Next →</button>
     </div>
   )
 }
+
+// ── Signal Reconciliation badge ───────────────────────────────────────────────
+// Fetches rolling win-rate stats for scalp vs mirror from /api/signal-reconciliation
+// and renders a compact comparison badge. The badge shows which signal path is
+// currently winning (higher win-rate over the last 50 resolved signals) so the
+// operator can see at a glance whether the mirror edge is holding.
+interface ReconStats {
+  winRate: number | null
+  n: number
+  wins: number
+  losses: number
+  inconclusive: number
+  inconclusiveRate: number | null
+}
+
+interface ReconResponse {
+  noiseThresholdPips: number
+  windows: Record<string, { scalp: ReconStats; mirror: ReconStats }>
+  scalp: ReconStats
+  mirror: ReconStats
+}
+
+function useSignalReconciliation(userId?: string) {
+  const [stats, setStats] = useState<ReconResponse | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!userId) { setStats(null); return }
+    let cancelled = false
+    async function fetch_() {
+      setLoading(true)
+      try {
+        const res = await fetch(`/api/signal-reconciliation?userId=${encodeURIComponent(userId)}`)
+        if (!res.ok) return
+        const data = await res.json()
+        if (!cancelled) setStats(data)
+      } catch { /* keep stale on network error */ } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    fetch_()
+    const id = setInterval(fetch_, 60_000) // refresh every minute
+    return () => { cancelled = true; clearInterval(id) }
+  }, [userId])
+
+  return { stats, loading }
+}
+
+// Compact badge rendered in the SCALP SIGNALS / MIRROR TRADES section headers.
+// Shows the win-rate for the given signal type plus a comparison arrow against
+// the other type. Green when this type is winning, red when losing, muted when
+// no data yet.
+function ReconBadge({ stats, type }: { stats: ReconResponse | null; type: 'scalp' | 'mirror' }) {
+  if (!stats) return null
+  const mine   = stats[type]
+  const other  = stats[type === 'scalp' ? 'mirror' : 'scalp']
+  if (!mine || mine.n === 0) return null
+
+  const mineRate  = mine.winRate
+  const otherRate = other?.winRate ?? null
+  const diff      = mineRate !== null && otherRate !== null ? mineRate - otherRate : null
+  const isWinning = diff !== null && diff > 0
+  const isLosing  = diff !== null && diff < 0
+  const color     = isWinning ? 'var(--color-buy)' : isLosing ? 'var(--color-sell)' : 'var(--text-muted)'
+  const arrow     = isWinning ? '▲' : isLosing ? '▼' : '—'
+
+  return (
+    <span
+      title={`Last ${mine.n} resolved signals · ${mine.wins}W/${mine.losses}L/${mine.inconclusive} inc · noise threshold ${stats.noiseThresholdPips} pips`}
+      style={{
+        fontSize: 9, fontWeight: 700, letterSpacing: 1,
+        padding: '2px 6px', borderRadius: 2,
+        background: isWinning ? 'rgba(0,200,83,0.15)' : isLosing ? 'rgba(255,48,86,0.15)' : 'rgba(255,255,255,0.06)',
+        color,
+        fontFamily: 'JetBrains Mono',
+        textTransform: 'uppercase',
+        cursor: 'help',
+      }}
+    >
+      {arrow} {mineRate !== null ? `${mineRate}%` : '—'} vs {otherRate !== null ? `${otherRate}%` : '—'}
+    </span>
+  )
+}
+
 
 interface AutoTradePageProps {
   strategy: StrategySettings
@@ -250,7 +334,12 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
 
   const accountBalance = account?.balance || 10000
 
+  // Signal Reconciliation — rolling win-rate comparison between scalp and
+  // mirror signal paths. Fetched from /api/signal-reconciliation every minute.
+  const { stats: reconStats } = useSignalReconciliation(userId)
+
   const { enabled, setEnabled, scanning, lastScan, countdown, pendingSignals, diagnostics = [], error, runScan, rejectSignal, clearAll } = scanner
+
 
   // 1-second tick for expiry countdown display
   useEffect(() => {
@@ -1570,9 +1659,11 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
 
       {/* Live scalp signals — always-on direction panel for Gold and Silver */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2, fontWeight: 700, paddingLeft: 2 }}>
+        <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2, fontWeight: 700, paddingLeft: 2, display: 'flex', alignItems: 'center', gap: 8 }}>
           SCALP SIGNALS
+          <ReconBadge stats={reconStats} type="scalp" />
         </div>
+
       <div className="scalp-signal-grid">
         {METALS_ONLY.map(pair => {
           const sig  = scalpSignals[pair]
@@ -1775,9 +1866,11 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
 
       {/* Mirror Trades — opposite-direction cards for Gold and Silver */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2, fontWeight: 700, paddingLeft: 2 }}>
+        <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2, fontWeight: 700, paddingLeft: 2, display: 'flex', alignItems: 'center', gap: 8 }}>
           MIRROR TRADES
+          <ReconBadge stats={reconStats} type="mirror" />
         </div>
+
         <div className="scalp-signal-grid">
           {METALS_ONLY.map(pair => {
             const sig      = scalpSignals[pair]
