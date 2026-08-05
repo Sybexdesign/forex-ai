@@ -434,14 +434,14 @@ const RECON_RESOLVE_BATCH        = parseInt(process.env.SIGNAL_RECON_RESOLVE_BAT
 // predictions graded against the same outcome.
 async function captureSignalReconciliation({ signalType, pair, direction, entryPrice, timeframe, signalId }) {
   if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return
-  if (!direction || direction === 'HOLD') return
+  if (!direction) return
   if (!entryPrice || entryPrice <= 0) return
   try {
     await sbInsert('signal_reconciliation', {
       user_id:     WORKER_USER_ID,
       signal_type: signalType,          // 'scalp' | 'mirror'
       pair,
-      direction,                        // 'BUY' | 'SELL'
+      direction,                        // 'BUY' | 'SELL' | 'HOLD'
       entry_price: entryPrice,
       timeframe,                        // '1m' | '5m'
       generated_at: new Date().toISOString(),
@@ -453,6 +453,7 @@ async function captureSignalReconciliation({ signalType, pair, direction, entryP
     console.error('[recon] capture failed:', e.message)
   }
 }
+
 
 // Fetches pending reconciliation rows that are due for resolution
 // (generated_at + timeframe <= now). Returns [] on any failure.
@@ -506,7 +507,11 @@ async function resolveReconciliation(row) {
     const movementPips  = Math.abs(resolvedPrice - entryPrice) / pip
 
     let outcome
-    if (movementPips < RECON_NOISE_THRESHOLD_PIPS) {
+    if (row.direction === 'HOLD') {
+      // A HOLD signal doesn't commit to a direction — there is no directional
+      // bet to grade. It's inherently inconclusive (the model abstained).
+      outcome = 'INCONCLUSIVE'
+    } else if (movementPips < RECON_NOISE_THRESHOLD_PIPS) {
       // Below noise threshold — not enough movement to confirm either way.
       outcome = 'INCONCLUSIVE'
     } else if (row.direction === 'BUY') {
@@ -514,6 +519,7 @@ async function resolveReconciliation(row) {
     } else { // SELL
       outcome = resolvedPrice < entryPrice ? 'WIN' : 'LOSS'
     }
+
 
     await sbUpdate('signal_reconciliation', row.id, {
       resolved_at:    new Date().toISOString(),
@@ -527,16 +533,82 @@ async function resolveReconciliation(row) {
   }
 }
 
-// Sweep hook — resolves any reconciliation rows that are due.
-async function resolvePendingReconciliations() {
-  const due = await fetchDueReconciliations()
-  if (due.length === 0) return
-  console.log(`[recon] resolving ${due.length} due signal(s)`)
-  // Resolve sequentially to avoid hammering the price feed
-  for (const row of due) {
-    await resolveReconciliation(row)
+// Stale-PENDING alert — dedup key so we only alert once per stale batch.
+let lastStaleReconAlertAt = 0
+const STALE_RECON_ALERT_COOLDOWN_MS = 30 * 60_000  // 30 min between alerts
+
+// Detects PENDING reconciliation rows that are well past their due time
+// (generated_at + timeframe elapsed by > 2× the timeframe). These indicate the
+// worker was down or a sweep missed them — silent gaps in the win-rate sample.
+// Alert-only (Telegram + worker_logs); never blocks or alters anything.
+async function alertStaleReconciliations() {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return
+  if (Date.now() - lastStaleReconAlertAt < STALE_RECON_ALERT_COOLDOWN_MS) return
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/signal_reconciliation`
+      + `?user_id=eq.${WORKER_USER_ID}`
+      + `&outcome=eq.PENDING`
+      + `&order=generated_at.asc`
+      + `&limit=100`
+
+    const res = await fetch(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+      signal:  AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return
+    const rows = await res.json()
+    if (!Array.isArray(rows)) return
+
+    // Count rows that are > 2× their timeframe past due
+    const stale = rows.filter(r => {
+      const genMs = new Date(r.generated_at).getTime()
+      const tfMs  = (r.timeframe === '1m' ? 60 : 300) * 1000
+      return Date.now() >= genMs + tfMs * 2
+    })
+    if (stale.length === 0) return
+
+    lastStaleReconAlertAt = Date.now()
+    const oldest = stale[0]
+    const oldestAgeMin = Math.round((Date.now() - new Date(oldest.generated_at).getTime()) / 60_000)
+    console.warn(`[recon] ${stale.length} stale PENDING row(s) — oldest ${oldestAgeMin} min old (${oldest.pair} ${oldest.signal_type})`)
+    wlog('warn', `Signal reconciliation backlog: ${stale.length} stale PENDING row(s)`, {
+      metadata: { staleCount: stale.length, oldestAgeMin, oldestPair: oldest.pair, oldestType: oldest.signal_type },
+    })
+    await tgSend(
+      `⚠️ <b>SIGNAL RECONCILIATION BACKLOG</b>\n\n` +
+      `${stale.length} signal(s) are stuck PENDING past their resolution window.\n` +
+      `Oldest: ${oldest.pair} ${oldest.signal_type} (${oldestAgeMin} min overdue)\n\n` +
+      `This usually means the worker was down or a sweep missed them.\n` +
+      `Win-rate sample may have gaps.`
+    ).catch(() => {})
+  } catch (e) {
+    console.warn('[recon] stale-alert failed:', e.message)
   }
 }
+
+// Sweep hook — resolves any reconciliation rows that are due, and alerts on
+// stale PENDING rows (worker-down / missed-sweep gaps). Both are observability
+// only — never gate or alter auto-trade execution.
+async function resolvePendingReconciliations() {
+  const due = await fetchDueReconciliations()
+  if (due.length > 0) {
+    console.log(`[recon] resolving ${due.length} due signal(s)`)
+    // Resolve sequentially to avoid hammering the price feed
+    for (const row of due) {
+      await resolveReconciliation(row)
+    }
+  }
+  // Alert on stale PENDING rows (past their resolution window by > 2× timeframe).
+  // Runs every sweep regardless of whether any rows were due, so a backlog is
+  // caught even when the due-filter happens to return nothing. Runs after
+  // resolution so freshly-resolved rows don't trigger a false alert.
+  await alertStaleReconciliations().catch(e =>
+    console.warn('[recon] stale-alert failed:', e.message)
+  )
+}
+
+
+
 
 
 // ── Direction-bias detector (auto-section-switch) ─────────────────────────────
@@ -1196,31 +1268,47 @@ async function processSignal(pair, tick, strategy, session, direction) {
       if (row?.id) trackSignal(row.id, pair, dir, entry, sl, tp)
     }).catch(() => {})
 
-    // ── Signal Reconciliation capture ─────────────────────────────────────
-    // Snapshot BOTH the scalp signal and its mirror inverse into
-    // signal_reconciliation. Each gets its own row — they are separate
-    // predictions graded against the same outcome. The timeframe is 5m
-    // (the worker's canonical scalp timeframe). Fire-and-forget — failures
-    // here must never block signal processing.
+  }
+
+  // ── Signal Reconciliation capture ───────────────────────────────────────
+  // Snapshot the scalp signal (and its mirror inverse) into
+  // signal_reconciliation. Each gets its own row — they are separate
+  // predictions graded against the same outcome. The timeframe is 5m
+  // (the worker's canonical scalp timeframe). Fire-and-forget — failures
+  // here must never block signal processing.
+  //
+  // Captured for EVERY signal — including HOLD — so the accuracy metric
+  // reflects the full prediction distribution, not just the signals the
+  // model was confident enough to act on. HOLD has no mirror inverse (it
+  // doesn't pick a side), so only the scalp row is written for HOLD.
+  //
+  // The mirror signal in this system IS the inverted scalp direction
+  // (see direction-check/route.ts: "Mirror = same 5 results with direction
+  // inverted"), so the mirror row is the true mirror prediction, not a
+  // synthetic stand-in.
+  if (WORKER_USER_ID) {
     const mirrorDir = dir === 'BUY' ? 'SELL' : 'BUY'
     const signalId  = `worker-${pair.replace('/', '')}-${Date.now()}`
     captureSignalReconciliation({
       signalType: 'scalp',
       pair,
       direction:  dir,
-      entryPrice: entry,
+      entryPrice: signal.entry || tick.price,
       timeframe:  '5m',
       signalId,
     }).catch(() => {})
-    captureSignalReconciliation({
-      signalType: 'mirror',
-      pair,
-      direction:  mirrorDir,
-      entryPrice: entry,
-      timeframe:  '5m',
-      signalId,
-    }).catch(() => {})
+    if (dir !== 'HOLD') {
+      captureSignalReconciliation({
+        signalType: 'mirror',
+        pair,
+        direction:  mirrorDir,
+        entryPrice: signal.entry || tick.price,
+        timeframe:  '5m',
+        signalId,
+      }).catch(() => {})
+    }
   }
+
 
 
   // Dynamic minStrength with user-strategy hard floor. Regime-aware

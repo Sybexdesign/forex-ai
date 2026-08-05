@@ -25,10 +25,14 @@ import { getAdminClient } from '@/lib/supabase'
 //   Default 0.3 pips.
 const NOISE_THRESHOLD_PIPS = parseFloat(process.env.SIGNAL_RECON_NOISE_THRESHOLD_PIPS || '0.3')
 
-// Rolling window sizes for aggregation.
-const WINDOW_50  = 50   // last N signals per type
-const WINDOW_7D  = 7    // days
-const WINDOW_30D = 30   // days
+// Rolling window sizes for aggregation — pulled from env, not hardcoded.
+//   SIGNAL_RECON_WINDOW_50  — last N signals per type (default 50)
+//   SIGNAL_RECON_WINDOW_7D  — days (default 7)
+//   SIGNAL_RECON_WINDOW_30D — days (default 30)
+const WINDOW_50  = parseInt(process.env.SIGNAL_RECON_WINDOW_50  || '50', 10)
+const WINDOW_7D  = parseInt(process.env.SIGNAL_RECON_WINDOW_7D  || '7',  10)
+const WINDOW_30D = parseInt(process.env.SIGNAL_RECON_WINDOW_30D || '30', 10)
+
 
 interface TypeStats {
   winRate: number | null

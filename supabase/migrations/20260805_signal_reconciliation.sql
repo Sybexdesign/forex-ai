@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS signal_reconciliation (
   user_id         UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   signal_type     TEXT NOT NULL CHECK (signal_type IN ('scalp', 'mirror')),
   pair            TEXT NOT NULL,
-  direction       TEXT NOT NULL CHECK (direction IN ('BUY', 'SELL')),
+  direction       TEXT NOT NULL CHECK (direction IN ('BUY', 'SELL', 'HOLD')),
   entry_price     NUMERIC NOT NULL,
   timeframe       TEXT NOT NULL CHECK (timeframe IN ('1m', '5m')),
   generated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS signal_reconciliation (
   movement_pips   NUMERIC,                       -- absolute price movement in pips
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
 
 -- Worker hot-path query: find signals that are due for resolution
 CREATE INDEX IF NOT EXISTS idx_signal_recon_pending
