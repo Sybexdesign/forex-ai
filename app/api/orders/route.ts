@@ -8,7 +8,8 @@ import { runRiskGuards, isTradeAllowed, getBlockReasons } from '@/lib/risk'
 import { calcPropFirmStatus, applyPropFirmGuards, DEFAULT_PROP_FIRM } from '@/lib/propfirm'
 import type { PropFirmSettings } from '@/lib/propfirm'
 import { getAdminClient } from '@/lib/supabase'
-import { minStopPips } from '@/lib/trade-levels'
+import { minStopPips, MAX_LOTS } from '@/lib/trade-levels'
+
 import { alertOrderPlaced, alertOrderBlocked, alertOrderFailed, alertProfitTargetDisabled } from '@/lib/telegram'
 
 function dbToSettings(d: any): PropFirmSettings {
@@ -305,7 +306,23 @@ export async function POST(req: NextRequest) {
         lots = Math.max(0.01, parseFloat(safeLots.toFixed(2)))
       }
     }
+
+    // ─── Hard lot ceiling (all sources) ───────────────────────────────────
+    // Belt-and-braces backstop AFTER the manual-lots reduction so no code path
+    // (auto, manual, or a buggy frontend) can place a position above MAX_LOTS.
+    // The MT5 Direct adapter and the MT5 EA enforce the same ceiling, so this
+    // is the third independent layer. Auto-sizing can only exceed it on very
+    // large balances at high risk % — the UI slider caps risk at MAX_RISK_PCT,
+    // but this guard is source-agnostic.
+    if (lots > MAX_LOTS) {
+      const reason = `Position size ${lots} lots exceeds the ${MAX_LOTS}-lot ceiling — rejected. Reduce risk % or balance exposure.`
+      console.warn(`[orders] BLOCKED ${pair} ${direction} — ${reason}`)
+      await alertOrderBlocked({ pair, direction, reason })
+      return NextResponse.json({ success: false, blocked: true, reasons: [reason] }, { status: 422 })
+    }
+
     // ─── Profit-target safety check ───────────────────────────────────────
+
     // Warn when broker_configs.config.profitFixedUsd is 0 or null at order time
     // — without it the EA's fixed-USD TP close is disabled and the trade can
     // only exit via SL/TP/trail/decay. Likely an unintended setting. Deduped

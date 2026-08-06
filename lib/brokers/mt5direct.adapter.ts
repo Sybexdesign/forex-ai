@@ -6,6 +6,8 @@
 import type { IBroker, Price, Candle, AccountSummary, OpenTrade, OrderRequest, OrderResult, CloseResult } from './interface'
 import { calcStandardPositionSize, getPipValue } from './interface'
 import { getAdminClient } from '@/lib/supabase'
+import { MAX_LOTS } from '@/lib/trade-levels'
+
 
 // EA pushes compact candle objects: { t, o, h, l, c, v }
 interface EACandle { t: number; o: number; h: number; l: number; c: number; v: number }
@@ -203,7 +205,20 @@ export class Mt5DirectBroker implements IBroker {
       return { success: false, error: 'MT5 Direct: missing _configId — cannot queue order' }
     }
 
+    // Hard lot ceiling — execution-layer backstop. Even if the frontend or the
+    // orders route somehow sends an oversized lot (bug, race, stale state), the
+    // adapter refuses to queue it. MAX_LOTS is the same config-driven constant
+    // the position-size calculator and the MT5 EA enforce, so all layers agree.
+    if (req.lots > MAX_LOTS) {
+      console.warn(`[mt5direct] BLOCKED ${req.pair} ${req.direction} — lots ${req.lots} exceeds ceiling ${MAX_LOTS}`)
+      return {
+        success: false,
+        error: `MT5 Direct: order of ${req.lots} lots exceeds the ${MAX_LOTS}-lot ceiling — rejected at the execution layer.`,
+      }
+    }
+
     const orderId  = crypto.randomUUID()
+
     const pip      = getPipValue(req.pair)
     const sign     = req.direction === 'BUY' ? 1 : -1
     const dp       = req.pair.includes('JPY') ? 3 : req.pair.startsWith('XA') ? 2 : 5

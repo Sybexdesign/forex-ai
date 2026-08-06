@@ -24,6 +24,18 @@
 export const MIRROR_SL_CAP = 35
 export const MIRROR_TP_CAP = 70  // unchanged; widening only SL for the test
 
+// ─── Position-sizing ceilings (config-driven, shared by UI + execution) ──────
+// MAX_RISK_PCT is the upper bound of the "Risk per trade" slider on the
+// Strategy page. It is a CEILING only — the default risk % stays at its
+// conservative value (DEFAULT_STRATEGY.riskPct = 1); only what's selectable
+// changes. MAX_LOTS is the hard lot ceiling enforced at every layer: the
+// position-size calculator, the orders route, the MT5 Direct adapter, and the
+// MT5 EA itself. Raising these together keeps the UI bound and the execution
+// backstop from drifting out of sync.
+export const MAX_RISK_PCT = 10   // max selectable risk per trade (% of balance)
+export const MAX_LOTS     = 10   // hard ceiling on any single position (lots)
+
+
 // Broker min-stop-distance floors. Brokers reject orders where SL/TP sit
 // inside their freeze level (MT5 retcode 10016), which can change with spread
 // spikes. Conservative per-instrument floors; anything tighter is widened

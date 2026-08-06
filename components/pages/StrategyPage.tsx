@@ -5,7 +5,9 @@ import { useState, useEffect, useRef } from 'react'
 import { Panel, LoadingDots } from '../ui'
 import type { StrategySettings } from '@/lib/supabase'
 import { PAIR_GROUPS, PAIR_LABELS, HIGH_VOLATILITY_PAIRS, getIndexSession } from '@/lib/instruments'
+import { MAX_RISK_PCT, MAX_LOTS } from '@/lib/trade-levels'
 const STYLES = ['Scalper', 'Day Trader', 'Swing', 'Position'] as const
+
 
 const STYLE_DESCRIPTIONS: Record<string, string> = {
   Scalper: 'Very short trades, 5–15 min. High frequency, tight stops. Reduced TP/SL defaults.',
@@ -171,7 +173,15 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
   const rr = (local.tpPips / local.slPips).toFixed(1)
   const rrColor = +rr >= 2 ? '#00ff87' : +rr >= 1.5 ? '#ffb800' : '#ff3056'
 
+  // Live account balance for position-sizing previews. Pulled from the `account`
+  // prop (useAccount → /api/account, refreshed every 3s). Falls back to a $10k
+  // reference only when the broker isn't synced yet.
+  const liveBalance      = typeof account?.balance === 'number' && account.balance > 0 ? account.balance : 0
+  const refBalance       = liveBalance > 0 ? liveBalance : 10000
+  const usingLiveBalance = liveBalance > 0
+
   return (
+
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 860 }}>
 
       {/* Trading Style */}
@@ -204,10 +214,11 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
         <Panel title="POSITION RISK">
           <div style={{ padding: '14px 18px 4px' }}>
             <SliderRow
-              label="Risk per trade" value={local.riskPct} min={0.5} max={5} step={0.5} unit="%"
+              label="Risk per trade" value={local.riskPct} min={0.5} max={MAX_RISK_PCT} step={0.5} unit="%"
               onChange={v => set('riskPct', v)} color="#0080ff"
               description="% of account balance risked per trade"
             />
+
             <SliderRow
               label="Max daily loss" value={local.maxLoss} min={2} max={10} step={0.5} unit="%"
               onChange={v => set('maxLoss', v)} color="#ff6060"
@@ -275,15 +286,21 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
               </div>
             </div>
 
-            {/* Position size preview */}
+            {/* Position size preview — sized against the LIVE account balance
+                (from /api/account via the `account` prop, refreshed every 3s),
+                falling back to a $10k reference only when the broker isn't
+                synced. Previously hardcoded to $10,000, which under-sized
+                positions on larger accounts and over-sized on smaller ones. */}
             <div style={{
               background: 'rgba(0,128,255,0.06)', border: '1px solid rgba(0,128,255,0.15)',
               borderRadius: 3, padding: '10px 14px'
             }}>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>AUTO POSITION SIZE (on $10,000 balance)</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
+                AUTO POSITION SIZE{liveBalance > 0 ? ` (LIVE $${liveBalance.toLocaleString()} BAL)` : ' (REF $10K BAL — connect broker for live)'}
+              </div>
               {['EUR/USD', 'USD/JPY', 'XAU/USD'].map(pair => {
                 const pipVal = pair === 'USD/JPY' ? 6.8 : pair === 'XAU/USD' ? 10 : 10
-                const lots = Math.max(0.01, Math.min((10000 * local.riskPct / 100) / (local.slPips * pipVal), 10)).toFixed(2)
+                const lots = Math.max(0.01, Math.min((refBalance * local.riskPct / 100) / (local.slPips * pipVal), MAX_LOTS)).toFixed(2)
                 return (
                   <div key={pair} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
                     <span style={{ color: 'var(--text-muted)' }}>{pair}</span>
@@ -292,6 +309,7 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
                 )
               })}
             </div>
+
 
             {/* Manual lot-size override — bypasses balance×risk auto-sizing.
                 Hard cap (1R × hardCapMultiplier) still applies in the orders route. */}
@@ -348,7 +366,8 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
                 // should equal idealFixedUsd:currentFixedUsd. Suggestion only shown
                 // when a target is actually configured (fixedUsd > 0).
                 const autoLotsRaw      = (refBalance * (local.riskPct / 100)) / (slCap * pipPerLotXau)
-                const autoLots         = Math.max(0.01, Math.min(10, autoLotsRaw))
+                const autoLots         = Math.max(0.01, Math.min(MAX_LOTS, autoLotsRaw))
+
                 const idealFixedUsd    = autoLots > 0 ? fixedUsd * (local.manualLots / autoLots) : fixedUsd
                 const targetConfigured = fixedUsd > 0
                 const isAligned        = targetConfigured && Math.abs(fixedUsd - idealFixedUsd) < 5

@@ -35,6 +35,15 @@ input int    MagicNumber         = 20260001;
 input int    SlippagePoints      = 10;
 input ENUM_ORDER_TYPE_FILLING FillMode = ORDER_FILLING_RETURN;
 
+// v9.7 - HARD LOT CEILING
+// Execution-layer backstop: any pending order whose lots exceed MaxLots is
+// rejected in-EA and reported back as failed. Mirrors MAX_LOTS (10) in
+// lib/trade-levels.ts, which the position-size calculator, the orders route,
+// and the MT5 Direct adapter all enforce. Keep this input in sync with that
+// constant — it is the final gate before OrderSend.
+input double MaxLots             = 10.0;
+
+
 // v8.1 FIX - MIN HOLD TIME
 input int    MinHoldSeconds      = 60;   // no BE / trail / decay until trade is this old
 
@@ -1118,12 +1127,30 @@ string ExecuteOrders(string response)
       // ── new order ───────────────────────────────────────────────────
       else if(lots > 0)
       {
+         // v9.7 — hard lot ceiling. Final gate before OrderSend. Mirrors
+         // MAX_LOTS in lib/trade-levels.ts (also enforced by the orders route
+         // and the MT5 Direct adapter). If a pending order somehow exceeds it,
+         // reject in-EA and report back as failed so the server can surface it.
+         if(lots > MaxLots)
+         {
+            completed += "{\"id\":\"" + orderId + "\",\"success\":false"
+                       + ",\"error\":\"lots " + DoubleToString(lots, 2)
+                       + " exceed MaxLots ceiling " + DoubleToString(MaxLots, 2) + "\"}";
+            Print("SybexForexAI v9.7: BLOCKED ", symbol,
+                  " lots=", lots, " > MaxLots=", MaxLots);
+            first     = false;
+            searchPos = objEnd + 1;
+            continue;
+         }
+
          string direction = JsonStr(obj, "direction");
+
          double slPrice   = JsonNum(obj, "slPrice");
          double tpPrice   = JsonNum(obj, "tpPrice");
          double filledPrice = 0;
          int    retcode     = 0;
          bool   ok = PlaceOrder(symbol, direction, lots, slPrice, tpPrice, filledPrice, retcode);
+
 
          if(ok)
          {

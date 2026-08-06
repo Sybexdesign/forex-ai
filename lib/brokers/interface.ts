@@ -117,6 +117,8 @@ export interface IBroker {
 // ─── Pip value helper (shared across brokers) ─────────────────────────────────
 
 import { isIndex } from '@/lib/instruments'
+import { MAX_LOTS } from '@/lib/trade-levels'
+
 
 export function getPipValue(pair: string): number {
   if (isIndex(pair))          return 1.0   // 1 point per index
@@ -151,8 +153,13 @@ export function calcStandardPositionSize(
   if (!pipValPerLot || pipValPerLot <= 0) return 0
   const lots = riskAmount / (slPips * pipValPerLot)
   if (!isFinite(lots) || isNaN(lots)) return 0
-  return +Math.max(0.01, Math.min(lots, 100)).toFixed(2)
+  // Hard lot ceiling — MAX_LOTS (10) is the config-driven backstop shared with
+  // the orders route, the MT5 Direct adapter, and the MT5 EA. Previously a
+  // hardcoded 100 here could drift from the UI/EA bounds; now all layers read
+  // the same constant so they can't disagree.
+  return +Math.max(0.01, Math.min(lots, MAX_LOTS)).toFixed(2)
 }
+
 
 // ─── Timeframe map (display → broker-specific handled per adapter) ────────────
 
