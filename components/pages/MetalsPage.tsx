@@ -6,6 +6,8 @@ import { useState, useEffect } from 'react'
 import { Panel, LoadingDots, DirectionBadge, StatCard, CopyValue } from '../ui'
 import { METAL_CONFIG, goldSilverRatio, goldAIContext, goldPositionSize } from '@/lib/metals'
 import { authFetch } from '@/lib/api'
+import { currencySymbol } from '@/lib/currency'
+
 
 const METALS = ['XAU/USD', 'XAG/USD']
 
@@ -144,9 +146,10 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
         onToast('🚫 ' + data.reasons?.[0], '#ff3056')
       } else if (data.success) {
         onToast(
-          `✅ ${rec.direction} ${cfg.name} — ${lots} lots @ $${currentPrice?.toFixed(2) ?? '—'}`,
+          `✅ ${rec.direction} ${cfg.name} — ${lots} lots @ ${currencySymbol(account?.currency)}${currentPrice?.toFixed(2) ?? '—'}`,
           DIR_COLOR[rec.direction]
         )
+
         onRefreshTrades?.()
         setTimeout(() => onRefreshAccount?.(), 1500)
       }
@@ -205,7 +208,8 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
               </div>
               <div style={{ marginLeft: 12 }}>
                 <div className="mono" style={{ fontSize: 18, fontWeight: 700, color: active ? mc.color : 'var(--text-secondary)' }}>
-                  {prices[metal]?.bid != null ? `$${prices[metal].bid.toFixed(mc.decimals)}` : '—'}
+                  {prices[metal]?.bid != null ? `${currencySymbol(account?.currency)}${prices[metal].bid.toFixed(mc.decimals)}` : '—'}
+
                 </div>
                 <div style={{ fontSize: 10, color: prices[metal]?.trend === 'up' ? '#00ff87' : '#ff3056' }}>
                   {prices[metal]?.trend === 'up' ? '▲' : '▼'}{' '}
@@ -247,18 +251,19 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
                   {cfg.emoji} {cfg.name.toUpperCase()} / USD
                 </div>
                 <div className="mono" style={{ fontSize: 36, fontWeight: 700, color: cfg.color, lineHeight: 1 }}>
-                  {currentPrice != null ? `$${currentPrice.toFixed(cfg.decimals)}` : <span style={{ fontSize: 18, color: 'var(--text-muted)' }}>Loading…</span>}
+                  {currentPrice != null ? `${currencySymbol(account?.currency)}${currentPrice.toFixed(cfg.decimals)}` : <span style={{ fontSize: 18, color: 'var(--text-muted)' }}>Loading…</span>}
                 </div>
                 <div style={{ display: 'flex', gap: 16, marginTop: 8, fontSize: 12 }}>
                   <span style={{ color: 'var(--text-muted)' }}>
-                    BID: <span className="mono" style={{ color: cfg.dimColor }}>{prices[selected]?.bid != null ? `$${prices[selected].bid.toFixed(cfg.decimals)}` : '—'}</span>
+                    BID: <span className="mono" style={{ color: cfg.dimColor }}>{prices[selected]?.bid != null ? `${currencySymbol(account?.currency)}${prices[selected].bid.toFixed(cfg.decimals)}` : '—'}</span>
                   </span>
                   <span style={{ color: 'var(--text-muted)' }}>
-                    ASK: <span className="mono" style={{ color: cfg.dimColor }}>{prices[selected]?.ask != null ? `$${prices[selected].ask.toFixed(cfg.decimals)}` : '—'}</span>
+                    ASK: <span className="mono" style={{ color: cfg.dimColor }}>{prices[selected]?.ask != null ? `${currencySymbol(account?.currency)}${prices[selected].ask.toFixed(cfg.decimals)}` : '—'}</span>
                   </span>
                   <span style={{ color: 'var(--text-muted)' }}>
-                    SPREAD: <span className="mono" style={{ color: cfg.dimColor }}>${cfg.spread}</span>
+                    SPREAD: <span className="mono" style={{ color: cfg.dimColor }}>{currencySymbol(account?.currency)}{cfg.spread}</span>
                   </span>
+
                 </div>
               </div>
               <div style={{ textAlign: 'right' }}>
@@ -335,7 +340,8 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
                 borderRadius: 4, padding: '8px 12px',
               }}>
                 <span style={{ fontSize: 10, color: '#6090c0', letterSpacing: 1, whiteSpace: 'nowrap' }}>ACCOUNT SIZE</span>
-                <span style={{ color: 'var(--text-muted)', fontSize: 13, marginLeft: 'auto' }}>$</span>
+                <span style={{ color: 'var(--text-muted)', fontSize: 13, marginLeft: 'auto' }}>{currencySymbol(account?.currency)}</span>
+
                 <input
                   type="number"
                   value={accountSizeInput}
@@ -353,11 +359,12 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
 
               <div className="grid-2col" style={{ gap: 10, marginBottom: 12 }}>
                 {[
-                  ['Risk per Trade', `${strategy.riskPct}% = $${riskUSD}`],
+                  ['Risk per Trade', `${strategy.riskPct}% = ${currencySymbol(account?.currency)}${riskUSD}`],
                   ['Stop Loss', `${strategy.slPips} pips`],
-                  ['Pip Value/Lot', `$${cfg.pipValuePerLot}`],
+                  ['Pip Value/Lot', `${currencySymbol(account?.currency)}${cfg.pipValuePerLot}`],
                   ['Units / Lot', cfg.lotSize.toLocaleString()],
                 ].map(([label, val]) => (
+
                   <div key={label} style={{ padding: '8px 10px', background: 'rgba(0,0,0,0.2)', borderRadius: 3 }}>
                     <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 3 }}>{label}</div>
                     <div className="mono" style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{val}</div>
@@ -378,10 +385,11 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
                   </div>
                 </div>
                 <div style={{ textAlign: 'right', fontSize: 12, color: 'var(--text-muted)' }}>
-                  <div>1 pip = ${(cfg.pipValuePerLot * lotSize).toFixed(2)}</div>
-                  <div style={{ marginTop: 4 }}>TP target: ${(cfg.pipValuePerLot * lotSize * strategy.tpPips).toFixed(2)}</div>
-                  <div style={{ color: '#ff6060', marginTop: 4 }}>SL risk: ${(cfg.pipValuePerLot * lotSize * strategy.slPips).toFixed(2)}</div>
+                  <div>1 pip = {currencySymbol(account?.currency)}{(cfg.pipValuePerLot * lotSize).toFixed(2)}</div>
+                  <div style={{ marginTop: 4 }}>TP target: {currencySymbol(account?.currency)}{(cfg.pipValuePerLot * lotSize * strategy.tpPips).toFixed(2)}</div>
+                  <div style={{ color: '#ff6060', marginTop: 4 }}>SL risk: {currencySymbol(account?.currency)}{(cfg.pipValuePerLot * lotSize * strategy.slPips).toFixed(2)}</div>
                 </div>
+
               </div>
 
               <div style={{
@@ -421,8 +429,9 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
             ) : indicators ? (
               <div style={{ padding: '0 16px 14px' }}>
                 {[
-                  ['EMA 20', `$${indicators.ema20?.toFixed(2)}`, indicators.emaCrossed ? cfg.color : '#ff3056'],
-                  ['EMA 50', `$${indicators.ema50?.toFixed(2)}`, 'var(--text-secondary)'],
+                  ['EMA 20', `${currencySymbol(account?.currency)}${indicators.ema20?.toFixed(2)}`, indicators.emaCrossed ? cfg.color : '#ff3056'],
+                  ['EMA 50', `${currencySymbol(account?.currency)}${indicators.ema50?.toFixed(2)}`, 'var(--text-secondary)'],
+
                   ['EMA Cross', indicators.emaCrossSignal, indicators.emaCrossSignal === 'BULLISH' ? '#00ff87' : indicators.emaCrossSignal === 'BEARISH' ? '#ff3056' : 'var(--text-muted)'],
                   ['RSI (14)', indicators.rsi, indicators.rsi > 70 ? '#ff3056' : indicators.rsi < 30 ? '#00ff87' : '#0080ff'],
                   ['MACD', indicators.macdHistogram > 0 ? 'BULLISH' : 'BEARISH', indicators.macdHistogram > 0 ? '#00ff87' : '#ff3056'],
@@ -483,10 +492,11 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
                 <div style={{ background: 'rgba(0,0,0,0.2)', borderRadius: 3, padding: '8px 12px', marginBottom: 12 }}>
                   <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>ENTRY ZONE </span>
                   <span className="mono" style={{ color: cfg.color }}>
-                    <CopyValue value={`$${rec.entry_zone.low?.toFixed(2)}`}>${rec.entry_zone.low?.toFixed(2)}</CopyValue>
+                    <CopyValue value={`${currencySymbol(account?.currency)}${rec.entry_zone.low?.toFixed(2)}`}>{currencySymbol(account?.currency)}{rec.entry_zone.low?.toFixed(2)}</CopyValue>
                     {' — '}
-                    <CopyValue value={`$${rec.entry_zone.high?.toFixed(2)}`}>${rec.entry_zone.high?.toFixed(2)}</CopyValue>
+                    <CopyValue value={`${currencySymbol(account?.currency)}${rec.entry_zone.high?.toFixed(2)}`}>{currencySymbol(account?.currency)}{rec.entry_zone.high?.toFixed(2)}</CopyValue>
                   </span>
+
                 </div>
               )}
 
@@ -494,10 +504,12 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
               {rec.direction !== 'WAIT' && (
                 <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
                   {[
-                    ['TP',          currentPrice != null ? `$${(currentPrice + strategy.tpPips * cfg.pipSize * (rec.direction === 'BUY' ? 1 : -1)).toFixed(2)}` : '—', '#00c060',  true],
-                    ['SL',          currentPrice != null ? `$${(currentPrice - strategy.slPips * cfg.pipSize * (rec.direction === 'BUY' ? 1 : -1)).toFixed(2)}` : '—', '#c02040',  true],
+                    ['TP',          currentPrice != null ? `${currencySymbol(account?.currency)}${(currentPrice + strategy.tpPips * cfg.pipSize * (rec.direction === 'BUY' ? 1 : -1)).toFixed(2)}` : '—', '#00c060',  true],
+                    ['SL',          currentPrice != null ? `${currencySymbol(account?.currency)}${(currentPrice - strategy.slPips * cfg.pipSize * (rec.direction === 'BUY' ? 1 : -1)).toFixed(2)}` : '—', '#c02040',  true],
+
                     ['LOTS',        lotSize,                                                                                                                           cfg.color,  false],
-                    ['P/L per pip', `$${(cfg.pipValuePerLot * lotSize).toFixed(2)}`,                                                                                  '#60c0ff',  false],
+                    ['P/L per pip', `${currencySymbol(account?.currency)}${(cfg.pipValuePerLot * lotSize).toFixed(2)}`,                                                                                  '#60c0ff',  false],
+
                   ].map(([label, val, color, copyable]) => (
                     <div key={label as string} style={{ flex: 1, background: 'rgba(0,0,0,0.2)', borderRadius: 3, padding: '6px 8px' }}>
                       <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 3 }}>{label}</div>
@@ -556,7 +568,8 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
                       <span className="mono" style={{
                         fontSize: 13, fontWeight: 700, width: 80,
                         color: isRes ? '#ff6060' : isSup ? '#00c060' : cfg.color,
-                      }}>${lvl.price?.toFixed(cfg.decimals)}</span>
+                      }}>{currencySymbol(account?.currency)}{lvl.price?.toFixed(cfg.decimals)}</span>
+
                       <span style={{
                         fontSize: 9, fontWeight: 700, letterSpacing: 1,
                         color: isRes ? '#ff3056' : isSup ? '#00c060' : cfg.color,

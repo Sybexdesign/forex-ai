@@ -8,6 +8,8 @@ import {
 } from 'recharts'
 import { Panel, StatCard, DirectionBadge } from '../ui'
 import { authFetch } from '@/lib/api'
+import { currencySymbol } from '@/lib/currency'
+
 
 interface JournalPageProps { trades: any[]; userId?: string; onTradeAdded?: () => void; account?: any }
 
@@ -193,11 +195,12 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
                 <XAxis dataKey="trade" tick={{ fill: '#405060', fontSize: 9 }}
                   label={{ value: 'Trade #', position: 'insideBottom', fill: '#405060', fontSize: 9 }} />
                 <YAxis domain={['auto', 'auto']} tick={{ fill: '#405060', fontSize: 9 }} width={60}
-                  tickFormatter={(v) => `$${v.toLocaleString()}`} />
+                  tickFormatter={(v) => `${currencySymbol(account?.currency)}${v.toLocaleString()}`} />
                 <Tooltip {...CUSTOM_TOOLTIP}
-                  formatter={(v: any, n?: any) => [`$${Number(v).toFixed(2)}`, n === 'balance' ? 'Balance' : n]}
+                  formatter={(v: any, n?: any) => [`${currencySymbol(account?.currency)}${Number(v).toFixed(2)}`, n === 'balance' ? 'Balance' : n]}
                   itemStyle={{ color: '#0080ff' }}
                 />
+
                 <Line type="monotone" dataKey="balance" stroke="#0080ff" strokeWidth={2} dot={false}
                   activeDot={{ r: 4, fill: '#0080ff', stroke: '#002040', strokeWidth: 2 }} />
               </LineChart>
@@ -305,8 +308,9 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
                       {pipsPos ? '+' : ''}{t.pips?.toFixed(1) || '—'}
                     </td>
                     <td className="mono" style={{ color: plPos ? '#00ff87' : '#ff6060', fontWeight: 700 }}>
-                      {plPos ? '+' : ''}${(t.pl_usd || 0).toFixed(2)}
+                      {plPos ? '+' : ''}{currencySymbol(account?.currency)}{(t.pl_usd || 0).toFixed(2)}
                     </td>
+
                     <td>
                       <span style={{
                         fontSize: 11, fontWeight: 700,

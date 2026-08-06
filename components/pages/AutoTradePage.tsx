@@ -11,6 +11,8 @@ import type { ScanSignal, ScanDiagnostic } from '@/hooks/useScanner'
 import { getSupabase } from '@/lib/supabase'
 import type { StrategySettings } from '@/lib/supabase'
 import type { AutoTradeGate } from '@/hooks/useForex'
+import { currencySymbol } from '@/lib/currency'
+
 
 const TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1H', '4H']
 const METALS_ONLY = ['XAU/USD', 'XAG/USD']
@@ -891,8 +893,9 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           const isWin = t.result === 'WIN'
           const color = isWin ? '#00e5b4' : t.result === 'LOSS' ? '#ff3056' : '#888'
           const pl = typeof t.pl_usd === 'number'
-            ? (t.pl_usd >= 0 ? `+$${t.pl_usd.toFixed(2)}` : `-$${Math.abs(t.pl_usd).toFixed(2)}`)
+            ? (t.pl_usd >= 0 ? `+${currencySymbol(account?.currency)}${t.pl_usd.toFixed(2)}` : `-${currencySymbol(account?.currency)}${Math.abs(t.pl_usd).toFixed(2)}`)
             : ''
+
           onToast?.(`${isWin ? '✓' : t.result === 'LOSS' ? '✗' : '○'} ${t.direction} ${t.pair} ${t.result} ${pl}`.trim(), color)
           loadOpenTrades()
           onRefreshTrades?.()
@@ -972,7 +975,8 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           console.log(`[profit-monitor] CLOSE ${snap.pair}: $${snap.profit.toFixed(2)} >= trigger $${snap.trigger.toFixed(2)} (nominal $${snap.target.toFixed(2)} +10%)`)
           closingForTargetRef.current.add(trade.id)
           handleClose(trade)
-            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snap.pair} @ $${snap.target.toFixed(2)} target (+$${snap.profit.toFixed(2)})`, '#00e5b4') })
+            .then(ok => { if (ok) onToast(`⚡ Auto-closed ${snap.pair} @ ${currencySymbol(account?.currency)}${snap.target.toFixed(2)} target (+${currencySymbol(account?.currency)}${snap.profit.toFixed(2)})`, '#00e5b4') })
+
         }
       }
     }, 2000)
@@ -1163,8 +1167,9 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
             </div>
             <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
               {autoTradeEnabled
-                ? `Active · ${openTrades.length} / ${maxConcurrentTrades} trades open · ${fixedProfitUsd > 0 ? `close @ $${(fixedProfitUsd * profitTargetPct / 100).toFixed(2)}` : 'no target set'}`
+                ? `Active · ${openTrades.length} / ${maxConcurrentTrades} trades open · ${fixedProfitUsd > 0 ? `close @ ${currencySymbol(account?.currency)}${(fixedProfitUsd * profitTargetPct / 100).toFixed(2)}` : 'no target set'}`
                 : 'Configure below then enable'}
+
             </div>
           </div>
           <button
@@ -1223,9 +1228,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
             </div>
             {fixedProfitUsd > 0 && (
               <div style={{ fontSize: 10, color: '#00e5b4', marginTop: 6 }}>
-                Active — closes at +${(fixedProfitUsd * profitTargetPct / 100).toFixed(2)} (${fixedProfitUsd.toFixed(2)} × {profitTargetPct}%)
+                Active — closes at +{currencySymbol(account?.currency)}{(fixedProfitUsd * profitTargetPct / 100).toFixed(2)} ({currencySymbol(account?.currency)}{fixedProfitUsd.toFixed(2)} × {profitTargetPct}%)
               </div>
             )}
+
           </div>
 
           {/* Max Concurrent Trades */}
@@ -1815,16 +1821,17 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                     <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>lots</span>
                   </div>
                   <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                    <div style={{ color: 'var(--color-loss)' }}>${displayRisk.toFixed(2)} at risk</div>
+                    <div style={{ color: 'var(--color-loss)' }}>{currencySymbol(account?.currency)}{displayRisk.toFixed(2)} at risk</div>
                     <div>
                       {useManual
-                        ? `${execSlPips.toFixed(1)}p SL × $10/pip-lot`
-                        : `${effectiveRiskPct}% of $${accountBalance.toLocaleString()}`}
+                        ? `${execSlPips.toFixed(1)}p SL × ${currencySymbol(account?.currency)}10/pip-lot`
+                        : `${effectiveRiskPct}% of ${currencySymbol(account?.currency)}${accountBalance.toLocaleString()}`}
                     </div>
                     {pfCapped && !useManual && (
                       <div style={{ color: 'var(--color-wait)', fontWeight: 700 }}>PF capped ↓{pfRiskCap}%</div>
                     )}
                   </div>
+
                 </div>
                 )
               })()}
@@ -2021,16 +2028,17 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                       <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>lots</span>
                     </div>
                     <div style={{ textAlign: 'right', fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                      <div style={{ color: 'var(--color-loss)' }}>${displayRisk.toFixed(2)} at risk</div>
+                      <div style={{ color: 'var(--color-loss)' }}>{currencySymbol(account?.currency)}{displayRisk.toFixed(2)} at risk</div>
                       <div>
                         {useManual
-                          ? `${execSlPips.toFixed(1)}p SL × $10/pip-lot`
-                          : `${effectiveRiskPct}% of $${accountBalance.toLocaleString()}`}
+                          ? `${execSlPips.toFixed(1)}p SL × ${currencySymbol(account?.currency)}10/pip-lot`
+                          : `${effectiveRiskPct}% of ${currencySymbol(account?.currency)}${accountBalance.toLocaleString()}`}
                       </div>
                       {pfCapped && !useManual && (
                         <div style={{ color: 'var(--color-wait)', fontWeight: 700 }}>PF capped ↓{pfRiskCap}%</div>
                       )}
                     </div>
+
                   </div>
                   )
                 })()}
@@ -2091,7 +2099,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
 // ─── Signal Card ───────────────────────────────────────────────────────────────
 
 function SignalCard({
-  signal, strategy, accountBalance, livePrice, approving, onApprove, onReject,
+  signal, strategy, accountBalance, livePrice, approving, onApprove, onReject, currency = 'USD',
 }: {
   signal: ScanSignal
   strategy: StrategySettings
@@ -2100,7 +2108,9 @@ function SignalCard({
   approving: boolean
   onApprove: () => void
   onReject: () => void
+  currency?: string
 }) {
+
   // Prefer live broker price; fall back to scan-time price
   const price = livePrice || signal.currentPrice
   const color = DIR_COLOR[signal.direction] || 'var(--color-wait)'
@@ -2228,14 +2238,15 @@ function SignalCard({
             {lots.toFixed(2)} <span style={{ fontSize: 12, fontWeight: 400, color: 'var(--text-muted)' }}>lots</span>
           </div>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
-            ${riskAmt} risk ({strategy.riskPct}% of ${accountBalance.toLocaleString()})
+            {currencySymbol(currency)}{riskAmt} risk ({strategy.riskPct}% of {currencySymbol(currency)}{accountBalance.toLocaleString()})
           </div>
         </div>
         <div style={{ textAlign: 'right', fontSize: 11, color: 'var(--text-muted)' }}>
-          <div>${(pipPerLot * lots).toFixed(2)} / pip</div>
-          <div style={{ color: 'var(--color-profit)', marginTop: 3 }}>TP +${tpProfit}</div>
-          <div style={{ color: 'var(--color-loss)', marginTop: 2 }}>SL −${slLoss}</div>
+          <div>{currencySymbol(currency)}{(pipPerLot * lots).toFixed(2)} / pip</div>
+          <div style={{ color: 'var(--color-profit)', marginTop: 3 }}>TP +{currencySymbol(currency)}{tpProfit}</div>
+          <div style={{ color: 'var(--color-loss)', marginTop: 2 }}>SL −{currencySymbol(currency)}{slLoss}</div>
         </div>
+
       </div>
 
       {/* Action buttons */}

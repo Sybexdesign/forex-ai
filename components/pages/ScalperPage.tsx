@@ -6,6 +6,8 @@ import { Panel, ChecklistItem, LiveDot, StrengthBar, CopyValue } from '../ui'
 import { authJson } from '@/lib/api'
 import type { PriceData } from '@/hooks/useForex'
 import type { StrategySettings } from '@/lib/supabase'
+import { currencySymbol, currencySigned } from '@/lib/currency'
+
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -186,18 +188,20 @@ function dynamicMinConf(wins: number, total: number): number {
 
 const RISK_CFG = { maxRiskPct: 1, maxDailyLossPct: 3, maxOpenTrades: 3 }
 
-function checkRisk(sig: Signal | null, balance: number, dailyPnL: number, openCount: number, minConf: number): RiskCheck {
+function checkRisk(sig: Signal | null, balance: number, dailyPnL: number, openCount: number, minConf: number, currency: string = 'USD'): RiskCheck {
   const checks: { label: string; ok: boolean }[] = []
   let passed = true
 
   const riskAmt = balance * RISK_CFG.maxRiskPct / 100
   const riskOk  = balance > 0
   if (!riskOk) passed = false
-  checks.push({ label: `Risk ≤ ${RISK_CFG.maxRiskPct}% ($${riskAmt.toFixed(0)})`, ok: riskOk })
+  checks.push({ label: `Risk ≤ ${RISK_CFG.maxRiskPct}% (${currencySymbol(currency)}${riskAmt.toFixed(0)})`, ok: riskOk })
+
 
   const limit = balance * RISK_CFG.maxDailyLossPct / 100
   if (dailyPnL < -limit) { checks.push({ label: 'Daily loss limit hit', ok: false }); passed = false }
-  else checks.push({ label: `Daily P&L: $${dailyPnL.toFixed(2)}`, ok: true })
+  else checks.push({ label: `Daily P&L: ${currencySymbol(currency)}${dailyPnL.toFixed(2)}`, ok: true })
+
 
   if (openCount >= RISK_CFG.maxOpenTrades) { checks.push({ label: `Max ${RISK_CFG.maxOpenTrades} trades reached`, ok: false }); passed = false }
   else checks.push({ label: `${openCount}/${RISK_CFG.maxOpenTrades} open`, ok: true })
@@ -375,7 +379,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
           const pnlUsd  = rawPnl * portion
           const closed  = { ...t, closePrice: price, closeTime: logTime(), pnl: pnlUsd, result: 'SL' as const }
           nowClosed.push(closed)
-          addLog(`SL hit ${t.pair} ${t.direction} @ ${price} | P&L: $${pnlUsd.toFixed(2)}`, pnlUsd >= 0 ? 'win' : 'loss')
+          addLog(`SL hit ${t.pair} ${t.direction} @ ${price} | P&L: ${currencySymbol(account?.currency)}${pnlUsd.toFixed(2)}`, pnlUsd >= 0 ? 'win' : 'loss')
+
           setDailyPnL(d => d + pnlUsd); setTradeCount(c => c + 1)
           if (pnlUsd > 0) setWinCount(w => w + 1)
           setBalance(b => b + pnlUsd)
@@ -386,7 +391,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
         if (t.tp3 !== undefined && ((isBuy && price >= t.tp3) || (!isBuy && price <= t.tp3))) {
           const rawPnl = (isBuy ? t.tp3 - t.entry : t.entry - t.tp3) * pnlPerPriceUnit * 0.34
           nowClosed.push({ ...t, closePrice: t.tp3, closeTime: logTime(), pnl: rawPnl, result: 'TP3' as const })
-          addLog(`TP3 ${t.pair} ${t.direction} | P&L: $${rawPnl.toFixed(2)}`, 'win')
+          addLog(`TP3 ${t.pair} ${t.direction} | P&L: ${currencySymbol(account?.currency)}${rawPnl.toFixed(2)}`, 'win')
+
           setDailyPnL(d => d + rawPnl); setTradeCount(c => c + 1); setWinCount(w => w + 1); setBalance(b => b + rawPnl)
           return
         }
@@ -395,7 +401,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
         if (t.tp2 !== undefined && (t.partialsClosed ?? 0) < 2 && (t.partialsClosed ?? 0) >= 1
           && ((isBuy && price >= t.tp2) || (!isBuy && price <= t.tp2))) {
           const rawPnl = (isBuy ? t.tp2 - t.entry : t.entry - t.tp2) * pnlPerPriceUnit * 0.33
-          addLog(`TP2 partial ${t.pair} | +$${rawPnl.toFixed(2)} — trailing SL to TP1`, 'win')
+          addLog(`TP2 partial ${t.pair} | +${currencySymbol(account?.currency)}${rawPnl.toFixed(2)} — trailing SL to TP1`, 'win')
+
           setDailyPnL(d => d + rawPnl); setBalance(b => b + rawPnl)
           const newSl = t.tp1 ?? t.entry  // trail SL to TP1 level
           stillOpen.push({ ...t, partialsClosed: 2, sl: newSl })
@@ -406,7 +413,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
         if (t.tp1 !== undefined && (t.partialsClosed ?? 0) < 1
           && ((isBuy && price >= t.tp1) || (!isBuy && price <= t.tp1))) {
           const rawPnl = (isBuy ? t.tp1 - t.entry : t.entry - t.tp1) * pnlPerPriceUnit * 0.33
-          addLog(`TP1 partial ${t.pair} | +$${rawPnl.toFixed(2)} — SL moved to breakeven`, 'win')
+          addLog(`TP1 partial ${t.pair} | +${currencySymbol(account?.currency)}${rawPnl.toFixed(2)} — SL moved to breakeven`, 'win')
+
           setDailyPnL(d => d + rawPnl); setBalance(b => b + rawPnl)
           stillOpen.push({ ...t, partialsClosed: 1, sl: t.entry })
           return
@@ -444,7 +452,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
         setSignal(holdSig); signalRef.current = holdSig
         if (data.ml) setMlData(data.ml)
         setAiConn(data.fallback ? 'fallback' : 'live')
-        setRiskResult(checkRisk(holdSig, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length, minConf))
+        setRiskResult(checkRisk(holdSig, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length, minConf, account?.currency))
+
         return
       }
 
@@ -469,7 +478,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
       if (data.ml) setMlData(data.ml)
       setAiConn(data.fallback ? 'fallback' : 'live')
 
-      const freshRisk = checkRisk(sig, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length, minConf)
+      const freshRisk = checkRisk(sig, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length, minConf, account?.currency)
+
       setRiskResult(freshRisk)
 
       // ── Instant reversal: opposite direction with sufficient confidence ───
@@ -611,7 +621,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
             const newIds = new Set(liveTrades.map(t => t.id))
             openTradesRef.current.forEach(pt => {
               if (pt.mode === 'LIVE' && !newIds.has(pt.id)) {
-                addLog(`[LIVE] Position closed: ${pt.pair} ${pt.direction} | P&L: $${pt.pnl.toFixed(2)}`, pt.pnl >= 0 ? 'win' : 'loss')
+                addLog(`[LIVE] Position closed: ${pt.pair} ${pt.direction} | P&L: ${currencySymbol(account?.currency)}${pt.pnl.toFixed(2)}`, pt.pnl >= 0 ? 'win' : 'loss')
+
                 setClosedTrades(p => [{
                   ...pt,
                   closeTime: new Date().toLocaleTimeString('en', { hour12: false }),
@@ -642,7 +653,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
         await fetchSignal(data)
       } else {
         const minConf = dynamicMinConf(winCountRef.current, tradeCountRef.current)
-        const risk = checkRisk(signalRef.current, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length, minConf)
+        const risk = checkRisk(signalRef.current, balanceRef.current, dailyPnLRef.current, openTradesRef.current.length, minConf, account?.currency)
+
         setRiskResult(risk)
       }
     } catch {
@@ -815,8 +827,9 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
 
       {/* ── Stats row ── */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 12 }}>
-        <StatCard label="BALANCE" value={`$${balance.toFixed(2)}`} />
-        <StatCard label="DAILY P&L" value={`${dailyPnL >= 0 ? '+' : ''}$${dailyPnL.toFixed(2)}`} color={dailyPnL >= 0 ? C.green : C.red} />
+        <StatCard label="BALANCE" value={`${currencySymbol(account?.currency)}${balance.toFixed(2)}`} />
+        <StatCard label="DAILY P&L" value={currencySigned(dailyPnL, account?.currency)} color={dailyPnL >= 0 ? C.green : C.red} />
+
         <StatCard label="WIN RATE" value={`${winRate}%`} sub={`${winCount}/${tradeCount}`} color={winRate >= 55 ? C.green : winRate >= 45 ? C.amber : C.red} />
         <StatCard label="OPEN TRADES" value={`${openTrades.length}`} sub={`/${RISK_CFG.maxOpenTrades}`} />
       </div>
@@ -1162,9 +1175,10 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                 )}
                 {t.mode === 'LIVE' && (
                   <div style={{ marginTop: 5, fontSize: 11, fontWeight: 700, color: t.pnl >= 0 ? C.green : C.red }}>
-                    P&L: {t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}
+                    P&L: {currencySigned(t.pnl, account?.currency)}
                   </div>
                 )}
+
               </div>
             ))}
           </div>
@@ -1185,8 +1199,9 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                   <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{t.mode}</span>
                 </div>
                 <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: t.pnl >= 0 ? C.green : C.red }}>
-                  {t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}
+                  {currencySigned(t.pnl, account?.currency)}
                 </span>
+
               </div>
             ))}
           </div>

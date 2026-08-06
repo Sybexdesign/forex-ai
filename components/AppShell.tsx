@@ -23,6 +23,8 @@ import { useScanner } from '@/hooks/useScanner'
 import { useAuth } from '@/hooks/useAuth'
 import type { StrategySettings } from '@/lib/supabase'
 import { DEFAULT_STRATEGY } from '@/lib/supabase'
+import { currencySymbol, currencySigned } from '@/lib/currency'
+
 
 const METALS_ONLY = ['XAU/USD', 'XAG/USD']
 const FALLBACK_PAIRS = METALS_ONLY
@@ -250,8 +252,9 @@ export default function AppShell() {
               {account === null
                 ? '…'
                 : account.balance > 0
-                  ? `$${account.balance.toLocaleString('en', { minimumFractionDigits: 2 })}`
+                  ? `${currencySymbol(account.currency)}${account.balance.toLocaleString('en', { minimumFractionDigits: 2 })}`
                   : <span
+
                       onClick={() => setPage('broker')}
                       style={{ cursor: 'pointer', textDecoration: 'underline', fontSize: 10 }}
                       title={account.brokerError || 'Go to Broker page to connect your account'}
@@ -270,7 +273,7 @@ export default function AppShell() {
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
             <span style={{ color: 'var(--text-muted)' }}>Today P/L</span>
             <span className="mono" style={{ color: todayPL >= 0 ? '#00ff87' : '#ff3056' }}>
-              {todayPL >= 0 ? '+' : ''}${todayPL.toFixed(2)}
+              {currencySigned(todayPL, account?.currency)}
             </span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -281,6 +284,7 @@ export default function AppShell() {
 
         {/* User + sign out */}
         <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
+
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {isAdmin ? '🛡 ' : ''}{user.email}
           </div>
@@ -451,7 +455,8 @@ export default function AppShell() {
           {/* {page === 'scalp' && <ScalpPage prices={prices} account={account} strategy={strategy} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />} */}
           {page === 'scalper' && <ScalperPage prices={prices} account={account} strategy={strategy} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />}
           {page === 'worker' && <WorkerPage />}
-          {page === 'admin' && isAdmin && <AdminPage onToast={addToast} />}
+          {page === 'admin' && isAdmin && <AdminPage onToast={addToast} account={account} />}
+
         </div>
       </main>
 
@@ -525,15 +530,16 @@ export default function AppShell() {
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
             <span style={{ color: 'var(--text-muted)' }}>Balance</span>
             <span className="mono" style={{ color: account?.balance ? '#60c0ff' : '#ff6060' }}>
-              {account === null ? '…' : account.balance > 0 ? `$${account.balance.toLocaleString('en', { minimumFractionDigits: 2 })}` : 'Not synced'}
+              {account === null ? '…' : account.balance > 0 ? `${currencySymbol(account.currency)}${account.balance.toLocaleString('en', { minimumFractionDigits: 2 })}` : 'Not synced'}
             </span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
             <span style={{ color: 'var(--text-muted)' }}>Today P/L</span>
             <span className="mono" style={{ color: todayPL >= 0 ? '#00ff87' : '#ff3056' }}>
-              {todayPL >= 0 ? '+' : ''}${todayPL.toFixed(2)}
+              {currencySigned(todayPL, account?.currency)}
             </span>
           </div>
+
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
             <span style={{ color: 'var(--text-muted)' }}>Win Rate</span>
             <span className="mono" style={{ color: winRate > 50 ? '#00ff87' : '#ff6060' }}>{winRate}%</span>

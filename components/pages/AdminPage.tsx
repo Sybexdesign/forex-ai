@@ -4,6 +4,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Panel, LoadingDots } from '../ui'
 import { authFetch } from '@/lib/api'
+import { currencySymbol } from '@/lib/currency'
+
 
 interface UserRow {
   id: string
@@ -20,9 +22,11 @@ interface UserRow {
 
 interface AdminPageProps {
   onToast: (msg: string, color?: string) => void
+  account?: any
 }
 
-export default function AdminPage({ onToast }: AdminPageProps) {
+export default function AdminPage({ onToast, account }: AdminPageProps) {
+
   const [users, setUsers] = useState<UserRow[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -79,7 +83,8 @@ export default function AdminPage({ onToast }: AdminPageProps) {
           { label: 'TOTAL USERS', value: users.length, color: '#60c0ff' },
           { label: 'ACTIVE TRADERS', value: activeUsers, color: '#00ff87' },
           { label: 'TOTAL TRADES', value: totalTrades, color: '#ffb800' },
-          { label: 'TOTAL P/L', value: `${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(2)}`, color: totalPL >= 0 ? '#00ff87' : '#ff3056' },
+          { label: 'TOTAL P/L', value: `${totalPL >= 0 ? '+' : ''}${currencySymbol(account?.currency)}${totalPL.toFixed(2)}`, color: totalPL >= 0 ? '#00ff87' : '#ff3056' },
+
         ].map(s => (
           <div key={s.label} style={{ background: 'rgba(0,0,0,0.3)', border: '1px solid var(--border)', borderRadius: 4, padding: '14px 16px' }}>
             <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: 2, marginBottom: 8 }}>{s.label}</div>
@@ -140,8 +145,9 @@ export default function AdminPage({ onToast }: AdminPageProps) {
                       </td>
                       <td style={{ padding: '10px 12px', fontFamily: 'JetBrains Mono', textAlign: 'right' }}>
                         <span style={{ color: u.totalPL >= 0 ? '#00ff87' : '#ff3056' }}>
-                          {u.totalPL >= 0 ? '+' : ''}${u.totalPL.toFixed(2)}
+                          {u.totalPL >= 0 ? '+' : ''}{currencySymbol(account?.currency)}{u.totalPL.toFixed(2)}
                         </span>
+
                       </td>
                       <td style={{ padding: '10px 12px' }}>
                         <span style={{

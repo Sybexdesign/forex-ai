@@ -6,7 +6,9 @@ import { Panel, LoadingDots } from '../ui'
 import type { StrategySettings } from '@/lib/supabase'
 import { PAIR_GROUPS, PAIR_LABELS, HIGH_VOLATILITY_PAIRS, getIndexSession } from '@/lib/instruments'
 import { MAX_RISK_PCT, MAX_LOTS } from '@/lib/trade-levels'
+import { currencySymbol } from '@/lib/currency'
 const STYLES = ['Scalper', 'Day Trader', 'Swing', 'Position'] as const
+
 
 
 const STYLE_DESCRIPTIONS: Record<string, string> = {
@@ -130,9 +132,11 @@ interface StrategyPageProps {
   // profitFixedUsd/profitTargetPct from this object when present.
   account?: {
     balance?: number
+    currency?: string
     profitFixedUsd?: number | null
     profitTargetPct?: number | null
   } | null
+
 }
 
 export default function StrategyPage({ strategy, onSave, account }: StrategyPageProps) {
@@ -296,8 +300,9 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
               borderRadius: 3, padding: '10px 14px'
             }}>
               <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
-                AUTO POSITION SIZE{liveBalance > 0 ? ` (LIVE $${liveBalance.toLocaleString()} BAL)` : ' (REF $10K BAL — connect broker for live)'}
+                AUTO POSITION SIZE{liveBalance > 0 ? ` (LIVE ${currencySymbol(account?.currency)}${liveBalance.toLocaleString()} BAL)` : ` (REF ${currencySymbol(account?.currency)}10K BAL — connect broker for live)`}
               </div>
+
               {['EUR/USD', 'USD/JPY', 'XAU/USD'].map(pair => {
                 const pipVal = pair === 'USD/JPY' ? 6.8 : pair === 'XAU/USD' ? 10 : 10
                 const lots = Math.max(0.01, Math.min((refBalance * local.riskPct / 100) / (local.slPips * pipVal), MAX_LOTS)).toFixed(2)
@@ -377,28 +382,29 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
                     fontSize: 11, lineHeight: 1.7,
                   }}>
                     <div style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 6 }}>
-                      AT {local.manualLots} LOTS ON XAU/USD ({usingLiveBalance ? `LIVE $${refBalance.toLocaleString()} BAL` : 'REF $10K BAL — connect broker for live'})
+                      AT {local.manualLots} LOTS ON XAU/USD ({usingLiveBalance ? `LIVE ${currencySymbol(account?.currency)}${refBalance.toLocaleString()} BAL` : `REF ${currencySymbol(account?.currency)}10K BAL — connect broker for live`})
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                       <span style={{ color: 'var(--text-muted)' }}>Max win ({local.tpPips}p TP)</span>
-                      <span className="mono" style={{ color: '#00ff87' }}>+${maxWin.toFixed(2)}</span>
+                      <span className="mono" style={{ color: '#00ff87' }}>+{currencySymbol(account?.currency)}{maxWin.toFixed(2)}</span>
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                       <span style={{ color: 'var(--text-muted)' }}>
-                        Profit-target exit{targetConfigured ? ` (${targetPct}% of $${fixedUsd.toFixed(2)})` : ''}
+                        Profit-target exit{targetConfigured ? ` (${targetPct}% of ${currencySymbol(account?.currency)}${fixedUsd.toFixed(2)})` : ''}
                       </span>
                       <span className="mono" style={{ color: targetConfigured ? '#ffb800' : 'var(--text-dim)' }}>
-                        {targetConfigured ? `+$${profitExit.toFixed(2)}` : 'not configured'}
+                        {targetConfigured ? `+${currencySymbol(account?.currency)}${profitExit.toFixed(2)}` : 'not configured'}
                       </span>
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                       <span style={{ color: 'var(--text-muted)' }}>Max loss ({slCap}p SL)</span>
-                      <span className="mono" style={{ color: '#ff3056' }}>−${maxLoss.toFixed(2)}</span>
+                      <span className="mono" style={{ color: '#ff3056' }}>−{currencySymbol(account?.currency)}{maxLoss.toFixed(2)}</span>
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                       <span style={{ color: 'var(--text-muted)' }}>Hard cap (1R × {hardCapMult})</span>
-                      <span className="mono" style={{ color: '#ff8800' }}>${hardCapUsd.toFixed(2)}</span>
+                      <span className="mono" style={{ color: '#ff8800' }}>{currencySymbol(account?.currency)}{hardCapUsd.toFixed(2)}</span>
                     </div>
+
                     {overCap && (
                       <div style={{
                         marginTop: 8, padding: '6px 8px',
@@ -414,8 +420,9 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
                         background: 'rgba(0,229,180,0.06)', border: '1px solid rgba(0,229,180,0.25)',
                         borderRadius: 3, color: '#00e5b4', fontSize: 11,
                       }}>
-                        ℹ Profit target ${fixedUsd.toFixed(2)} is sized for ~{autoLots.toFixed(2)} auto-lots.
-                        For {local.manualLots} lots, suggested target ≈ <b>${idealFixedUsd.toFixed(2)}</b>
+                        ℹ Profit target {currencySymbol(account?.currency)}{fixedUsd.toFixed(2)} is sized for ~{autoLots.toFixed(2)} auto-lots.
+                        For {local.manualLots} lots, suggested target ≈ <b>{currencySymbol(account?.currency)}{idealFixedUsd.toFixed(2)}</b>
+
                         {' '}— update on AutoTrade page.
                       </div>
                     )}

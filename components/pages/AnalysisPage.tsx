@@ -7,6 +7,8 @@ import { useIndicators } from '@/hooks/useForex'
 import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { authFetch } from '@/lib/api'
 import type { StrategySettings } from '@/lib/supabase'
+import { currencySymbol } from '@/lib/currency'
+
 
 const DEFAULT_PAIRS = ['XAU/USD', 'XAG/USD']
 const TIMEFRAMES = ['1m', '3m', '5m', '15m', '1H', '4H', 'Daily']
@@ -538,18 +540,19 @@ export default function AnalysisPage({
                             <span style={{ fontSize: 14, color: 'var(--text-muted)', fontWeight: 400, marginLeft: 6 }}>lots</span>
                           </div>
                           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
-                            ${riskAmt} risk ({strategy.riskPct}% of ${accountSize.toLocaleString()})
+                            {currencySymbol(account?.currency)}{riskAmt} risk ({strategy.riskPct}% of {currencySymbol(account?.currency)}{accountSize.toLocaleString()})
                           </div>
                         </div>
                         <div style={{ textAlign: 'right', fontSize: 11, color: 'var(--text-muted)' }}>
-                          <div>${(pipPerLot * lots).toFixed(2)} / pip</div>
+                          <div>{currencySymbol(account?.currency)}{(pipPerLot * lots).toFixed(2)} / pip</div>
                           <div style={{ color: 'var(--color-profit)', marginTop: 3 }}>
-                            TP +${(pipPerLot * lots * strategy.tpPips).toFixed(2)}
+                            TP +{currencySymbol(account?.currency)}{(pipPerLot * lots * strategy.tpPips).toFixed(2)}
                           </div>
                           <div style={{ color: 'var(--color-loss)', marginTop: 2 }}>
-                            SL −${(pipPerLot * lots * strategy.slPips).toFixed(2)}
+                            SL −{currencySymbol(account?.currency)}{(pipPerLot * lots * strategy.slPips).toFixed(2)}
                           </div>
                         </div>
+
                       </div>
                     </div>
                   </>

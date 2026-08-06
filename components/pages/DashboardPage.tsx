@@ -6,6 +6,8 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { Panel, LiveDot, StatCard, LoadingDots } from '../ui'
 import { authFetch } from '@/lib/api'
 import type { PriceData } from '@/hooks/useForex'
+import { currencySymbol, currencySigned } from '@/lib/currency'
+
 
 const DIR_COLOR: Record<string, string> = { BUY: '#00ff87', SELL: '#ff3056' }
 
@@ -121,14 +123,15 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
       <div className="stat-card-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 10 }}>
         <StatCard
           label="BALANCE"
-          value={account?.balance ? `$${account.balance.toLocaleString('en', { minimumFractionDigits: 2 })}` : account === null ? '…' : 'Not synced'}
+          value={account?.balance ? `${currencySymbol(account.currency)}${account.balance.toLocaleString('en', { minimumFractionDigits: 2 })}` : account === null ? '…' : 'Not synced'}
           color={account?.balance ? '#60c0ff' : '#ffb800'}
         />
         <StatCard
           label="TODAY P/L"
-          value={`${todayPL >= 0 ? '+' : ''}$${todayPL.toFixed(2)}`}
+          value={currencySigned(todayPL, account?.currency)}
           color={todayPL > 0 ? '#00ff87' : todayPL < 0 ? '#ff3056' : '#607080'}
         />
+
         <StatCard
           label="OPEN TRADES"
           value={openTrades.length}
@@ -239,13 +242,14 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
                 <CartesianGrid strokeDasharray="2 6" stroke="#0d1e30" />
                 <XAxis dataKey="day" tick={{ fill: '#405060', fontSize: 9 }} interval="preserveStartEnd" />
                 <YAxis domain={['auto', 'auto']} tick={{ fill: '#405060', fontSize: 9 }} width={64}
-                  tickFormatter={(v) => `$${v.toLocaleString()}`} />
+                  tickFormatter={(v) => `${currencySymbol(account?.currency)}${v.toLocaleString()}`} />
                 <Tooltip
                   contentStyle={{ background: '#0a1628', border: '1px solid #1a2940', borderRadius: 3, fontSize: 12 }}
                   labelStyle={{ color: '#607080' }}
-                  formatter={(v: any) => [`$${Number(v).toFixed(2)}`, 'Balance']}
+                  formatter={(v: any) => [`${currencySymbol(account?.currency)}${Number(v).toFixed(2)}`, 'Balance']}
                   itemStyle={{ color: '#00ff87' }}
                 />
+
                 <Line type="monotone" dataKey="balance" stroke="#0080ff" strokeWidth={2} dot={false}
                   activeDot={{ r: 3, fill: '#0080ff' }} />
               </LineChart>
@@ -281,8 +285,9 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
                           </td>
                           <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t.lots?.toFixed(2) ?? '—'}</td>
                           <td className="mono" style={{ color: (t.pl_usd ?? 0) >= 0 ? '#00ff87' : '#ff6060', fontWeight: 700 }}>
-                            {(t.pl_usd ?? 0) >= 0 ? '+' : ''}${(t.pl_usd ?? 0).toFixed(2)}
+                            {currencySigned(t.pl_usd ?? 0, account?.currency)}
                           </td>
+
                           <td>
                             <span style={{
                               fontSize: 11, fontWeight: 700,

@@ -7,3 +7,8 @@ node_modules/
 .vercel/output/
 .vercel/README.txt
 .env*.local
+supabase/.temp/
+tsconfig.tsbuildinfo
+ml/.venv/
+ml/data/*.csv
+.claude/

@@ -7,6 +7,8 @@ import { authFetch } from '@/lib/api'
 import { getPipValue, getPipValuePerLot, calcStandardPositionSize } from '@/lib/brokers/interface'
 import type { StrategySettings } from '@/lib/supabase'
 import type { PriceData } from '@/hooks/useForex'
+import { currencySymbol } from '@/lib/currency'
+
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -395,7 +397,8 @@ export default function ScalpPage({ prices, account, strategy, onToast, userId, 
 
       if (!partial) {
         setActive(null)
-        onToast(`Trade closed — ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`, pl >= 0 ? C_GREEN : C_RED)
+        onToast(`Trade closed — ${pl >= 0 ? '+' : ''}${currencySymbol(account?.currency)}${pl.toFixed(2)}`, pl >= 0 ? C_GREEN : C_RED)
+
       } else {
         onToast('Closed half at TP1', C_GREEN)
       }
@@ -581,7 +584,8 @@ export default function ScalpPage({ prices, account, strategy, onToast, userId, 
             {[
               ['TRADES', `${session.tradeCount}/${MAX_TRADES}`, session.tradeCount >= MAX_TRADES ? C_RED : C_GREEN],
               ['LOSS STREAK', `${session.lossStreak}/${MAX_LOSS_STREAK}`, session.lossStreak >= MAX_LOSS_STREAK ? C_RED : session.lossStreak === 1 ? C_AMBER : 'var(--text-primary)'],
-              ['SESSION P/L', `${session.sessionPL >= 0 ? '+' : ''}$${session.sessionPL.toFixed(2)}`, session.sessionPL >= 0 ? C_GREEN : C_RED],
+              ['SESSION P/L', `${session.sessionPL >= 0 ? '+' : ''}${currencySymbol(account?.currency)}${session.sessionPL.toFixed(2)}`, session.sessionPL >= 0 ? C_GREEN : C_RED],
+
               ['STATUS', session.status, STATUS_COLOR[session.status]],
             ].map(([l, v, c]) => (
               <div key={l as string} style={{ background: 'rgba(0,0,0,0.15)', borderRadius: 3, padding: '8px 10px' }}>
@@ -857,7 +861,8 @@ export default function ScalpPage({ prices, account, strategy, onToast, userId, 
               <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
                 {[
                   ['LOTS', `${lots}`, 'var(--text-primary)'],
-                  ['RISK', `$${(balance * (strategy.riskPct || 1) / 100).toFixed(2)}`, C_AMBER],
+                  ['RISK', `${currencySymbol(account?.currency)}${(balance * (strategy.riskPct || 1) / 100).toFixed(2)}`, C_AMBER],
+
                   ['SL PIPS', `${slPips}p`, C_RED],
                   ['TP1', `${(slPips * 1).toFixed(0)}p`, C_GREEN],
                   ['TP2', `${(slPips * 1.5).toFixed(0)}p`, C_GREEN],
@@ -896,7 +901,8 @@ export default function ScalpPage({ prices, account, strategy, onToast, userId, 
                   </div>
                   <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
                     <div className="mono" style={{ fontSize: 26, fontWeight: 900, color: activePL >= 0 ? C_GREEN : C_RED, lineHeight: 1 }}>
-                      {activePL >= 0 ? '+' : ''}${activePL.toFixed(2)}
+                      {activePL >= 0 ? '+' : ''}{currencySymbol(account?.currency)}{activePL.toFixed(2)}
+
                     </div>
                     <div style={{ fontSize: 10, color: C_DIM, marginTop: 2 }}>unrealized P/L</div>
                   </div>
@@ -1002,7 +1008,8 @@ export default function ScalpPage({ prices, account, strategy, onToast, userId, 
                 ['TOTAL TRADES', session.tradeCount, 'var(--text-primary)'],
                 ['WINS', wins, C_GREEN],
                 ['LOSSES', losses, C_RED],
-                ['SESSION P/L', `${session.sessionPL >= 0 ? '+' : ''}$${session.sessionPL.toFixed(2)}`, session.sessionPL >= 0 ? C_GREEN : C_RED],
+                ['SESSION P/L', `${session.sessionPL >= 0 ? '+' : ''}${currencySymbol(account?.currency)}${session.sessionPL.toFixed(2)}`, session.sessionPL >= 0 ? C_GREEN : C_RED],
+
                 ['PIPS', `${closedPips >= 0 ? '+' : ''}${closedPips.toFixed(1)}`, closedPips >= 0 ? C_GREEN : C_RED],
                 ['DURATION', fmtDuration(sessionElapsed), C_BLUE],
               ].map(([l, v, c]) => (
@@ -1030,7 +1037,8 @@ export default function ScalpPage({ prices, account, strategy, onToast, userId, 
                     <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{t.pair}</span>
                     <span className="mono" style={{ fontSize: 11, color }}>{t.result || 'OPEN'}</span>
                     <span className="mono" style={{ fontSize: 11, color: pl >= 0 ? C_GREEN : C_RED }}>
-                      {t.closedPL !== undefined ? `${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}` : '—'}
+                      {t.closedPL !== undefined ? `${pl >= 0 ? '+' : ''}${currencySymbol(account?.currency)}${pl.toFixed(2)}` : '—'}
+
                     </span>
                     {t.closedAt && t.enteredAt && (
                       <span style={{ fontSize: 10, color: C_DIM }}>{fmtDuration(t.closedAt - t.enteredAt)}</span>
