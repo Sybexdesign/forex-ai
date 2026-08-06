@@ -35,7 +35,9 @@ function friendlyError(msg: unknown): string {
   if (m.includes('password') && m.includes('6')) return 'Password must be at least 6 characters.'
   if (m.includes('rate limit') || m.includes('too many')) return 'Too many attempts — please wait a moment and try again.'
   if (m.includes('network') || m.includes('fetch')) return 'Connection error — check your internet and try again.'
+  if (m.includes('abort') || m.includes('timeout') || m.includes('timed out')) return 'Login is taking too long — the auth service may be down. Please try again in a moment.'
   return msg
+
 }
 
 

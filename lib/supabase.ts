@@ -16,11 +16,28 @@ function getServiceKey() {
   return process.env.SUPABASE_SERVICE_ROLE_KEY || getAnonKey()
 }
 
+// Wrap fetch with a hard timeout so a slow/unresponsive Supabase auth
+// service doesn't hang the UI for 30+ seconds (observed as HTTP 504 from
+// the auth endpoint). 10s is generous for normal auth calls.
+const AUTH_TIMEOUT_MS = 10_000
+
+function timedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), AUTH_TIMEOUT_MS)
+  return fetch(input, { ...init, signal: controller.signal })
+    .finally(() => clearTimeout(timer))
+}
+
 let _browser: SupabaseClient | null = null
 export function getSupabase() {
-  if (!_browser) _browser = createClient(getUrl(), getAnonKey())
+  if (!_browser) {
+    _browser = createClient(getUrl(), getAnonKey(), {
+      global: { fetch: timedFetch },
+    })
+  }
   return _browser
 }
+
 
 export function getAdminClient() {
   return createClient(getUrl(), getServiceKey(), {
