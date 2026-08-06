@@ -20,7 +20,14 @@ function EyeIcon({ open }: { open: boolean }) {
   )
 }
 
-function friendlyError(msg: string): string {
+function friendlyError(msg: unknown): string {
+  // Handle non-string / missing error messages gracefully.
+  // Supabase can return an empty object or undefined for `message` in some
+  // failure modes (network drop, malformed response, CORS) — never crash the
+  // UI or show a raw `{}`.
+  if (typeof msg !== 'string' || msg.length === 0) {
+    return 'Something went wrong. Please try again.'
+  }
   const m = msg.toLowerCase()
   if (m.includes('invalid login') || m.includes('invalid credentials')) return 'Incorrect email or password.'
   if (m.includes('email not confirmed'))   return 'Please confirm your email address first, then sign in.'
@@ -30,6 +37,7 @@ function friendlyError(msg: string): string {
   if (m.includes('network') || m.includes('fetch')) return 'Connection error — check your internet and try again.'
   return msg
 }
+
 
 export default function AuthPage() {
   const { signIn, signUp, resetPassword } = useAuth()
@@ -73,9 +81,16 @@ export default function AuthPage() {
         if (error) setError(friendlyError(error.message))
         else setSuccess('Reset email sent! Check your inbox and follow the link.')
       }
+    } catch (err: any) {
+      // Catch unexpected errors (network drop, Supabase outage, malformed
+      // response) so the user sees a friendly message instead of a raw `{}`
+      // or a silent failure.
+      console.error('[AuthPage] unexpected error:', err)
+      setError(friendlyError(err?.message))
     } finally {
       setLoading(false)
     }
+
   }
 
   const submitLabel =
