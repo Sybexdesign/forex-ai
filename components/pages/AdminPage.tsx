@@ -33,6 +33,17 @@ export default function AdminPage({ onToast, account }: AdminPageProps) {
   const [deleting, setDeleting] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [search, setSearch] = useState('')
+  const [cacheClearing, setCacheClearing] = useState(false)
+  const [cacheResult, setCacheResult] = useState<{ cleared: string[]; errors: string[] } | null>(null)
+  const [cacheLayers, setCacheLayers] = useState<any[]>([])
+  const [loadingLayers, setLoadingLayers] = useState(false)
+  const [clientCacheCleared, setClientCacheCleared] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [confirmClientClear, setConfirmClientClear] = useState(false)
+  const [confirmWorkerClear, setConfirmWorkerClear] = useState(false)
+  const [workerClearing, setWorkerClearing] = useState(false)
+  const [workerResult, setWorkerResult] = useState<string | null>(null)
+
 
   const loadUsers = useCallback(() => {
     setLoading(true)
@@ -48,7 +59,74 @@ export default function AdminPage({ onToast, account }: AdminPageProps) {
 
   useEffect(() => { loadUsers() }, [loadUsers])
 
+  // ── Cache management ──────────────────────────────────────────────────────
+  const loadCacheLayers = useCallback(() => {
+    setLoadingLayers(true)
+    authFetch('/api/admin/cache')
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { onToast('Cache status failed: ' + d.error, '#ff3056'); return }
+        setCacheLayers(d.layers || [])
+      })
+      .catch(e => onToast('Cache status error: ' + e.message, '#ff3056'))
+      .finally(() => setLoadingLayers(false))
+  }, [onToast])
+
+  useEffect(() => { loadCacheLayers() }, [loadCacheLayers])
+
+  async function handleClearServerCaches() {
+    if (!confirmClear) { setConfirmClear(true); return }
+    setCacheClearing(true)
+    setCacheResult(null)
+    try {
+      const res = await authFetch('/api/admin/cache', { method: 'POST' })
+      const d = await res.json()
+      if (d.error) { onToast('Cache clear failed: ' + d.error, '#ff3056'); return }
+      setCacheResult({ cleared: d.cleared || [], errors: d.errors || [] })
+      onToast(`Cleared ${(d.cleared || []).length} cache layer(s)`, '#00ff87')
+    } catch (e: any) {
+      onToast('Cache clear error: ' + e.message, '#ff3056')
+    } finally {
+      setCacheClearing(false)
+      setConfirmClear(false)
+    }
+  }
+
+  async function handleClearClientCaches() {
+    if (!confirmClientClear) { setConfirmClientClear(true); return }
+    try {
+      const keys = ['forexai_strategy_v2', 'forexai_account_size', 'forexai_theme']
+      const cleared: string[] = []
+      for (const key of keys) {
+        try { localStorage.removeItem(key); cleared.push(key) } catch { /* ignore */ }
+      }
+      setClientCacheCleared(true)
+      onToast(`Cleared ${cleared.length} client cache key(s)`, '#00ff87')
+    } finally {
+      setConfirmClientClear(false)
+    }
+  }
+
+  async function handleClearWorkerCaches() {
+    if (!confirmWorkerClear) { setConfirmWorkerClear(true); return }
+    setWorkerClearing(true)
+    setWorkerResult(null)
+    try {
+      const res = await authFetch('/api/worker/cache-reset', { method: 'POST' })
+      const d = await res.json()
+      if (d.error) { onToast('Worker cache reset failed: ' + d.error, '#ff3056'); return }
+      setWorkerResult('Worker cache reset requested — will apply on next sweep (~30s)')
+      onToast('Worker cache reset requested', '#00ff87')
+    } catch (e: any) {
+      onToast('Worker cache reset error: ' + e.message, '#ff3056')
+    } finally {
+      setWorkerClearing(false)
+      setConfirmWorkerClear(false)
+    }
+  }
+
   async function handleDelete(userId: string, email: string) {
+
     if (confirmDelete !== userId) { setConfirmDelete(userId); return }
     setDeleting(userId)
     try {
@@ -93,8 +171,123 @@ export default function AdminPage({ onToast, account }: AdminPageProps) {
         ))}
       </div>
 
+      {/* Cache Management */}
+      <Panel title="CACHE MANAGEMENT" bright>
+        <div style={{ padding: '14px 16px' }}>
+          <div style={{ display: 'flex', gap: 10, marginBottom: 16, alignItems: 'center', flexWrap: 'wrap' }}>
+            <button
+              className="btn"
+              onClick={handleClearServerCaches}
+              disabled={cacheClearing}
+              style={{
+                padding: '8px 16px', fontSize: 12, cursor: 'pointer',
+                background: confirmClear ? 'rgba(255,48,86,0.15)' : 'rgba(255,184,0,0.1)',
+                border: `1px solid ${confirmClear ? 'rgba(255,48,86,0.4)' : 'rgba(255,184,0,0.3)'}`,
+                color: confirmClear ? '#ff3056' : '#ffb800',
+                borderRadius: 3,
+              }}
+            >
+              {cacheClearing ? 'Clearing…' : confirmClear ? '⚠ Confirm Clear All?' : '🧹 Clear Server Caches'}
+            </button>
+            <button
+              className="btn btn-ghost"
+              onClick={handleClearClientCaches}
+              style={{ padding: '8px 16px', fontSize: 12, cursor: 'pointer' }}
+            >
+              {confirmClientClear ? '⚠ Confirm?' : '🗑 Clear Client Cache'}
+            </button>
+            <button
+              className="btn btn-ghost"
+              onClick={handleClearWorkerCaches}
+              disabled={workerClearing}
+              style={{ padding: '8px 16px', fontSize: 12, cursor: 'pointer' }}
+            >
+              {workerClearing ? 'Requesting…' : confirmWorkerClear ? '⚠ Confirm?' : '⚙ Reset Worker Cache'}
+            </button>
+            <button className="btn btn-ghost" onClick={loadCacheLayers} style={{ padding: '8px 16px', fontSize: 12 }}>
+              ⟳ Refresh
+            </button>
+          </div>
+
+          {cacheResult && (
+            <div style={{
+              padding: '10px 14px', borderRadius: 3, marginBottom: 12, fontSize: 12,
+              background: cacheResult.errors.length ? 'rgba(255,48,86,0.08)' : 'rgba(0,255,135,0.08)',
+              border: `1px solid ${cacheResult.errors.length ? 'rgba(255,48,86,0.3)' : 'rgba(0,255,135,0.3)'}`,
+              color: cacheResult.errors.length ? '#ff6060' : '#00ff87',
+              fontFamily: 'JetBrains Mono',
+            }}>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                {cacheResult.errors.length ? '⚠ Partial clear' : '✅ All caches cleared'}
+              </div>
+              {cacheResult.cleared.length > 0 && (
+                <div style={{ color: 'var(--text-secondary)' }}>
+                  Cleared: {cacheResult.cleared.join(', ')}
+                </div>
+              )}
+              {cacheResult.errors.length > 0 && (
+                <div style={{ color: '#ff6060', marginTop: 4 }}>
+                  Errors: {cacheResult.errors.join('; ')}
+                </div>
+              )}
+            </div>
+          )}
+
+          {workerResult && (
+            <div style={{
+              padding: '10px 14px', borderRadius: 3, marginBottom: 12, fontSize: 12,
+              background: 'rgba(0,255,135,0.08)',
+              border: '1px solid rgba(0,255,135,0.3)',
+              color: '#00ff87',
+              fontFamily: 'JetBrains Mono',
+            }}>
+              {workerResult}
+            </div>
+          )}
+
+          {clientCacheCleared && (
+            <div style={{
+              padding: '10px 14px', borderRadius: 3, marginBottom: 12, fontSize: 12,
+              background: 'rgba(0,255,135,0.08)',
+              border: '1px solid rgba(0,255,135,0.3)',
+              color: '#00ff87',
+              fontFamily: 'JetBrains Mono',
+            }}>
+              ✅ Client localStorage cleared — strategy and account size will reload from server
+            </div>
+          )}
+
+          {loadingLayers ? (
+            <div style={{ textAlign: 'center', padding: 20 }}><LoadingDots /></div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {cacheLayers.map(layer => (
+                <div key={layer.id} style={{
+                  display: 'flex', alignItems: 'center', gap: 12,
+                  padding: '10px 14px', borderRadius: 3,
+                  background: 'rgba(0,0,0,0.2)', border: '1px solid var(--border)',
+                }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>{layer.name}</div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{layer.description}</div>
+                  </div>
+                  <span style={{
+                    fontSize: 9, fontWeight: 700, letterSpacing: 1, padding: '2px 6px', borderRadius: 2,
+                    background: 'rgba(255,184,0,0.08)', border: '1px solid rgba(255,184,0,0.2)',
+                    color: '#ffb800', whiteSpace: 'nowrap',
+                  }}>
+                    {layer.id}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Panel>
+
       {/* User table */}
       <Panel title="USER MANAGEMENT" bright>
+
         <div style={{ padding: '14px 16px' }}>
           <div style={{ display: 'flex', gap: 10, marginBottom: 16, alignItems: 'center' }}>
             <input

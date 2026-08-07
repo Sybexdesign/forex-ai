@@ -17,6 +17,16 @@ let _capitalCircuitOpen = false
 let _capitalCircuitOpenAt = 0
 const CAPITAL_CIRCUIT_MS = 5 * 60_000
 
+// ─── Circuit breaker reset (admin cache-clear) ────────────────────────────────
+// Forces the Capital.com circuit breaker closed so the next request retries
+// immediately instead of waiting out the 5-minute cooldown. Called by
+// /api/admin/cache.
+export function resetCapitalCircuit() {
+  _capitalCircuitOpen = false
+  _capitalCircuitOpenAt = 0
+  console.log('[marketdata] Capital.com circuit breaker reset')
+}
+
 async function tryMt5ServerCandles(pair: string, timeframe: string, count: number): Promise<Candle[] | null> {
   try {
     const { getAdminClient } = await import('./supabase')

@@ -70,6 +70,16 @@ let _cst: string | null = null
 // Epic cache: { epic, scaleFactor } keyed by pair, expires after 1 hour
 const _epicCache: Record<string, { epic: string; scale: number; expiresAt: number }> = {}
 
+// ─── Cache reset (admin cache-clear) ──────────────────────────────────────────
+// Clears the session token, CST, and epic cache so the next request re-authenticates
+// and re-discovers market epics. Called by /api/admin/cache.
+export function resetCapitalCache() {
+  _sessionToken = null
+  _cst = null
+  for (const key of Object.keys(_epicCache)) delete _epicCache[key]
+  console.log('[capital] cache reset — session + epic cache cleared')
+}
+
 async function getSession() {
   if (_sessionToken && _cst) return { token: _sessionToken, cst: _cst }
   const res = await fetch(`${BASE_URL}/v1/session`, {

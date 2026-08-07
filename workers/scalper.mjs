@@ -256,6 +256,44 @@ let   lastCbArmedAt   = null  // CB ISO timestamp we've already announced "armed
 let   tradingHalted  = false
 let   haltNotified   = false
 
+// ── Admin cache reset ─────────────────────────────────────────────────────────
+// Polls /api/worker/cache-reset every sweep. When the admin clears caches from
+// the Admin page, this endpoint returns { reset: true } and the worker resets
+// all in-memory state so the next sweep starts fresh.
+let _lastCacheResetCheck = 0
+const CACHE_RESET_CHECK_MS = 30_000  // check every 30s (every ~3 sweeps)
+
+async function checkForCacheReset() {
+  const now = Date.now()
+  if (now - _lastCacheResetCheck < CACHE_RESET_CHECK_MS) return
+  _lastCacheResetCheck = now
+  try {
+    const data = await apiFetch('/api/worker/cache-reset')
+    if (data?.reset) {
+      console.log('[worker] ⚡ Admin cache reset received — clearing in-memory state')
+      // Clear all in-memory caches
+      lastSigFetch.clear()
+      alertCooldowns.clear()
+      mlMissingAlerts.clear()
+      stalePriceTrack.clear()
+      htfCache.clear()
+      lastPairPlacedRef.clear()
+      pendingSignals.clear()
+      cachedRisk = null
+      riskCachedAt = 0
+      tradingHalted = false
+      haltNotified = false
+      lastCbClearedAt = null
+      lastCbArmedAt = null
+      wlog('info', 'Admin cache reset applied — in-memory state cleared', { metadata: { ts: new Date().toISOString() } })
+      tgSend('🧹 <b>Cache Reset Applied</b>\n\nWorker in-memory state cleared by admin.\nRisk cache, HTF cache, cooldowns, pending signals all reset.')
+        .catch(() => {})
+    }
+  } catch (e) {
+    // Silent — don't spam logs if the endpoint is briefly unavailable
+  }
+}
+
 const stats = {
   sweeps: 0, sigChecks: 0, alerts: 0, trades: 0, errors: 0,
   startTime: Date.now(),
@@ -1613,6 +1651,9 @@ async function processSignal(pair, tick, strategy, session, direction) {
 
 async function runSweep() {
   stats.sweeps++
+
+  // Check for admin-triggered cache reset (throttled to every 30s)
+  await checkForCacheReset().catch(() => {})
 
   // Snapshot the sweep instant once and pass it to every time-dependent helper.
   // Calling new Date() inside each (isMarketOpen, getSession, log timestamp) used
