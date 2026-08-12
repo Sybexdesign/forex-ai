@@ -281,6 +281,21 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   const [placingMirrorScalp, setPlacingMirrorScalp] = useState<string | null>(null)
   const [pfEnabled, setPfEnabled]     = useState(false)
   const [pfRiskCap, setPfRiskCap]     = useState<number | null>(null)  // null = not yet loaded
+  // Hide Silver cards toggle — persisted to localStorage so the preference
+  // survives reloads and applies across all devices.
+  const [hideSilver, setHideSilver] = useState<boolean>(() => {
+    try { return localStorage.getItem('forexai_hide_silver') === '1' } catch { return false }
+  })
+  const toggleHideSilver = () => {
+    setHideSilver(prev => {
+      const next = !prev
+      try { localStorage.setItem('forexai_hide_silver', next ? '1' : '0') } catch { /* ignore */ }
+      return next
+    })
+  }
+  // Pairs to render — excludes Silver when the toggle is ON
+  const visiblePairs = hideSilver ? METALS_ONLY.filter(p => p !== 'XAG/USD') : METALS_ONLY
+
 
   // Direction-confirmation analysis: per-pair result of the 5+5 strategy
   // fan-out (see /api/scalper/direction-check). Re-runs only when the user
@@ -447,7 +462,8 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   const runDirectionCheck = useCallback(async () => {
     setDirCheckLoading(true)
     try {
-      await Promise.all(METALS_ONLY.map(async pair => {
+      await Promise.all(visiblePairs.map(async pair => {
+
         try {
           const r = await fetch('/api/scalper/direction-check', {
             method:  'POST',
@@ -474,20 +490,21 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
       // is done reload the signal cards this way we have a fresh data for
       // both signal and market direction." Fire-and-forget — failures here
       // surface on the scalp cards via their own fetchError handling.
-      METALS_ONLY.forEach(p => fetchScalpSignalForPair(p))
+      visiblePairs.forEach(p => fetchScalpSignalForPair(p))
     } finally {
       setDirCheckLoading(false)
     }
-  }, [userId, dirCheckTimeframe, fetchScalpSignalForPair])
+  }, [userId, dirCheckTimeframe, fetchScalpSignalForPair, visiblePairs])
 
   // Poll scalp signals for each metal pair
   useEffect(() => {
-    METALS_ONLY.forEach(p => fetchScalpSignalForPair(p))
+    visiblePairs.forEach(p => fetchScalpSignalForPair(p))
     const id = setInterval(() => {
-      METALS_ONLY.forEach(p => fetchScalpSignalForPair(p))
+      visiblePairs.forEach(p => fetchScalpSignalForPair(p))
     }, SCALP_REFRESH_MS)
     return () => clearInterval(id)
-  }, [fetchScalpSignalForPair])
+  }, [fetchScalpSignalForPair, visiblePairs])
+
 
   const loadOpenTrades = useCallback(async (): Promise<any[]> => {
     if (!userId) return openTradesRef.current
@@ -1086,8 +1103,40 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         </div>
       </div>
 
+      {/* ── Hide Silver Toggle — hides Silver signal cards + direction confirmation card ── */}
+      <div style={{
+        background:   hideSilver ? 'rgba(255,200,0,0.06)' : 'rgba(255,255,255,0.02)',
+        border:       `1px solid ${hideSilver ? 'rgba(255,200,0,0.3)' : 'rgba(255,255,255,0.07)'}`,
+        borderRadius: 5,
+        padding:      '8px 14px',
+        display:      'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+        flexWrap:     'wrap',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1.5, color: hideSilver ? '#ffc800' : 'var(--text-muted)' }}>
+            SILVER CARDS
+          </span>
+          <span style={{ fontSize: 10, color: 'var(--text-dim)' }}>
+            {hideSilver ? 'Hidden — Gold only' : 'Visible — Gold + Silver'}
+          </span>
+        </div>
+        <button
+          onClick={toggleHideSilver}
+          title={hideSilver ? 'Show Silver signal cards and direction confirmation' : 'Hide Silver signal cards and direction confirmation'}
+          style={{
+            padding: '6px 16px', borderRadius: 4, border: 'none', cursor: 'pointer',
+            fontWeight: 700, fontSize: 11, letterSpacing: 1.5, flexShrink: 0,
+            background: hideSilver ? 'rgba(255,200,0,0.18)' : 'rgba(255,255,255,0.06)',
+            color: hideSilver ? '#ffc800' : 'var(--text-muted)',
+          }}
+        >
+          {hideSilver ? '● HIDE SILVER' : '○ SHOW SILVER'}
+        </button>
+      </div>
+
       {/* ── Circuit Breaker Banner — only renders when CB is active ───────────── */}
       {circuitBreakerUntil && cbCountdown && (
+
         <div className="circuit-breaker-banner">
           <div className="circuit-breaker-icon">⚡</div>
           <div className="circuit-breaker-content">
@@ -1281,8 +1330,9 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
               PAIRS — only execute signals for selected instruments
             </div>
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              {METALS_ONLY.map(pair => {
+              {visiblePairs.map(pair => {
                 const active = autoPairs.has(pair)
+
                 const label  = pair === 'XAU/USD' ? 'Gold · XAU/USD' : 'Silver · XAG/USD'
                 return (
                   <button key={pair} onClick={() => setAutoPairs(prev => {
@@ -1386,9 +1436,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           </div>
         </div>
         <div className="scalp-signal-grid">
-          {METALS_ONLY.map(pair => {
+          {visiblePairs.map(pair => {
             void scalpTick   // force per-second re-render so age + status update live
             const r = dirCheck[pair]
+
             const name = pair === 'XAU/USD' ? 'Gold' : 'Silver'
             const hasResult = !!r && !r.error && !r.simulated
             const placeholder = !r && !dirCheckLoading
@@ -1673,10 +1724,11 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         </div>
 
       <div className="scalp-signal-grid">
-        {METALS_ONLY.map(pair => {
+        {visiblePairs.map(pair => {
           const sig  = scalpSignals[pair]
           const name = pair === 'XAU/USD' ? 'Gold' : 'Silver'
           const dir  = sig?.direction ?? 'HOLD'
+
           const conf = sig?.confidence ?? 0
           // scalpTick forces re-render; expiry recomputed from real Date.now() each second
           void scalpTick
@@ -1881,9 +1933,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         </div>
 
         <div className="scalp-signal-grid">
-          {METALS_ONLY.map(pair => {
+          {visiblePairs.map(pair => {
             const sig      = scalpSignals[pair]
             const name     = pair === 'XAU/USD' ? 'Gold' : 'Silver'
+
             const origDir  = sig?.direction ?? 'HOLD'
             const dir: 'BUY' | 'SELL' | 'HOLD' =
               origDir === 'BUY' ? 'SELL' : origDir === 'SELL' ? 'BUY' : 'HOLD'
