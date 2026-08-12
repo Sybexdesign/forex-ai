@@ -1386,10 +1386,12 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           </div>
         </div>
         <div className="scalp-signal-grid">
-          {METALS_ONLY.map(pair => {
+          {/* Silver (XAG/USD) signal cards commented out — Gold only */}
+          {METALS_ONLY.filter(p => p !== 'XAG/USD').map(pair => {
             void scalpTick   // force per-second re-render so age + status update live
             const r = dirCheck[pair]
             const name = pair === 'XAU/USD' ? 'Gold' : 'Silver'
+
             const hasResult = !!r && !r.error && !r.simulated
             const placeholder = !r && !dirCheckLoading
             const dirColor =
@@ -1673,10 +1675,12 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         </div>
 
       <div className="scalp-signal-grid">
-        {METALS_ONLY.map(pair => {
+        {/* Silver (XAG/USD) signal cards commented out — Gold only */}
+        {METALS_ONLY.filter(p => p !== 'XAG/USD').map(pair => {
           const sig  = scalpSignals[pair]
           const name = pair === 'XAU/USD' ? 'Gold' : 'Silver'
           const dir  = sig?.direction ?? 'HOLD'
+
           const conf = sig?.confidence ?? 0
           // scalpTick forces re-render; expiry recomputed from real Date.now() each second
           void scalpTick
@@ -1881,10 +1885,12 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         </div>
 
         <div className="scalp-signal-grid">
-          {METALS_ONLY.map(pair => {
+          {/* Silver (XAG/USD) mirror cards commented out — Gold only */}
+          {METALS_ONLY.filter(p => p !== 'XAG/USD').map(pair => {
             const sig      = scalpSignals[pair]
             const name     = pair === 'XAU/USD' ? 'Gold' : 'Silver'
             const origDir  = sig?.direction ?? 'HOLD'
+
             const dir: 'BUY' | 'SELL' | 'HOLD' =
               origDir === 'BUY' ? 'SELL' : origDir === 'SELL' ? 'BUY' : 'HOLD'
             const conf = sig?.confidence ?? 0
