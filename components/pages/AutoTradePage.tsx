@@ -276,7 +276,9 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   const [openPage, setOpenPage] = useState(0)
   const autoExecutedRef = useRef<Set<string>>(new Set())
   const [scalpSignals, setScalpSignals] = useState<Record<string, ScalpSignal>>({})
+  const scalpSignalsRef = useRef<Record<string, ScalpSignal>>({})  // mirror for polling checks
   const [scalpTick, setScalpTick] = useState(0)  // increments every second for expiry countdown
+
   const [placingScalp, setPlacingScalp] = useState<string | null>(null)
   const [placingMirrorScalp, setPlacingMirrorScalp] = useState<string | null>(null)
   const [pfEnabled, setPfEnabled]     = useState(false)
@@ -496,14 +498,45 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     }
   }, [userId, dirCheckTimeframe, fetchScalpSignalForPair, visiblePairs])
 
-  // Poll scalp signals for each metal pair
+  // Keep the ref in sync with the state so the polling loop can check expiry
+  // without triggering re-renders.
+  useEffect(() => { scalpSignalsRef.current = scalpSignals }, [scalpSignals])
+
+  // Poll scalp signals for each metal pair. Signals are only re-fetched when
+  // they have EXPIRED (3-minute validity) — not every 15 seconds. This keeps
+  // the confidence %, direction, entry/SL/TP stable for the full signal
+  // validity window, matching the countdown timer displayed on each card.
+  // Live price re-anchoring (entry/SL/TP) still updates every second via the
+  // scalpTick re-render + liveAnchoredLevels() using the OANDA prices feed.
   useEffect(() => {
     visiblePairs.forEach(p => fetchScalpSignalForPair(p))
     const id = setInterval(() => {
-      visiblePairs.forEach(p => fetchScalpSignalForPair(p))
+      visiblePairs.forEach(p => {
+        const sig = scalpSignalsRef.current[p]
+        // Re-fetch only if there's no signal yet, it's HOLD, or it has expired.
+        if (!sig || sig.direction === 'HOLD' || sig.expiresAt <= Date.now()) {
+          fetchScalpSignalForPair(p)
+        }
+      })
     }, SCALP_REFRESH_MS)
     return () => clearInterval(id)
   }, [fetchScalpSignalForPair, visiblePairs])
+
+  // Re-fetch fresh signals when the browser tab becomes visible again
+  // (covers browser refresh, tab switching, and window focus). This ensures
+  // the signal cards always show the latest data after the page reloads or
+  // the user returns to the tab.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        visiblePairs.forEach(p => fetchScalpSignalForPair(p))
+      }
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [fetchScalpSignalForPair, visiblePairs])
+
+
 
 
   const loadOpenTrades = useCallback(async (): Promise<any[]> => {
