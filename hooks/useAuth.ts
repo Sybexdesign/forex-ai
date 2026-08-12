@@ -53,25 +53,39 @@ export function useAuth() {
   }, [])
 
   const signUp = useCallback(async (email: string, password: string, fullName?: string) => {
+    // Use the production URL for the email confirmation redirect.
+    // The useAuth hook's onAuthStateChange listener picks up the session
+    // from the URL hash when the user clicks the confirmation link.
+    const redirectTo = typeof window !== 'undefined'
+      ? window.location.origin
+      : 'https://forex.sybexdesigns.co.uk'
     const { data, error } = await getSupabase().auth.signUp({
       email, password,
       options: {
         data: { full_name: fullName || '' },
-        emailRedirectTo: typeof window !== 'undefined' ? window.location.origin : undefined,
+        emailRedirectTo: redirectTo,
       },
     })
     return { user: data.user, error }
   }, [])
+
+
+
 
   const signOut = useCallback(async () => {
     await getSupabase().auth.signOut()
   }, [])
 
   const resetPassword = useCallback(async (email: string) => {
-    const redirectTo = typeof window !== 'undefined' ? `${window.location.origin}/reset-password` : undefined
+    // Use the production URL for the password reset redirect.
+    const baseUrl = typeof window !== 'undefined'
+      ? window.location.origin
+      : 'https://forex.sybexdesigns.co.uk'
+    const redirectTo = `${baseUrl}/reset-password`
     const { error } = await getSupabase().auth.resetPasswordForEmail(email, { redirectTo })
     return { error }
   }, [])
+
 
   const isAdmin = state.user?.email === 'sybexdesigns@gmail.com'
 
