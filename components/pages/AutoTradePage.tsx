@@ -525,16 +525,24 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   // Re-fetch fresh signals when the browser tab becomes visible again
   // (covers browser refresh, tab switching, and window focus). This ensures
   // the signal cards always show the latest data after the page reloads or
-  // the user returns to the tab.
+  // the user returns to the tab. IMPORTANT: only re-fetches signals that have
+  // EXPIRED — never re-fetches active signals, so the confidence %, direction
+  // and countdown timer stay stable for the full 3-minute validity window.
   useEffect(() => {
     const onVisible = () => {
-      if (document.visibilityState === 'visible') {
-        visiblePairs.forEach(p => fetchScalpSignalForPair(p))
-      }
+      if (document.visibilityState !== 'visible') return
+      visiblePairs.forEach(p => {
+        const sig = scalpSignalsRef.current[p]
+        // Only re-fetch if there's no signal yet, it's HOLD, or it has expired.
+        if (!sig || sig.direction === 'HOLD' || sig.expiresAt <= Date.now()) {
+          fetchScalpSignalForPair(p)
+        }
+      })
     }
     document.addEventListener('visibilitychange', onVisible)
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [fetchScalpSignalForPair, visiblePairs])
+
 
 
 
