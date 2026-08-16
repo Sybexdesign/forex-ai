@@ -3,8 +3,12 @@
 // Returns rolling win-rate per signal_type over configurable windows
 // (last 50 signals, last 7 days, last 30 days) plus the inconclusive rate.
 //
+// The data is GLOBAL — aggregated across all users — so the badge always
+// shows a live comparison regardless of which account is active. This is
+// intentional: the reconciliation badge is a platform-wide health indicator,
+// not a per-user stat.
+//
 // Query params:
-//   userId  — required, the authenticated user's UUID
 //   window  — optional, one of '50' | '7d' | '30d' (default '50')
 //
 // Response shape:
@@ -13,6 +17,7 @@
 //     mirror: { winRate, n, wins, losses, inconclusive, inconclusiveRate },
 //     windows: { '50': {...}, '7d': {...}, '30d': {...} }  // all windows
 //   }
+
 
 export const dynamic = 'force-dynamic'
 
@@ -62,22 +67,21 @@ function computeStats(rows: any[]): TypeStats {
 }
 
 export async function GET(req: NextRequest) {
-  const userId = req.nextUrl.searchParams.get('userId')
-  if (!userId) return NextResponse.json({ error: 'userId required' }, { status: 400 })
-
   try {
     const sb = getAdminClient()
 
-    // Fetch all resolved signals for this user, ordered newest first.
-    // We fetch a generous limit (500) and compute all windows in JS to avoid
-    // multiple round-trips. The table is small per-user so this is fine.
+    // Fetch ALL resolved signals across every user, ordered newest first.
+    // The reconciliation badge is a platform-wide health indicator, so the
+    // data is aggregated globally — every account sees the same live
+    // comparison. We fetch a generous limit (2000) and compute all windows
+    // in JS to avoid multiple round-trips.
     const { data, error } = await sb
       .from('signal_reconciliation')
       .select('signal_type, outcome, generated_at')
-      .eq('user_id', userId)
       .not('outcome', 'is', null)
       .order('generated_at', { ascending: false })
-      .limit(500)
+      .limit(2000)
+
 
     if (error) throw error
 

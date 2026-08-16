@@ -164,18 +164,16 @@ interface ReconResponse {
   mirror: ReconStats
 }
 
-function useSignalReconciliation(userId?: string) {
+function useSignalReconciliation() {
   const [stats, setStats] = useState<ReconResponse | null>(null)
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
-    if (!userId) { setStats(null); return }
-    const uid = userId
     let cancelled = false
     async function fetch_() {
       setLoading(true)
       try {
-        const res = await fetch(`/api/signal-reconciliation?userId=${encodeURIComponent(uid)}`)
+        const res = await fetch('/api/signal-reconciliation')
 
         if (!res.ok) return
         const data = await res.json()
@@ -187,42 +185,23 @@ function useSignalReconciliation(userId?: string) {
     fetch_()
     const id = setInterval(fetch_, 60_000) // refresh every minute
     return () => { cancelled = true; clearInterval(id) }
-  }, [userId])
+  }, [])
 
   return { stats, loading }
 }
 
+
 // Compact badge rendered in the SCALP SIGNALS / MIRROR TRADES section headers.
 // Shows the win-rate for the given signal type plus a comparison arrow against
 // the other type. Green when this type is winning, red when losing, muted when
-// no data yet. Always renders — shows a "NO DATA" state when there are no
-// resolved signals yet so every user sees the badge from any account.
+// no data yet. Always renders — shows the live comparison with "—" placeholders
+// when there's no data yet, so every user sees the badge from any account.
 function ReconBadge({ stats, type }: { stats: ReconResponse | null; type: 'scalp' | 'mirror' }) {
   const mine   = stats?.[type]
   const other  = stats?.[type === 'scalp' ? 'mirror' : 'scalp']
   const hasData = !!mine && mine.n > 0
 
-  // No data yet — show a muted "NO DATA" badge so the badge is always visible.
-  if (!hasData) {
-    return (
-      <span
-        title="No resolved signals yet — win-rate comparison will appear once signals have been scored"
-        style={{
-          fontSize: 9, fontWeight: 700, letterSpacing: 1,
-          padding: '2px 6px', borderRadius: 2,
-          background: 'rgba(255,255,255,0.06)',
-          color: 'var(--text-muted)',
-          fontFamily: 'JetBrains Mono',
-          textTransform: 'uppercase',
-          cursor: 'help',
-        }}
-      >
-        — NO DATA
-      </span>
-    )
-  }
-
-  const mineRate  = mine.winRate
+  const mineRate  = mine?.winRate ?? null
   const otherRate = other?.winRate ?? null
   const diff      = mineRate !== null && otherRate !== null ? mineRate - otherRate : null
   const isWinning = diff !== null && diff > 0
@@ -232,7 +211,9 @@ function ReconBadge({ stats, type }: { stats: ReconResponse | null; type: 'scalp
 
   return (
     <span
-      title={`Last ${mine.n} resolved signals · ${mine.wins}W/${mine.losses}L/${mine.inconclusive} inc · noise threshold ${stats?.noiseThresholdPips ?? 0.3} pips`}
+      title={hasData
+        ? `Last ${mine.n} resolved signals · ${mine.wins}W/${mine.losses}L/${mine.inconclusive} inc · noise threshold ${stats?.noiseThresholdPips ?? 0.3} pips`
+        : 'Live comparison — win-rate will populate as signals are scored'}
       style={{
         fontSize: 9, fontWeight: 700, letterSpacing: 1,
         padding: '2px 6px', borderRadius: 2,
@@ -247,6 +228,7 @@ function ReconBadge({ stats, type }: { stats: ReconResponse | null; type: 'scalp
     </span>
   )
 }
+
 
 
 
@@ -361,7 +343,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
 
   // Signal Reconciliation — rolling win-rate comparison between scalp and
   // mirror signal paths. Fetched from /api/signal-reconciliation every minute.
-  const { stats: reconStats } = useSignalReconciliation(userId)
+  // Data is GLOBAL (aggregated across all users) so the badge always shows
+  // live comparison data regardless of which account is active.
+  const { stats: reconStats } = useSignalReconciliation()
+
 
   const { enabled, setEnabled, scanning, lastScan, countdown, pendingSignals, diagnostics = [], error, runScan, rejectSignal, clearAll } = scanner
 
