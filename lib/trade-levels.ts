@@ -40,8 +40,15 @@ export const MAX_LOTS     = 10   // hard ceiling on any single position (lots)
 // inside their freeze level (MT5 retcode 10016), which can change with spread
 // spikes. Conservative per-instrument floors; anything tighter is widened
 // with a 10% safety margin before placement.
+//
+// XAU min-stop resolved 2026-08-25 (audit Phase 1.3): the previous 35-pip
+// TEMP DIAGNOSTIC was never reverted. XAU/USD 5-day ATR has a 5th percentile
+// of ~24 pips, so a 35-pip floor forces every trade into a stop distance far
+// larger than the volatility suggests — distorting R:R and ML labels. The
+// correct floor is 20 pips (the pre-diagnostic value), which sits below the
+// 5th-percentile ATR while still clearing the broker's freeze level.
 export const MIN_STOP_PIPS: Record<string, number> = {
-  XAU: 35,    // TEMP DIAGNOSTIC 2026-06-11: raised 20 → 35 alongside MIRROR_SL_CAP to test retcode 10013 on XAU. Revert to 20 once root cause confirmed.
+  XAU: 20,    // XAU/USD: 20 pips at pip=0.1 — below 5th-pct ATR (~24p), clears broker freeze
   XAG: 10,    // XAG/USD: 0.10 USD = 10 pips at pip=0.01
   JPY: 5,     // *JPY: 5 pips at pip=0.01
   FX:  3,     // major FX: 3 pips at pip=0.0001

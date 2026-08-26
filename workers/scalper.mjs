@@ -43,9 +43,10 @@ const STRATEGY_REFRESH_MS = 5 * 60_000  // re-pull live strategy every 5 min
 // SL/TP clamp bounds — see AutoTradePage MIRROR_SL_CAP comment. Floor = user's
 // liveStrategy.slPips/tpPips; outer cap = these constants. Keep in sync with the
 // browser values; both code paths feed the same /api/orders endpoint.
-// TEMP DIAGNOSTIC 2026-06-11: raised 25 → 35 to test whether retcode 10013 on
-// XAU mirror orders is a broker stops-level issue. Revert to 25 once root
-// cause confirmed. Mirrored in components/pages/AutoTradePage.tsx:32.
+// Diagnostic resolved 2026-08-25 (audit Phase 1.3): the raised values were
+// originally a TEMP test for retcode 10013. The XAU min-stop floor (20 pips)
+// is now the correct constraint; the cap stays at 35 for SL and 70 for TP to
+// match lib/trade-levels.ts. Mirrored in components/pages/AutoTradePage.tsx:32.
 const MIRROR_SL_CAP = 35
 const MIRROR_TP_CAP = 70
 

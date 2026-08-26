@@ -16,6 +16,11 @@ interface TickSnapshot {
   adx: number; atr: number; atrPips: number
   spreadPips: number; buyPressure: number; tickVolume: number
   emaCrossSignal: string
+  // Audit Phase 1.4 — provenance of the spread value: 'live' bid/ask feed
+  // vs the static per-instrument default. Gates must only fire on 'live'.
+  spreadSource?: 'live' | 'default'
+  bid?: number | null
+  ask?: number | null
 }
 
 function pipSize(pair: string): number {
@@ -332,7 +337,27 @@ export async function POST(req: NextRequest) {
       })
     }
 
-    // Thin-history block: EMA50/ADX computed on <100 bars are poorly converged
+    // Candle-closed gate (audit Phase 1.1): predictions computed on an
+    // unfinished candle are unreliable — indicator values change every tick
+    // and produce flash signals that flip direction mid-candle. The tick route
+    // now returns `candleClosed` when the final candle has fully formed.
+    // When the flag is present and false, HOLD — the confirmed signal is only
+    // emitted once the candle closes. Absent field (older callers / tests)
+    // is not blocked.
+    if (body.candleClosed === false) {
+      return NextResponse.json({
+        direction:  'HOLD' as Direction,
+        confidence: 0,
+        reasons:    ['Candle not yet closed — waiting for the current candle to complete before generating a signal'],
+        risk_note:  'Signal blocked: prediction requires a closed candle to avoid flash direction changes.',
+        entry: body.price || 0, sl: body.price || 0, tp: body.price || 0,
+        fallback: false,
+        candleOpen: true,
+        ml: null,
+      })
+    }
+
+    // History block: EMA50/ADX computed on <100 bars are poorly converged
     // — a direction from half-warmed indicators is noise with a confidence
     // number attached. Callers forward the tick verbatim, so candleCount is
     // present whenever the tick route produced the data. Absent field (older
@@ -383,6 +408,35 @@ export async function POST(req: NextRequest) {
         effectiveMinStrength: 100,
         suggestedSection:     null,
         adx:                  t.adx,
+      })
+    }
+
+    // ── Live-spread gate (audit Phase 1.4) ──────────────────────────────────
+    // Blocks signals when the REAL bid/ask spread is too wide relative to ATR.
+    // Entering through a wide spread hands back most of the expected move, so
+    // this is a hard block (not just a confidence penalty) — but ONLY when the
+    // spread is live market data. The static per-instrument default is an
+    // estimate, not a market condition, and is handled by the soft penalty in
+    // fallbackSignal() instead. Threshold matches the strategy prompts and the
+    // rule engine: >40% of ATR.
+    if (t.spreadSource === 'live' && t.atrPips > 0 && t.spreadPips > t.atrPips * 0.4) {
+      const reason = `Live spread ${t.spreadPips.toFixed(1)} pips exceeds 40% of ATR (${t.atrPips.toFixed(1)} pips) — wide-spread gate`
+      console.log(`[scalper/signal] ${reason} (${pair})`)
+      return NextResponse.json({
+        direction:            'HOLD' as Direction,
+        confidence:           0,
+        reasons:              [reason],
+        risk_note:            'Signal blocked: live bid/ask spread too wide relative to ATR. Wait for spread to normalise.',
+        entry:                t.price,
+        sl:                   t.price,
+        tp:                   t.price,
+        fallback:             false,
+        spreadGate:           true,
+        spreadPips:           t.spreadPips,
+        atrPips:              t.atrPips,
+        bid:                  t.bid ?? null,
+        ask:                  t.ask ?? null,
+        ml:                   null,
       })
     }
 
@@ -553,7 +607,10 @@ Return JSON only:
       preGateConfidence,
     }
 
-    // Persist to signals table
+    // Persist to signals table (audit Phase 1.5)
+    // `direction` remains the final gated direction. `predicted_direction`
+    // stores the raw engine output before any gate (discipline/ML) touched it,
+    // so we can later measure whether the filters actually improve accuracy.
     if (userId && result.direction !== 'HOLD') {
       try {
         const admin = getAdminClient()
@@ -562,12 +619,15 @@ Return JSON only:
           pair,
           timeframe:          'scalper',
           direction:          result.direction,
+          predicted_direction: preGateDirection,
+          gating_reasons:     audit.disciplineAction ? [audit.disciplineAction] : [],
           confidence:         result.confidence,
           checklist_score:    0,
           reasons:            result.reasons,
           risk_note:          result.risk_note,
           acted_on:           false,
           outcome:            'PENDING',
+          candle_close_time:  body.lastCandleTime ? new Date(body.lastCandleTime).getTime() + 5 * 60_000 : null,
           indicator_snapshot: {
             ...body,
             _computed: { entry: result.entry, sl: result.sl, tp: result.tp },

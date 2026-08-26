@@ -2,7 +2,7 @@
 export const dynamic = 'force-dynamic'  // live price data — must never be cached
 
 import { NextRequest, NextResponse } from 'next/server'
-import { getMarketCandles } from '@/lib/marketdata'
+import { getMarketCandles, getMarketPrices } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -28,7 +28,19 @@ export async function GET(req: NextRequest) {
   const timeframe = searchParams.get('timeframe') || '5m'
   const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
 
-  const { candles, source: brokerName, simulated } = await getMarketCandles(authToken, pair, timeframe, 200)
+  // Fetch candles and live bid/ask quotes in parallel — the price feed is
+  // independent of the OHLC series. The spread is advisory (gating input), so
+  // the quote fetch is race'd against a 6s timeout: a slow broker feed must
+  // never stall the tick endpoint the worker polls every 10s.
+  const pricePromise = getMarketPrices(authToken, [pair]).catch(() => null)
+  const timedPrices  = Promise.race([
+    pricePromise,
+    new Promise<null>(resolve => setTimeout(() => resolve(null), 6000)),
+  ])
+  const [{ candles, source: brokerName, simulated }, priceFeed] = await Promise.all([
+    getMarketCandles(authToken, pair, timeframe, 200),
+    timedPrices,
+  ])
 
   // Standard indicators (EMA20/50, RSI14, MACD, Bollinger, ADX)
   const ind = calculateIndicators(candles)
@@ -67,9 +79,46 @@ export async function GET(req: NextRequest) {
     : 0
 
   const pip        = pipSize(pair)
-  const spread     = defaultSpread(pair)
+
+  // ── Real spread feed (audit Phase 1.4) ─────────────────────────────────────
+  // Use the live bid/ask spread from the broker price feed when available.
+  // `spreadSource` tells downstream gates whether the value is a real market
+  // condition or a static per-instrument baseline — wide-spread gating must
+  // only fire on live data, never on the default estimate.
+  let spread      = defaultSpread(pair)
+  let spreadSource: 'live' | 'default' = 'default'
+  let bid: number | null = null
+  let ask: number | null = null
+  const quote = priceFeed?.prices.find((p: any) => p.pair === pair)
+  if (quote && !priceFeed?.simulated && quote.bid > 0 && quote.ask >= quote.bid) {
+    bid          = quote.bid
+    ask          = quote.ask
+    spread       = +(quote.ask - quote.bid).toFixed(6)
+    spreadSource = 'live'
+  }
+
   const spreadPips = +(spread / pip).toFixed(1)
   const atrPips    = +(atr    / pip).toFixed(1)
+
+  // ── Candle-closed detection (audit Phase 1.1) ─────────────────────────────
+  // The last candle in the array may still be in progress. Signal generation
+  // must NOT run against an unfinished candle — the indicator values change
+  // every tick and produce flash predictions. Compute whether the candle has
+  // closed by comparing the final candle's open time + timeframe span against
+  // the server clock.
+  const TF_SPAN_MS: Record<string, number> = {
+    '1m': 60_000, '3m': 3 * 60_000, '5m': 5 * 60_000, '15m': 15 * 60_000,
+    '30m': 30 * 60_000, '1H': 60 * 60_000, '1h': 60 * 60_000, '4H': 4 * 60 * 60_000,
+    '4h': 4 * 60 * 60_000, '1D': 24 * 60 * 60_000, 'Daily': 24 * 60 * 60_000,
+  }
+  const spanMs = TF_SPAN_MS[timeframe]
+  let candleClosed = false
+  if (spanMs && candles.length > 0) {
+    const lastCandleOpenMs = new Date(candles[candles.length - 1].time).getTime()
+    if (isFinite(lastCandleOpenMs)) {
+      candleClosed = Date.now() >= lastCandleOpenMs + spanMs
+    }
+  }
 
   return NextResponse.json({
     price:          ind.currentPrice,
@@ -92,6 +141,9 @@ export async function GET(req: NextRequest) {
     atrPips,
     spread,
     spreadPips,
+    bid,
+    ask,
+    spreadSource,
     buyPressure,
     tickVolume,
     volSMA20,
@@ -104,6 +156,9 @@ export async function GET(req: NextRequest) {
     // `timestamp` is server time, NOT candle time — keep both.
     candleCount:    candles.length,
     lastCandleTime: candles[candles.length - 1]?.time ?? null,
+    // Phase 1.1: authoritative "is the last candle COMPLETE?" flag.
+    // Prediction pipelines MUST gate on this flag before emitting a signal.
+    candleClosed,
     timestamp:      Date.now(),
   })
 }

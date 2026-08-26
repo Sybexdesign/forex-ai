@@ -18,7 +18,6 @@ import argparse
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, roc_auc_score, accuracy_score
 from supabase import create_client
 from dotenv import load_dotenv
@@ -261,6 +260,9 @@ def extract_features(row):
 features = []
 targets  = []
 pairs_list = []
+# Temporal ordering is essential for walk-forward validation. Every feature
+# row is paired with its created_at so we can split on time, not at random.
+created_list = []
 
 for _, row in df.iterrows():
     feat = extract_features(row)
@@ -268,9 +270,11 @@ for _, row in df.iterrows():
         features.append(feat)
         targets.append(1 if row['outcome'] == 'WIN' else 0)
         pairs_list.append(row.get('pair', 'EUR/USD'))
+        created_list.append(row.get('created_at', ''))
 
 feature_df = pd.DataFrame(features)
 y = np.array(targets)
+created_col = pd.Series(created_list)
 
 # One-hot encode pair using fixed set so serve.py always has the same columns
 for p in ALL_PAIRS:
@@ -281,10 +285,11 @@ for p in ALL_PAIRS:
 # the model would overfit to the specific hours in our small dataset.
 feature_df.drop(columns=[c for c in ['hour_utc'] if c in feature_df.columns], inplace=True)
 
-# Drop rows with NaN
+# Drop rows with NaN — track the mask so created_col stays aligned with X/y
 mask       = ~feature_df.isna().any(axis=1)
 feature_df = feature_df[mask]
 y          = y[mask.values]
+created_col_filtered = created_col[mask.values].reset_index(drop=True)
 
 feature_names = list(feature_df.columns)
 X = feature_df.values
@@ -296,54 +301,173 @@ spw     = max(1.0, n_loss / n_wins) if n_wins > 0 else 1.0
 print(f"✓ Features: {len(feature_names)} columns, {len(X)} samples")
 print(f"  WIN: {n_wins}  LOSS: {n_loss}  win_rate={y.mean():.1%}  scale_pos_weight={spw:.1f}")
 
-# ─── Train / test split ───────────────────────────────────────────────────────
+# ─── Walk-forward train/test split (audit Phase 1.2) ──────────────────────────
+# Random train_test_split on time-series market data creates look-ahead bias:
+# the model sees future price behaviour in training. Instead, sort strictly
+# by created_at and walk the training window forward. The model is trained
+# ONLY on past data and validated ONLY on future data it never saw.
+#
+# Protocol:
+#   initial_train = 60% of samples (chronological)
+#   fold_size     = 10% of samples (advances by 10% each step)
+#   The FINAL reported AUC is the mean over all out-of-sample validation
+#   folds — the honest estimate of live performance.
 
-# With small WIN counts, put all WINs in train to avoid empty test class
-if n_wins < 10:
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.15, stratify=y, random_state=42
-    )
+_ts_raw = created_col_filtered.map(
+    lambda x: _parse_ts(str(x)) if isinstance(x, str) and x else None
+)
+_ts_dt  = pd.to_datetime(_ts_raw, errors='coerce', utc=True)
+
+# Sort rows by created_at (stable for ties). Fall back to source order if NaT.
+if _ts_dt.isna().all():
+    order = np.arange(len(X))
+    print("  ⚠  All timestamps missing — using source order (best-effort)")
 else:
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=42
+    order = np.argsort(_ts_dt.values, kind='stable')
+
+X_sorted = X[order]
+y_sorted = y[order]
+n_total  = len(X_sorted)
+
+AVG_AUC = 0.0
+
+if n_total < 30:
+    print(f"❌ Need at least 30 samples for walk-forward validation, got {n_total}")
+    print("   Falling back to simple hold-out split (train=80%, val=20%).")
+    cut      = int(n_total * 0.8)
+    X_tr, X_va = X_sorted[:cut], X_sorted[cut:]
+    y_tr, y_va = y_sorted[:cut], y_sorted[cut:]
+    fold_spw = max(1.0, (len(y_tr) - y_tr.sum()) / max(1.0, y_tr.sum()))
+    model = xgb.XGBClassifier(
+        n_estimators=150, max_depth=3, learning_rate=0.05, subsample=0.7,
+        colsample_bytree=0.7, min_child_weight=5, reg_alpha=0.1,
+        reg_lambda=1.5, scale_pos_weight=fold_spw, eval_metric='aucpr',
+        random_state=42,
     )
-print(f"\n📊 Train: {len(X_train)} | Test: {len(X_test)}")
+    model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+    AVG_AUC = float(roc_auc_score(y_va, model.predict_proba(X_va)[:, 1]))
+    print(f"  Holdout AUC = {AVG_AUC:.4f}")
+else:
+    train_frac = 0.60
+    val_frac   = 0.10
+    step_frac  = 0.10
 
-# ─── Train XGBoost ────────────────────────────────────────────────────────────
+    train_n = max(20, int(n_total * train_frac))
+    val_n   = max(5,  int(n_total * val_frac))
+    step_n  = max(5,  int(n_total * step_frac))
 
-print("\n🧠 Training XGBoost...")
+    fold_logs = []
+    best_fold_model = None
+    best_fold_auc   = -1.0
 
+    print(f"\n📊 Walk-forward split: {n_total} samples")
+    print(f"   Initial train: {train_n} | Val step: {val_n} | Step size: {step_n}")
+
+    cur_end = train_n
+    fold_idx = 0
+    while cur_end + val_n <= n_total:
+        tr_end = cur_end
+        va_end = cur_end + val_n
+        if tr_end < 10 or va_end <= tr_end:
+            break
+
+        X_tr = X_sorted[:tr_end]
+        y_tr = y_sorted[:tr_end]
+        X_va = X_sorted[tr_end:va_end]
+        y_va = y_sorted[tr_end:va_end]
+
+        # Skip folds with a single class in validation (can't compute AUC)
+        if len(np.unique(y_va)) < 2:
+            print(f"  Fold {fold_idx}: skipped (val single-class)")
+            cur_end += step_n
+            fold_idx += 1
+            continue
+
+        fold_spw = max(1.0, (len(y_tr) - y_tr.sum()) / max(1.0, y_tr.sum()))
+
+        fold_model = xgb.XGBClassifier(
+            n_estimators=150, max_depth=3, learning_rate=0.05, subsample=0.7,
+            colsample_bytree=0.7, min_child_weight=5, reg_alpha=0.1,
+            reg_lambda=1.5, scale_pos_weight=fold_spw, eval_metric='aucpr',
+            random_state=42,
+        )
+        fold_model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+
+        fold_auc = float(roc_auc_score(y_va, fold_model.predict_proba(X_va)[:, 1]))
+        fold_acc = float(accuracy_score(y_va, fold_model.predict(X_va)))
+        print(f"  Fold {fold_idx}: train={tr_end} val=[{tr_end}:{va_end}] "
+              f"AUC={fold_auc:.4f} Acc={fold_acc:.4f}")
+        fold_logs.append({'fold': fold_idx, 'auc': fold_auc, 'acc': fold_acc,
+                          'train_end': tr_end, 'val_end': va_end})
+
+        if fold_auc > best_fold_auc:
+            best_fold_auc = fold_auc
+            best_fold_model = fold_model
+
+        cur_end += step_n
+        fold_idx += 1
+
+    if not fold_logs:
+        print("❌ No walk-forward folds — too few samples. Falling back.")
+        cut = int(n_total * 0.8)
+        X_tr, X_va = X_sorted[:cut], X_sorted[cut:]
+        y_tr, y_va = y_sorted[:cut], y_sorted[cut:]
+        fold_spw = max(1.0, (len(y_tr) - y_tr.sum()) / max(1.0, y_tr.sum()))
+        best_fold_model = xgb.XGBClassifier(
+            n_estimators=150, max_depth=3, learning_rate=0.05, subsample=0.7,
+            colsample_bytree=0.7, min_child_weight=5, reg_alpha=0.1,
+            reg_lambda=1.5, scale_pos_weight=fold_spw, eval_metric='aucpr',
+            random_state=42,
+        )
+        best_fold_model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+        best_fold_auc = float(roc_auc_score(y_va, best_fold_model.predict_proba(X_va)[:, 1]))
+        fold_logs.append({'fold': 'holdout', 'auc': best_fold_auc})
+        print(f"  Holdout AUC = {best_fold_auc:.4f}")
+
+    AVG_AUC = float(np.mean([f['auc'] for f in fold_logs]))
+    print("\n" + "=" * 60)
+    print("📈 WALK-FORWARD VALIDATION (out-of-sample)")
+    print("=" * 60)
+    print(f"  Folds: {len(fold_logs)}")
+    for f in fold_logs:
+        print(f"    Fold {f['fold']}: AUC={f['auc']:.4f} "
+              f"Acc={f.get('acc', float('nan')):.4f}")
+    print(f"\n  Mean OOS AUC: {AVG_AUC:.4f}")
+
+# ─── Train final model on ALL data for deployment ─────────────────────────────
+
+print("\n\n🧠 Training final model on all data (for deployment)...")
+
+# Final model uses the same hyperparameters. We train on all samples without
+# a separate holdout (the walk-forward AUC above is our honest OOS metric).
 model = xgb.XGBClassifier(
     n_estimators=150,
-    max_depth=3,            # shallower — prevents memorising specific price levels
+    max_depth=3,
     learning_rate=0.05,
     subsample=0.7,
     colsample_bytree=0.7,
-    min_child_weight=5,     # require more samples per leaf — stronger regularisation
-    reg_alpha=0.1,          # L1 regularisation
-    reg_lambda=1.5,         # L2 regularisation
+    min_child_weight=5,
+    reg_alpha=0.1,
+    reg_lambda=1.5,
     scale_pos_weight=spw,
     eval_metric='aucpr',
     random_state=42,
 )
+model.fit(X, y, verbose=False)
 
-model.fit(
-    X_train, y_train,
-    eval_set=[(X_test, y_test)],
-    verbose=False,
-)
+# ─── In-sample evaluation (informational only) ────────────────────────────────
 
-# ─── Evaluate ─────────────────────────────────────────────────────────────────
+y_pred  = model.predict(X)
+y_proba = model.predict_proba(X)[:, 1]
 
-y_pred  = model.predict(X_test)
-y_proba = model.predict_proba(X_test)[:, 1]
-
+in_auc = float(roc_auc_score(y, y_proba))
 print("\n" + "=" * 60)
 print("📈 MODEL PERFORMANCE")
 print("=" * 60)
-print(f"\nAccuracy:  {accuracy_score(y_test, y_pred):.4f}")
-print(f"ROC-AUC:   {roc_auc_score(y_test, y_proba):.4f}")
-print(f"\n{classification_report(y_test, y_pred, target_names=['LOSS', 'WIN'])}")
+print(f"\nIn-sample Accuracy:  {accuracy_score(y, y_pred):.4f}")
+print(f"In-sample ROC-AUC:   {in_auc:.4f}")
+print(f"Walk-forward OOS AUC: {AVG_AUC:.4f}   ← use this for validation")
+print(f"\n{classification_report(y, y_pred, target_names=['LOSS', 'WIN'])}")
 
 importance = model.feature_importances_
 sorted_idx = np.argsort(importance)[::-1]
