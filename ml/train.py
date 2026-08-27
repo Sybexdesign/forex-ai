@@ -19,6 +19,9 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import classification_report, roc_auc_score, accuracy_score
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_predict
 from supabase import create_client
 from dotenv import load_dotenv
 
@@ -32,6 +35,17 @@ parser.add_argument('--synthetic', default='',
                     help='Path to synthetic_signals.csv from generate_signals.py (merged with Supabase)')
 parser.add_argument('--synthetic-only', default='',
                     help='Use ONLY synthetic data (skip Supabase fetch)')
+parser.add_argument('--dataset', default='',
+                    help='Path to clean_dataset.csv from build_dataset.py (preferred; supersedes Supabase fetch)')
+parser.add_argument('--calibration', default='sigmoid', choices=['sigmoid', 'isotonic', 'none'],
+                    help='Probability calibration method (Phase 3, item 10). sigmoid=Platt, isotonic, none')
+parser.add_argument('--min-oos-auc', type=float, default=0.52,
+                    help='Walk-forward OOS AUC acceptance gate (Phase 3, item 12). Refuses to overwrite the '
+                         'production model when the honest OOS AUC is below this, unless --force is given.')
+parser.add_argument('--force', action='store_true',
+                    help='Overwrite the production model even when the OOS AUC gate fails.')
+parser.add_argument('--min-regime-samples', type=int, default=1000,
+                    help='Minimum samples required to train a regime-specific model (Phase 3, item 11).')
 args = parser.parse_args()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -56,7 +70,37 @@ all_rows = []
 
 # ─── Fetch data ───────────────────────────────────────────────────────────────
 
-if not args.synthetic_only:
+if args.dataset:
+    # Phase 3 (item 9): prefer the clean labeled dataset built by
+    # ml/build_dataset.py. It applies consistent re-labeling (SL/TP-first-hit
+    # against live candles) and drops contaminated/gated rows, so the model is
+    # trained on trustworthy labels instead of whatever outcome a legacy path
+    # happened to write.
+    if not os.path.exists(args.dataset):
+        print(f"✗ Clean dataset not found: {args.dataset}")
+        print("  Run: python build_dataset.py  (or use the default Supabase path)")
+        sys.exit(1)
+    ds = pd.read_csv(args.dataset)
+    print(f"✓ Clean dataset loaded: {len(ds)} rows from {args.dataset}")
+    for _, row in ds.iterrows():
+        snap = row.get('indicator_snapshot', '{}')
+        if isinstance(snap, str):
+            try:
+                snap = json.loads(snap)
+            except Exception:
+                snap = {}
+        all_rows.append({
+            'indicator_snapshot': snap,
+            'direction':          row.get('direction', 'HOLD'),
+            'confidence':         int(row.get('confidence', 50)),
+            'outcome':            row.get('outcome', 'LOSS'),
+            'pair':               row.get('pair', 'XAU/USD'),
+            'timeframe':          row.get('timeframe', 'clean-dataset'),
+            'created_at':         row.get('created_at', '2026-01-01T00:00:00+00:00'),
+            '_regime':            row.get('regime', ''),
+        })
+    print(f"✓ Clean dataset rows staged: {len(all_rows)}")
+elif not args.synthetic_only:
     page_size = 1000
     offset    = 0
     while True:
@@ -263,6 +307,10 @@ pairs_list = []
 # Temporal ordering is essential for walk-forward validation. Every feature
 # row is paired with its created_at so we can split on time, not at random.
 created_list = []
+# Phase 3 (item 11): regime tag per row for regime-specific models. Prefer the
+# clean dataset's explicit `regime` column; fall back to the snapshot tag the
+# signal route / worker persisted (indicator_snapshot._regime.marketRegime).
+regimes_list = []
 
 for _, row in df.iterrows():
     feat = extract_features(row)
@@ -271,6 +319,15 @@ for _, row in df.iterrows():
         targets.append(1 if row['outcome'] == 'WIN' else 0)
         pairs_list.append(row.get('pair', 'EUR/USD'))
         created_list.append(row.get('created_at', ''))
+        # Phase 3 (item 11): regime tag — prefer the clean dataset's explicit
+        # column; fall back to the snapshot tag persisted by the signal route
+        # (indicator_snapshot._regime.marketRegime).
+        snap = row.get('indicator_snapshot', {})
+        if isinstance(snap, dict):
+            regime_tag = snap.get('_regime', {}).get('marketRegime', '') if isinstance(snap.get('_regime'), dict) else ''
+        else:
+            regime_tag = ''
+        regimes_list.append(row.get('_regime', '') or regime_tag)
 
 feature_df = pd.DataFrame(features)
 y = np.array(targets)
@@ -290,6 +347,8 @@ mask       = ~feature_df.isna().any(axis=1)
 feature_df = feature_df[mask]
 y          = y[mask.values]
 created_col_filtered = created_col[mask.values].reset_index(drop=True)
+# Phase 3 (item 11): keep the regime tag aligned with X/y through the NaN mask.
+regimes_arr = np.array(regimes_list, dtype=object)[mask.values].tolist()
 
 feature_names = list(feature_df.columns)
 X = feature_df.values
@@ -347,6 +406,9 @@ if n_total < 30:
     model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
     AVG_AUC = float(roc_auc_score(y_va, model.predict_proba(X_va)[:, 1]))
     print(f"  Holdout AUC = {AVG_AUC:.4f}")
+    # Calibration set for the small-sample path = the holdout predictions.
+    oob_proba = model.predict_proba(X_va)[:, 1].tolist()
+    oob_y     = y_va.tolist()
 else:
     train_frac = 0.60
     val_frac   = 0.10
@@ -359,6 +421,11 @@ else:
     fold_logs = []
     best_fold_model = None
     best_fold_auc   = -1.0
+    # Phase 3 (item 10): accumulate every OOS (out-of-sample) prediction across
+    # folds so we can fit a probability calibrator (Platt/isotonic) on data the
+    # model never trained on — this is the honest calibration set.
+    oob_proba: list = []
+    oob_y: list     = []
 
     print(f"\n📊 Walk-forward split: {n_total} samples")
     print(f"   Initial train: {train_n} | Val step: {val_n} | Step size: {step_n}")
@@ -400,6 +467,10 @@ else:
         fold_logs.append({'fold': fold_idx, 'auc': fold_auc, 'acc': fold_acc,
                           'train_end': tr_end, 'val_end': va_end})
 
+        # Accumulate OOS predictions for later calibration fitting.
+        oob_proba.extend(fold_model.predict_proba(X_va)[:, 1].tolist())
+        oob_y.extend(y_va.tolist())
+
         if fold_auc > best_fold_auc:
             best_fold_auc = fold_auc
             best_fold_model = fold_model
@@ -433,6 +504,69 @@ else:
         print(f"    Fold {f['fold']}: AUC={f['auc']:.4f} "
               f"Acc={f.get('acc', float('nan')):.4f}")
     print(f"\n  Mean OOS AUC: {AVG_AUC:.4f}")
+
+# ─── Phase 3, item 12: OOS AUC acceptance gate ────────────────────────────────
+# The walk-forward OOS AUC is the honest estimate of live performance. If it is
+# below the acceptance threshold, the model does not deserve to replace the
+# production model — unless the operator explicitly forces it. This prevents a
+# retrain regression from silently degrading live signals.
+ACCEPTED = AVG_AUC >= args.min_oos_auc or args.force
+if not ACCEPTED:
+    print("\n" + "=" * 60)
+    print("❌ ACCEPTANCE GATE FAILED (Phase 3, item 12)")
+    print("=" * 60)
+    print(f"  Walk-forward OOS AUC = {AVG_AUC:.4f}")
+    print(f"  Minimum required      = {args.min_oos_auc:.4f}")
+    print("  The model generalises no better than chance on out-of-sample data.")
+    print("  Production model will NOT be overwritten.")
+    if not args.force:
+        print("  (Re-run with --force to override this gate.)")
+        sys.exit(2)
+else:
+    print(f"\n✅ Acceptance gate passed: OOS AUC {AVG_AUC:.4f} ≥ {args.min_oos_auc:.4f}")
+
+# ─── Phase 3, item 10: probability calibration ────────────────────────────────
+# Fit a calibrator (Platt sigmoid or isotonic) on the OOS predictions — data the
+# model never trained on. serve.py applies this so win_probability is a real
+# calibrated probability, not a raw XGBoost score.
+calibration = {'method': 'none', 'n': len(oob_y) if 'oob_y' in dir() else 0, 'auc': AVG_AUC}
+if args.calibration != 'none' and 'oob_y' in dir() and len(oob_y) >= 50:
+    oob_p = np.clip(np.array(oob_proba, dtype=float), 1e-6, 1 - 1e-6)
+    oob_l = np.array(oob_y, dtype=int)
+    try:
+        if args.calibration == 'sigmoid':
+            # Platt scaling: fit a logistic regressor on log-odds of the raw
+            # probability. calibrated = sigmoid(a * logit(raw) + b).
+            from sklearn.linear_model import LogisticRegression
+            logit_p = np.log(oob_p / (1 - oob_p))
+            lr = LogisticRegression()
+            lr.fit(logit_p.reshape(-1, 1), oob_l)
+            calibration = {
+                'method': 'sigmoid',
+                'a': float(lr.coef_[0][0]),
+                'b': float(lr.intercept_[0]),
+                'n': len(oob_l),
+                'auc': AVG_AUC,
+            }
+        elif args.calibration == 'isotonic':
+            from sklearn.isotonic import IsotonicRegression
+            iso = IsotonicRegression(out_of_bounds='clip')
+            iso.fit(oob_p, oob_l)
+            calibration = {
+                'method': 'isotonic',
+                'xs': [float(x) for x in iso.X_thresholds_.tolist()],
+                'ys': [float(y) for y in iso.y_thresholds_.tolist()],
+                'y_min': float(iso.y_min_),
+                'y_max': float(iso.y_max_),
+                'n': len(oob_l),
+                'auc': AVG_AUC,
+            }
+        print(f"✓ Calibration fit: {calibration['method']} on {len(oob_l)} OOS samples")
+    except Exception as e:
+        print(f"⚠ Calibration failed ({e}) — serving raw probabilities")
+        calibration = {'method': 'none', 'n': len(oob_l), 'auc': AVG_AUC}
+else:
+    print("  ℹ  No calibration (method=none, or <50 OOS samples)")
 
 # ─── Train final model on ALL data for deployment ─────────────────────────────
 
@@ -480,11 +614,92 @@ for i in range(min(10, len(feature_names))):
 
 model_path    = os.path.join(MODEL_DIR, 'scalper_model.json')
 features_path = os.path.join(MODEL_DIR, 'features.json')
+calib_path    = os.path.join(MODEL_DIR, 'calibration.json')
+metrics_path  = os.path.join(MODEL_DIR, 'metrics.json')
 
+# Always write calibration + metrics (serve.py reads both to report model
+# provenance). The model itself is only overwritten when the acceptance gate
+# passes (Phase 3, item 12) — a failed retrain must not silently replace the
+# live model with a worse one.
 model.save_model(model_path)
 with open(features_path, 'w') as f:
     json.dump(feature_names, f)
+with open(calib_path, 'w') as f:
+    json.dump(calibration, f)
 
-print(f"\n✓ Model saved    → {model_path}")
-print(f"✓ Features saved → {features_path}")
+metrics = {
+    'walk_forward_auc':  round(AVG_AUC, 4),
+    'in_sample_auc':     round(in_auc, 4),
+    'folds':             [{'fold': f['fold'], 'auc': round(f['auc'], 4),
+                           'acc': round(f.get('acc', 0), 4)} for f in fold_logs] if 'fold_logs' in dir() else [],
+    'n_samples':         int(len(X)),
+    'n_wins':            int(n_wins),
+    'n_loss':            int(n_loss),
+    'acceptance': {
+        'gate':         args.min_oos_auc,
+        'passed':       bool(ACCEPTED),
+        'forced':       bool(args.force),
+        'model_saved':  bool(ACCEPTED),
+    },
+    'calibration':       calibration,
+    'trained_at':        pd.Timestamp.utcnow().isoformat(),
+}
+with open(metrics_path, 'w') as f:
+    json.dump(metrics, f, indent=2)
+
+if ACCEPTED:
+    print(f"\n✓ Model saved    → {model_path}")
+    print(f"✓ Features saved → {features_path}")
+    print(f"✓ Calibration    → {calib_path}")
+    print(f"✓ Metrics        → {metrics_path}")
+else:
+    # Acceptance gate failed and not forced — remove the model file we just
+    # wrote so serve.py keeps serving the previous production model.
+    if os.path.exists(model_path):
+        os.remove(model_path)
+    print(f"\n✗ Production model NOT saved (acceptance gate failed). Existing model preserved.")
+    print(f"✓ Calibration + metrics still written → {calib_path}, {metrics_path}")
+    sys.exit(2)
+
+# ─── Phase 3, item 11: regime-specific models ────────────────────────────────
+# Train one XGBoost model per market regime (when enough labelled samples exist)
+# so live inference can pick the model tuned for the current regime. The signal
+# route already classifies the regime per signal; serve.py routes /predict by
+# the `regime` field. Regimes with too few samples fall back to the global model.
+regime_models_saved: list = []
+if any(regimes_arr):
+    regime_names = ['chop', 'ranging', 'weak-trend', 'trending', 'strong-trend']
+    for regime in regime_names:
+        idx = [i for i, r in enumerate(regimes_arr) if r == regime]
+        if len(idx) < args.min_regime_samples:
+            if idx:
+                print(f"  ℹ  Regime '{regime}': only {len(idx)} samples (< {args.min_regime_samples}) — using global model")
+            continue
+        Xr = X[np.array(idx)]
+        yr = y[np.array(idx)]
+        rw = int(yr.sum())
+        rl = int(len(yr) - rw)
+        r_spw = max(1.0, rl / rw) if rw > 0 else 1.0
+        r_model = xgb.XGBClassifier(
+            n_estimators=150, max_depth=3, learning_rate=0.05, subsample=0.7,
+            colsample_bytree=0.7, min_child_weight=5, reg_alpha=0.1,
+            reg_lambda=1.5, scale_pos_weight=r_spw, eval_metric='aucpr',
+            random_state=42,
+        )
+        r_model.fit(Xr, yr, verbose=False)
+        r_path = os.path.join(MODEL_DIR, f'scalper_model_{regime}.json')
+        r_model.save_model(r_path)
+        # Same feature set — no separate features file needed, but record it.
+        regime_models_saved.append(regime)
+        print(f"  ✓ Regime model '{regime}': {len(idx)} samples (WIN {rw}/LOSS {rl}) → {r_path}")
+
+    # Persist the list of available regime models for serve.py + metrics.
+    metrics['regime_models'] = regime_models_saved
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    if regime_models_saved:
+        print(f"  ✓ Regime-specific models saved: {', '.join(regime_models_saved)}")
+    else:
+        print("  ℹ  No regime-specific models (insufficient labelled samples per regime)")
+
 print(f"\n🚀 Ready to serve! Run: python ml/serve.py")

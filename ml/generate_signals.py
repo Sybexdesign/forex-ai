@@ -2,6 +2,17 @@
 """
 ml/generate_signals.py — Synthetic scalper training signal generator.
 
+⚠️ AUDIT WARNING (Phase 3, item 9): synthetic data is CIRCULAR by construction.
+This script applies the *identical* Scalp 5-vote rule engine to generate the
+signal AND then labels it with the same TP/SL rule — so a model trained on it
+can never outperform the rule it was trained to replicate. The audit
+recommended stopping auto-labeling with the same rule being trained.
+
+Preferred path: `python build_dataset.py` → REAL resolved Supabase signals with
+consistent SL/TP-first-hit re-labeling. Use --synthetic only as a last-resort
+data-augmentation supplement, and expect it to cap model performance at the
+rule engine's own accuracy.
+
 Pulls M5 OHLCV from OANDA (primary, unlimited history) or yfinance (fallback,
 60-day window), computes every indicator the live system uses, applies the Scalp
 5-vote signal logic to every bar, then labels each signal WIN/LOSS using the same

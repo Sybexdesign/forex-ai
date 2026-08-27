@@ -40,6 +40,8 @@ ALL_PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD',
 # Load model at startup — fail fast if model files are missing
 model_path    = os.path.join(MODEL_DIR, 'scalper_model.json')
 features_path = os.path.join(MODEL_DIR, 'features.json')
+calib_path    = os.path.join(MODEL_DIR, 'calibration.json')
+metrics_path  = os.path.join(MODEL_DIR, 'metrics.json')
 
 if not os.path.exists(model_path):
     raise FileNotFoundError(f"Model not found at {model_path}. Run: python ml/train.py")
@@ -51,6 +53,88 @@ with open(features_path) as f:
     FEATURE_NAMES = json.load(f)
 
 print(f"✓ Scalper model loaded: {len(FEATURE_NAMES)} features")
+
+# ─── Phase 3, item 10: probability calibration ─────────────────────────────────
+# train.py fits a calibrator on out-of-sample predictions. We apply it here so
+# `win_probability` is a calibrated probability, not a raw XGBoost score.
+CALIBRATION: dict = {'method': 'none'}
+if os.path.exists(calib_path):
+    try:
+        with open(calib_path) as f:
+            CALIBRATION = json.load(f)
+        print(f"✓ Calibration loaded: {CALIBRATION.get('method', 'none')} "
+              f"({CALIBRATION.get('n', 0)} OOS samples, AUC {CALIBRATION.get('auc', 0):.4f})")
+    except Exception as e:
+        print(f"⚠ Calibration load failed ({e}) — serving raw probabilities")
+
+# Phase 3, item 12: model provenance / acceptance metrics (from train.py).
+MODEL_METRICS: dict = {}
+if os.path.exists(metrics_path):
+    try:
+        with open(metrics_path) as f:
+            MODEL_METRICS = json.load(f)
+    except Exception:
+        MODEL_METRICS = {}
+
+# ─── Phase 3, item 11: regime-specific models ──────────────────────────────────
+# train.py saves scalper_model_<regime>.json per regime. Load them lazily so a
+# missing regime model (or no regime models at all) never breaks /predict —
+# the global model is always the fallback. Regime routing happens on the
+# `regime` field the signal route sends.
+REGIME_MODELS: dict = {}
+_REGIME_NAMES = ['chop', 'ranging', 'weak-trend', 'trending', 'strong-trend']
+for _rg in _REGIME_NAMES:
+    _p = os.path.join(MODEL_DIR, f'scalper_model_{_rg}.json')
+    if os.path.exists(_p):
+        try:
+            _m = xgb.XGBClassifier()
+            _m.load_model(_p)
+            REGIME_MODELS[_rg] = _m
+            print(f"✓ Regime model loaded: {_rg}")
+        except Exception as e:
+            print(f"⚠ Regime model {_rg} failed to load ({e})")
+
+# ─── Phase 3, item 10: calibration transform ───────────────────────────────────
+def calibrate_probability(raw_prob: float) -> float:
+    """Map a raw XGBoost P(win) to a calibrated probability.
+
+    sigmoid (Platt): calibrated = sigmoid(a * logit(raw) + b)
+    isotonic:        piecewise-linear interpolation over (xs, ys), clipped.
+    none:            passthrough.
+    """
+    method = CALIBRATION.get('method', 'none')
+    if method == 'sigmoid' and 'a' in CALIBRATION:
+        try:
+            import math
+            p = min(max(raw_prob, 1e-6), 1 - 1e-6)
+            logit = math.log(p / (1 - p))
+            z = CALIBRATION['a'] * logit + CALIBRATION['b']
+            z = min(max(z, -40), 40)   # numeric stability
+            return 1.0 / (1.0 + math.exp(-z))
+        except Exception:
+            return raw_prob
+    if method == 'isotonic' and 'xs' in CALIBRATION:
+        try:
+            xs = CALIBRATION['xs']
+            ys = CALIBRATION['ys']
+            x  = min(max(raw_prob, xs[0]), xs[-1])
+            # bisect for the interpolation segment
+            lo = 0
+            hi = len(xs) - 1
+            while lo < hi - 1:
+                mid = (lo + hi) // 2
+                if xs[mid] < x:
+                    lo = mid
+                else:
+                    hi = mid
+            if xs[hi] == xs[lo]:
+                frac = 0.0
+            else:
+                frac = (x - xs[lo]) / (xs[hi] - xs[lo])
+            return ys[lo] + frac * (ys[hi] - ys[lo])
+        except Exception:
+            return raw_prob
+    return raw_prob
 
 # 1-hour cache for /predict_daily_auto results keyed by metal ('gold'|'silver')
 _auto_cache: dict = {}  # {'gold': {'result': {...}, 'ts': float}, ...}
@@ -186,6 +270,10 @@ class PredictRequest(BaseModel):
     indicators:         dict
     scalperIndicators:  dict
     timestamp:          Optional[str] = None
+    # Phase 3 (item 11): market regime ('chop' | 'ranging' | 'weak-trend' |
+    # 'trending' | 'strong-trend') — routes to the regime-specific model when
+    # one exists. Absent/unknown regimes fall back to the global model.
+    regime:             Optional[str] = None
 
 
 class PredictResponse(BaseModel):
@@ -193,6 +281,11 @@ class PredictResponse(BaseModel):
     should_trade:         bool
     ml_confidence:        int
     feature_contributions: dict
+    # Phase 3 provenance — lets the caller see which model + calibration were used.
+    regime:               Optional[str] = None
+    model:                str = 'global'
+    calibration_method:   str = 'none'
+    model_auc:            Optional[float] = None
 
 
 class DailyPredictRequest(BaseModel):
@@ -285,11 +378,21 @@ def predict(req: PredictRequest):
     try:
         features = extract_features(req)
         X        = np.array([[features.get(f, 0) for f in FEATURE_NAMES]])
-        proba    = model.predict_proba(X)[0]
-        win_prob = float(proba[1])
+
+        # Phase 3 (item 11): pick the regime-specific model when one exists and
+        # the caller told us the regime. Unknown/missing regime → global model.
+        active_model = model
+        model_name   = 'global'
+        if req.regime and req.regime in REGIME_MODELS:
+            active_model = REGIME_MODELS[req.regime]
+            model_name   = req.regime
+
+        raw_prob  = float(active_model.predict_proba(X)[0][1])
+        # Phase 3 (item 10): apply calibrated probability (Platt/isotonic).
+        win_prob  = calibrate_probability(raw_prob)
 
         # Top 5 feature contributions
-        importances = model.feature_importances_
+        importances = active_model.feature_importances_
         sorted_idx  = np.argsort(importances)[::-1][:5]
         top_feats   = {
             FEATURE_NAMES[i]: {
@@ -304,6 +407,10 @@ def predict(req: PredictRequest):
             should_trade=win_prob >= 0.55,
             ml_confidence=int(win_prob * 100),
             feature_contributions=top_feats,
+            regime=req.regime,
+            model=model_name,
+            calibration_method=CALIBRATION.get('method', 'none'),
+            model_auc=MODEL_METRICS.get('walk_forward_auc'),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -342,7 +449,14 @@ def predict_daily(req: DailyPredictRequest):
 def health():
     return {
         'status':        'ok',
-        'scalper_model': {'features': len(FEATURE_NAMES)},
+        'scalper_model': {
+            'features': len(FEATURE_NAMES),
+            'regime_models': list(REGIME_MODELS.keys()),
+            'calibration': CALIBRATION.get('method', 'none'),
+            'walk_forward_auc': MODEL_METRICS.get('walk_forward_auc'),
+            'acceptance_passed': MODEL_METRICS.get('acceptance', {}).get('passed'),
+            'trained_at': MODEL_METRICS.get('trained_at'),
+        },
         'daily_model':   {'features': len(DAILY_FEATURE_NAMES), 'loaded': daily_model is not None},
     }
 

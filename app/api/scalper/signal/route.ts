@@ -327,9 +327,10 @@ function scalpConsensus(t: TickSnapshot): {
 
 const ML_URL = process.env.ML_SERVICE_URL || 'http://localhost:8100'
 
-async function queryMlService(body: any, pair: string, direction: Direction, confidence: number): Promise<{
+async function queryMlService(body: any, pair: string, direction: Direction, confidence: number, regime?: string): Promise<{
   win_probability: number; should_trade: boolean; ml_confidence: number
   feature_contributions: Record<string, { importance: number; value: number }>
+  regime?: string | null; model?: string; calibration_method?: string; model_auc?: number | null
 } | null> {
   try {
     const ctrl = new AbortController()
@@ -345,6 +346,7 @@ async function queryMlService(body: any, pair: string, direction: Direction, con
         indicators:        body,
         scalperIndicators: body.scalper ?? {},
         timestamp:         new Date().toISOString(),
+        regime:            regime ?? null,   // Phase 3 (item 11): regime routing
       }),
     })
     clearTimeout(timer)
@@ -594,7 +596,10 @@ Return JSON only:
 
     // Query ML service in parallel with signal result (non-blocking)
     const mlQueryDirection = result.direction as Direction
-    mlData = await queryMlService(body, pair, mlQueryDirection, result.confidence)
+    // Phase 3 (item 11): route the ML request to a regime-specific model when
+    // one exists. Uses the same ADX→regime classification the gate uses.
+    const mlRegime = strategy === 'Scalp' ? classifyRegime(t.adx).regime : undefined
+    mlData = await queryMlService(body, pair, mlQueryDirection, result.confidence, mlRegime)
 
     // ML win-probability gate — softer threshold for Scalp (long-TF model not tuned for 1-5min)
     if (mlData && typeof mlData.win_probability === 'number' && result.direction !== 'HOLD') {
@@ -721,6 +726,11 @@ Return JSON only:
       agreementScore,    // 0-100 unified agreement across 5M/15M/1H/ML/rule
       agreementVotes,
       mlWinProb:         mlData?.win_probability ?? null,
+      // Phase 3 provenance — which ML model + calibration produced the gate input
+      mlModel:           mlData?.model ?? null,
+      mlRegime:          mlData?.regime ?? mlRegime ?? null,
+      mlCalibration:     mlData?.calibration_method ?? null,
+      mlModelAuc:        mlData?.model_auc ?? null,
       preGateDirection,
       preGateConfidence,
     }

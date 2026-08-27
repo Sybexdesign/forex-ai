@@ -1305,6 +1305,14 @@ async function processSignal(pair, tick, strategy, session, direction) {
           suggestedSection:     signal.suggestedSection     ?? null,
           adx:                  signal.adx                  ?? tick.adx ?? null,
         },
+        // Exact execution levels used by this signal — mirrors the browser
+        // path (_computed in /api/scalper/signal) so the clean ML dataset
+        // (ml/build_dataset.py) can reconstruct canonical SL/TP labels.
+        _computed: {
+          entry: signal.entry ?? tick.price,
+          sl:    signal.sl    ?? null,
+          tp:    signal.tp    ?? null,
+        },
         // Engine/gate audit trail from /api/scalper/signal — spot-check
         // mechanism for verifying predictions against a chart.
         _audit: signal._audit ?? null,
