@@ -102,6 +102,30 @@ export async function clearAllServerCaches(): Promise<{
     errors.push(`capital-circuit: ${e?.message}`)
   }
 
+  // 4. Reset Phase 2 threshold calibration (lib/threshold-calibration.ts) so the
+  //    next signal recomputes NO-TRADE thresholds from fresh historical evidence.
+  try {
+    const { clearCalibrationCache } = await import('./threshold-calibration')
+    if (typeof clearCalibrationCache === 'function') {
+      clearCalibrationCache()
+      cleared.push('threshold-calibration')
+    }
+  } catch (e: any) {
+    errors.push(`threshold-calibration: ${e?.message}`)
+  }
+
+  // 5. Reset the signal route's multi-timeframe HTF bias cache so a cache-clear
+  //    forces fresh 15m/1H trend reads (Phase 2 item 6).
+  try {
+    const { clearHtfBiasCache } = await import('@/app/api/scalper/signal/route')
+    if (typeof clearHtfBiasCache === 'function') {
+      clearHtfBiasCache()
+      cleared.push('signal-htf-bias')
+    }
+  } catch (e: any) {
+    errors.push(`signal-htf-bias: ${e?.message}`)
+  }
+
   return { cleared, errors }
 }
 

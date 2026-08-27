@@ -4,6 +4,9 @@ export const dynamic = 'force-dynamic'
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 import { llmComplete, hasLlmKey, providerLabel } from '@/lib/llm'
+import { getMarketCandles } from '@/lib/marketdata'
+import { calculateIndicators } from '@/lib/indicators'
+import { getCalibratedMinStrengths } from '@/lib/threshold-calibration'
 
 type Strategy = 'Momentum' | 'Mean Reversion' | 'Breakout' | 'Order Flow' | 'Scalp'
 type Direction = 'BUY' | 'SELL' | 'HOLD'
@@ -124,6 +127,40 @@ export function classifyRegime(adx: number): {
   if (adx < 25)  return { regime: 'weak-trend',   effectiveMinStrength: 75,  suggestedSection: 'mirror' }
   if (adx < 28)  return { regime: 'trending',     effectiveMinStrength: 72,  suggestedSection: 'scalp'  }
   return           { regime: 'strong-trend', effectiveMinStrength: 100, suggestedSection: 'scalp'  }
+}
+
+// ── Multi-timeframe HTF bias (audit Phase 2, item 6) ──────────────────────────
+// Fetches 15m / 1H indicator snapshots and derives a directional bias using the
+// same persistent-EMA logic the worker's inferHTFDirection uses (ema20 vs ema50
+// + MACD histogram + RSI). Serves both the Scalp HTF bias filter (item 6) and
+// the unified agreement score (item 8). A short TTL cache keeps repeated calls
+// cheap — the worker already refreshes its own HTF cache every 30s.
+const HTF_CACHE_MS = 20_000
+const htfCache = new Map<string, { at: number; bias: 'BUY' | 'SELL' | null; simulated: boolean }>()
+
+async function fetchHtfBias(pair: string, timeframe: string): Promise<'BUY' | 'SELL' | null> {
+  const key = `${pair}:${timeframe}`
+  const hit = htfCache.get(key)
+  if (hit && Date.now() - hit.at < HTF_CACHE_MS) return hit.simulated ? null : hit.bias
+  try {
+    const { candles, simulated } = await getMarketCandles(undefined, pair, timeframe, 200)
+    const ind = calculateIndicators(candles)
+    const ema20AboveEma50 = ind.ema20 > ind.ema50
+    let bias: 'BUY' | 'SELL' | null = null
+    if (ema20AboveEma50 && ind.macdHistogram > 0 && ind.rsi > 50)  bias = 'BUY'
+    else if (!ema20AboveEma50 && ind.macdHistogram < 0 && ind.rsi < 50) bias = 'SELL'
+    htfCache.set(key, { at: Date.now(), bias, simulated })
+    // Never bias-filter on simulated HTF data — a fake trend would be worse
+    // than no trend signal.
+    return simulated ? null : bias
+  } catch {
+    return null  // feed unavailable → no bias opinion
+  }
+}
+
+/** Admin cache-clear hook: drop cached 15m/1H bias reads. */
+export function clearHtfBiasCache(): void {
+  htfCache.clear()
 }
 
 function fallbackSignal(t: TickSnapshot, strategy: Strategy, pair: string): {
@@ -453,6 +490,7 @@ export async function POST(req: NextRequest) {
     // action so any persisted signal can be verified against a chart.
     let rawResponse: string | null = null
     let disciplineAction: string | null = null
+    let htfAction: string | null = null
 
     const hasKey = hasLlmKey()
 
@@ -555,7 +593,8 @@ Return JSON only:
     // in AutoTradePage.tsx and workers/scalper.mjs use sig.effectiveMinStrength.
 
     // Query ML service in parallel with signal result (non-blocking)
-    mlData = await queryMlService(body, pair, result.direction as Direction, result.confidence)
+    const mlQueryDirection = result.direction as Direction
+    mlData = await queryMlService(body, pair, mlQueryDirection, result.confidence)
 
     // ML win-probability gate — softer threshold for Scalp (long-TF model not tuned for 1-5min)
     if (mlData && typeof mlData.win_probability === 'number' && result.direction !== 'HOLD') {
@@ -576,6 +615,82 @@ Return JSON only:
         const boost = Math.round((winProb - 0.65) * 20)
         result.confidence = Math.min(98, result.confidence + boost)
       }
+    }
+
+    // ── Multi-timeframe 15M/1H bias filter (audit Phase 2, item 6) ────────────
+    // Scalp previously skipped the 15M HTF check in the worker and the browser
+    // path had no 1H/15M bias filter. This server-side filter applies the same
+    // top-down discipline to both paths: when the 5m direction contradicts a
+    // CLEAR 15m or 1H trend, the signal is penalised; when it contradicts BOTH
+    // higher-timeframe biases, the signal is demoted to HOLD. Ambiguous HTF
+    // (null bias — ranging regime) is NOT a penalty: ranging is Scalp's
+    // highest-edge condition and a null HTF means "no trend to respect".
+    let htfBias15m: Direction | null = null
+    let htfBias1h:  Direction | null = null
+    if (strategy === 'Scalp' && result.direction !== 'HOLD') {
+      const [b15, b1h] = await Promise.all([
+        fetchHtfBias(pair, '15m'),
+        fetchHtfBias(pair, '1H'),
+      ])
+      htfBias15m = b15
+      htfBias1h  = b1h
+
+      const dir    = result.direction as Direction
+      const opp15  = b15 !== null && b15 !== dir
+      const opp1h  = b1h !== null && b1h !== dir
+      const align15 = b15 === dir
+      const align1h = b1h === dir
+
+      if (opp15 && opp1h) {
+        // Both HTFs clearly oppose the 5m scalp direction → hard block.
+        htfAction = `HTF-block: 5m ${dir} opposes 15m ${b15} AND 1H ${b1h}`
+        console.log(`[scalper/signal] ${htfAction} (${pair})`)
+        result.direction = 'HOLD' as Direction
+        result.reasons   = [
+          ...(result.reasons || []).slice(0, 3),
+          `Multi-TF filter: 15m=${b15} 1H=${b1h} both oppose ${dir} — blocked`,
+        ]
+      } else if (opp15 || opp1h) {
+        // One HTF opposes — confidence penalty (not a block; the other HTF is
+        // either aligned or ambiguous).
+        const penalty = 10
+        result.confidence = Math.max(0, result.confidence - penalty)
+        htfAction = `HTF-penalty: 5m ${dir} vs ${opp15 ? `15m ${b15}` : ''}${opp15 && opp1h ? ' + ' : ''}${opp1h ? `1H ${b1h}` : ''} (−${penalty} conf)`
+        result.reasons = [...(result.reasons || []), htfAction]
+      } else if (align15 && align1h) {
+        // Both HTFs confirm → small confidence boost.
+        result.confidence = Math.min(98, result.confidence + 5)
+        htfAction = `HTF-confirm: 15m ${b15} + 1H ${b1h} confirm ${dir} (+5)`
+      }
+      // Any null HTF bias (ambiguous trend) → no change. Ranging is valid for
+      // Scalp; only a clear opposing bias is filtered.
+    }
+
+    // ── Unified Signal Agreement Score (audit Phase 2, item 8) ────────────────
+    // How many independent engines agree with the FINAL direction:
+    //   5M rule consensus · 15M bias · 1H bias · ML win-prob · rule engine.
+    // Each component contributes a directional vote; the score is the fraction
+    // of non-null votes matching the final direction (0-100). The worker
+    // auto-trade gate consumes this as an additional quality filter.
+    let agreementScore: number | null = null
+    let agreementVotes: { source: string; direction: Direction | null }[] = []
+    if (result.direction !== 'HOLD') {
+      const { bullVotes, bearVotes } = scalpConsensus(t)
+      const m5Dir: Direction | null = bullVotes >= 4 ? 'BUY' : bearVotes >= 4 ? 'SELL' : null
+      const ruleDir = fallbackSignal(t, strategy, pair).direction
+      const mlDir: Direction | null = (mlData && typeof mlData.win_probability === 'number' && mlQueryDirection !== 'HOLD')
+        ? (mlData.win_probability >= 0.5 ? mlQueryDirection : (mlQueryDirection === 'BUY' ? 'SELL' : 'BUY'))
+        : null
+      agreementVotes = [
+        { source: '5M',  direction: m5Dir },
+        { source: '15M', direction: htfBias15m },
+        { source: '1H',  direction: htfBias1h },
+        { source: 'ML',  direction: mlDir },
+        { source: 'rule', direction: ruleDir === 'HOLD' ? null : ruleDir },
+      ]
+      const opinionated = agreementVotes.filter(v => v.direction !== null)
+      const agreeing    = opinionated.filter(v => v.direction === result.direction).length
+      agreementScore    = opinionated.length > 0 ? Math.round((agreeing / opinionated.length) * 100) : null
     }
 
     // For Scalp: always use server-computed SL/TP — AI misreads pip-to-price for metals (treats
@@ -602,15 +717,44 @@ Return JSON only:
       engine:            fallback ? 'rules' : providerLabel(),
       rawResponse,       // LLM raw text (≤500 chars); null on rules engine
       disciplineAction,  // non-null when the consensus guard demoted to HOLD
+      htfAction,         // non-null when the multi-TF bias filter modified the signal
+      agreementScore,    // 0-100 unified agreement across 5M/15M/1H/ML/rule
+      agreementVotes,
       mlWinProb:         mlData?.win_probability ?? null,
       preGateDirection,
       preGateConfidence,
     }
 
+    // Attach market-regime metadata (Scalp only — other strategies have their
+    // own ADX semantics). AutoTradePage and worker use these to gate execution
+    // and to override section bias per-signal.
+    //
+    // Phase 2 (item 7): the NO-TRADE minStrength threshold is now taken from
+    // calibrated historical evidence (win rate by regime/confidence band in
+    // lib/threshold-calibration.ts) when enough resolved signals exist, falling
+    // back to the original heuristic classifyRegime() values otherwise.
+    const regimeInfo = strategy === 'Scalp' ? classifyRegime(t.adx) : null
+    let thresholdSource: 'calibrated' | 'heuristic' = 'heuristic'
+    if (regimeInfo) {
+      const calibrated = await getCalibratedMinStrengths()
+      const calibMin   = calibrated[regimeInfo.regime]
+      if (typeof calibMin === 'number') {
+        regimeInfo.effectiveMinStrength = calibMin
+        thresholdSource = 'calibrated'
+      }
+    }
+    const regimeMeta = regimeInfo ? { ...regimeInfo, adx: t.adx } : null
+
     // Persist to signals table (audit Phase 1.5)
     // `direction` remains the final gated direction. `predicted_direction`
     // stores the raw engine output before any gate (discipline/ML) touched it,
     // so we can later measure whether the filters actually improve accuracy.
+    // `_regime` is persisted so the threshold calibration (item 7) can read the
+    // regime for EVERY signal, not just worker-generated rows.
+    const gatingReasons = [
+      ...(audit.disciplineAction ? [audit.disciplineAction] : []),
+      ...(htfAction ? [htfAction] : []),
+    ]
     if (userId && result.direction !== 'HOLD') {
       try {
         const admin = getAdminClient()
@@ -620,7 +764,7 @@ Return JSON only:
           timeframe:          'scalper',
           direction:          result.direction,
           predicted_direction: preGateDirection,
-          gating_reasons:     audit.disciplineAction ? [audit.disciplineAction] : [],
+          gating_reasons:     gatingReasons,
           confidence:         result.confidence,
           checklist_score:    0,
           reasons:            result.reasons,
@@ -631,18 +775,19 @@ Return JSON only:
           indicator_snapshot: {
             ...body,
             _computed: { entry: result.entry, sl: result.sl, tp: result.tp },
+            // Phase 2 (item 7): feed threshold calibration — same shape the
+            // worker writes (marketRegime key) so calibration reads both paths.
+            _regime: regimeMeta ? {
+              marketRegime:         regimeMeta.regime,
+              effectiveMinStrength: regimeMeta.effectiveMinStrength,
+              suggestedSection:     regimeMeta.suggestedSection,
+              adx:                  regimeMeta.adx,
+            } : null,
             _audit:    audit,
           },
         })
       } catch { /* non-critical */ }
     }
-
-    // Attach market-regime metadata (Scalp only — other strategies have their
-    // own ADX semantics). AutoTradePage and worker use these to gate execution
-    // and to override section bias per-signal.
-    const regimeMeta = strategy === 'Scalp'
-      ? { ...classifyRegime(t.adx), adx: t.adx }
-      : null
 
     return NextResponse.json({
       ...result,
@@ -651,8 +796,15 @@ Return JSON only:
       _audit: audit,
       marketRegime:         regimeMeta?.regime ?? null,
       effectiveMinStrength: regimeMeta?.effectiveMinStrength ?? null,
+      thresholdSource,       // Phase 2 (item 7): 'calibrated' | 'heuristic'
       suggestedSection:     regimeMeta?.suggestedSection ?? null,
       adx:                  regimeMeta?.adx ?? null,
+      // Phase 2 (item 8): unified agreement score across 5M/15M/1H/ML/rule.
+      agreementScore,        // 0-100, null when the signal was gated to HOLD
+      agreementVotes,        // [{ source, direction }] per component
+      htfBias15m,            // Phase 2 (item 6): 15m trend bias at signal time
+      htfBias1h,             // Phase 2 (item 6): 1H trend bias at signal time
+      htfAction,             // human-readable multi-TF filter outcome
     })
   } catch (error: any) {
     console.error('[scalper/signal]', error)

@@ -1267,6 +1267,12 @@ async function processSignal(pair, tick, strategy, session, direction) {
       effectiveMinStrength: signal.effectiveMinStrength ?? null,
       suggestedSection:     signal.suggestedSection     ?? null,
       adx:                  signal.adx                  ?? tick.adx ?? null,
+      agreementScore:       signal.agreementScore       ?? null,
+      agreementVotes:       signal.agreementVotes       ?? null,
+      htfBias15m:           signal.htfBias15m           ?? null,
+      htfBias1h:            signal.htfBias1h            ?? null,
+      htfAction:            signal.htfAction            ?? null,
+      thresholdSource:      signal.thresholdSource      ?? null,
     } }
   )
 
@@ -1380,6 +1386,29 @@ async function processSignal(pair, tick, strategy, session, direction) {
     // Bug-fix 2026-06-08: previously a silent return. Now logged for audit so
     // the operator can see why a signal didn't fire.
     await logAutoTradeDecision('skipped-confidence', pair, dir, signal, { conf, effMin })
+    return
+  }
+
+  // ── Agreement-score gate (audit Phase 2, item 8) ────────────────────────────
+  // The unified Signal Agreement Score (5M/15M/1H/ML/rule, 0-100) tells us how
+  // many independent engines agree with the final direction. When at least
+  // three components have an opinion and the agreement is low, the engines are
+  // contradicting each other — executing is betting against the consensus.
+  //   ≥3 votes and agreement < 40%  → skip (low agreement)
+  //   <3 votes or null score         → pass (not enough data to judge)
+  // The browser path displays the same score; this gate makes the worker use it.
+  const agreementScore = typeof signal.agreementScore === 'number' ? signal.agreementScore : null
+  const opinionated    = Array.isArray(signal.agreementVotes)
+    ? signal.agreementVotes.filter(v => v && v.direction).length
+    : 0
+  const MIN_AGREEMENT_PCT  = 40
+  const MIN_AGREEMENT_VOTES = 3
+  if (agreementScore !== null && opinionated >= MIN_AGREEMENT_VOTES && agreementScore < MIN_AGREEMENT_PCT) {
+    console.warn(`[agreement] ${pair} ${dir} ${conf}% — agreement ${agreementScore}% (${opinionated} engines) below ${MIN_AGREEMENT_PCT}% — skipping` +
+      `\n  votes: ${JSON.stringify(signal.agreementVotes || [])}`)
+    await logAutoTradeDecision('skipped-low-agreement', pair, dir, signal, {
+      agreementScore, opinionated, votes: signal.agreementVotes || [],
+    })
     return
   }
 
@@ -1770,10 +1799,12 @@ async function runSweep() {
       const htfDir  = inferHTFDirection(htfTick)  // 15m primary direction
       const dir5m   = inferDirection(cand.tick)   // 5m confirming direction
 
-      // Scalp: skip HTF macro-bias check. Ranging regimes produce ambiguous
-      // 15m trends by definition; the regime-aware effectiveMinStrength gate
-      // (65/68/72/75) downstream decides eligibility. Browser path on
-      // AutoTradePage doesn't apply an HTF prefilter either — keep parity.
+      // Scalp: skip HTF macro-bias check HERE. The 15M/1H bias filter now runs
+      // server-side in /api/scalper/signal (audit Phase 2, item 6), so both the
+      // worker AND the browser path get identical multi-timeframe filtering.
+      // Ranging regimes produce ambiguous 15m trends by definition; the signal
+      // route only penalises a CLEAR opposing HTF bias, so ranging setups still
+      // pass. Avoids double HTF fetches.
       if (cand.strategy === 'Scalp') {
         queue.push({ ...cand, direction: dir5m || htfDir || null })
         continue

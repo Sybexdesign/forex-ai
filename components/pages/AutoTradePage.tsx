@@ -129,6 +129,13 @@ interface ScalpSignal {
   effectiveMinStrength?: number | null
   suggestedSection?: 'mirror' | 'scalp' | null
   adx?: number | null
+  // Phase 2 — signal quality metadata
+  thresholdSource?: 'calibrated' | 'heuristic' | null
+  agreementScore?: number | null
+  agreementVotes?: { source: string; direction: 'BUY' | 'SELL' | null }[] | null
+  htfBias15m?: 'BUY' | 'SELL' | null
+  htfBias1h?: 'BUY' | 'SELL' | null
+  htfAction?: string | null
 }
 
 function Pager({ page, total, onPage }: { page: number; total: number; onPage: (p: number) => void }) {
@@ -434,6 +441,13 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           effectiveMinStrength: sig.effectiveMinStrength ?? null,
           suggestedSection:     sig.suggestedSection ?? null,
           adx:                  sig.adx ?? null,
+          // Phase 2 — signal quality metadata
+          thresholdSource:      sig.thresholdSource ?? null,
+          agreementScore:       sig.agreementScore ?? null,
+          agreementVotes:       sig.agreementVotes ?? null,
+          htfBias15m:           sig.htfBias15m ?? null,
+          htfBias1h:            sig.htfBias1h ?? null,
+          htfAction:            sig.htfAction ?? null,
           // fetchError cleared on success
         },
       }))
@@ -1741,7 +1755,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                     )}
                     {sig?.marketRegime && REGIME_BADGE[sig.marketRegime] && (
                       <span
-                        title={`ADX ${sig.adx?.toFixed?.(1) ?? '?'} — gate ≥${sig.effectiveMinStrength}%`}
+                        title={`ADX ${sig.adx?.toFixed?.(1) ?? '?'} — gate ≥${sig.effectiveMinStrength}%${sig.thresholdSource ? ` (${sig.thresholdSource})` : ''}`}
                         style={{
                           fontSize: 9, fontWeight: 700, letterSpacing: 1,
                           padding: '2px 6px', borderRadius: 2,
@@ -1751,6 +1765,52 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                         }}
                       >
                         {REGIME_BADGE[sig.marketRegime].label}
+                      </span>
+                    )}
+                    {/* Phase 2 — signal quality badges: agreement score + HTF bias */}
+                    {sig && dir !== 'HOLD' && typeof sig.agreementScore === 'number' && (
+                      <span
+                        title={`Agreement: ${sig.agreementScore}% of engines agree with ${dir}\n` +
+                          `(${(sig.agreementVotes || []).map(v => `${v.source}=${v.direction ?? '?'}`).join(' · ')})\n` +
+                          `15m bias: ${sig.htfBias15m ?? '—'} · 1H bias: ${sig.htfBias1h ?? '—'}${sig.htfAction ? `\n${sig.htfAction}` : ''}`}
+                        style={{
+                          fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                          padding: '2px 6px', borderRadius: 2,
+                          color: sig.agreementScore >= 60 ? 'var(--color-buy)'
+                            : sig.agreementScore >= 40 ? '#ffb800' : 'var(--color-sell)',
+                          background: sig.agreementScore >= 60 ? 'rgba(0,200,83,0.15)'
+                            : sig.agreementScore >= 40 ? 'rgba(255,184,0,0.15)' : 'rgba(255,48,86,0.15)',
+                          border: `1px solid ${sig.agreementScore >= 60 ? 'rgba(0,200,83,0.35)'
+                            : sig.agreementScore >= 40 ? 'rgba(255,184,0,0.3)' : 'rgba(255,48,86,0.3)'}`,
+                        }}
+                      >
+                        AGREE {sig.agreementScore}%
+                      </span>
+                    )}
+                    {sig && dir !== 'HOLD' && sig.htfBias15m && sig.htfBias15m !== dir && (
+                      <span
+                        title={`15m ${sig.htfBias15m} opposes 5m ${dir}${sig.htfAction ? ` — ${sig.htfAction}` : ''}`}
+                        style={{
+                          fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                          padding: '2px 6px', borderRadius: 2,
+                          color: 'var(--color-sell)', background: 'rgba(255,48,86,0.15)',
+                          border: '1px solid rgba(255,48,86,0.3)',
+                        }}
+                      >
+                        15m ⚠
+                      </span>
+                    )}
+                    {sig && dir !== 'HOLD' && sig.htfBias1h && sig.htfBias1h !== dir && (
+                      <span
+                        title={`1H ${sig.htfBias1h} opposes 5m ${dir}${sig.htfAction ? ` — ${sig.htfAction}` : ''}`}
+                        style={{
+                          fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                          padding: '2px 6px', borderRadius: 2,
+                          color: 'var(--color-sell)', background: 'rgba(255,48,86,0.15)',
+                          border: '1px solid rgba(255,48,86,0.3)',
+                        }}
+                      >
+                        1H ⚠
                       </span>
                     )}
                   </div>
