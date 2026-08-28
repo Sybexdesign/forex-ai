@@ -768,6 +768,36 @@ Return JSON only:
     if (userId && result.direction !== 'HOLD') {
       try {
         const admin = getAdminClient()
+        const predictionRow = {
+          user_id:             userId,
+          pair,
+          timeframe:           'scalper',
+          direction:           result.direction,
+          predicted_direction: preGateDirection,
+          gating_reasons:      gatingReasons,
+          confidence:          result.confidence,
+          entry:               result.entry ?? null,
+          sl:                  result.sl ?? null,
+          tp:                  result.tp ?? null,
+          candle_close_time:   body.lastCandleTime ? new Date(body.lastCandleTime).getTime() + 5 * 60_000 : null,
+          regime:              regimeMeta?.regime ?? null,
+          agreement_score:     agreementScore ?? null,
+          ml_model:            audit.mlModel ?? null,
+          ml_regime:           audit.mlRegime ?? null,
+          ml_calibration:      audit.mlCalibration ?? null,
+          ml_model_auc:        audit.mlModelAuc ?? null,
+          indicator_snapshot:  {
+            ...body,
+            _computed: { entry: result.entry, sl: result.sl, tp: result.tp },
+            _regime:   regimeMeta ? {
+              marketRegime:         regimeMeta.regime,
+              effectiveMinStrength: regimeMeta.effectiveMinStrength,
+              suggestedSection:     regimeMeta.suggestedSection,
+              adx:                  regimeMeta.adx,
+            } : null,
+            _audit:    audit,
+          },
+        }
         await admin.from('signals').insert({
           user_id:            userId,
           pair,
@@ -796,6 +826,14 @@ Return JSON only:
             _audit:    audit,
           },
         })
+        // Phase 4 (item 13): prediction_logs — the same prediction, captured in
+        // the auditable log the worker resolves into MFE/MAE + price samples.
+        // Fire-and-forget: a logging failure must never affect the signal path.
+        try {
+          await admin.from('prediction_logs').insert(predictionRow)
+        } catch (e: any) {
+          console.warn('[scalper/signal] prediction_logs insert skipped:', e?.message)
+        }
       } catch { /* non-critical */ }
     }
 

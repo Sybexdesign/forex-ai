@@ -906,6 +906,112 @@ async function checkPendingOutcomes(ticksByPair) {
   }
 }
 
+// ── Prediction-log resolution (audit Phase 4, item 13) ────────────────────────
+// prediction_logs rows are inserted fire-and-forget by the signal route and the
+// worker. Here we RESOLVE them: sample the price every sweep to build MFE/MAE +
+// price_after_1m/3m/5m/15m, and mark WIN/LOSS when TP/SL is hit (or INCONCLUSIVE
+// after the 15-minute resolution window if neither level was reached).
+//
+// Resolution window matches the label pipeline's CANDLE_WINDOW semantics
+// (15m = 3 × 5m candles). Never gates execution — observability only.
+
+const PREDLOG_MAX_AGE_MS = 16 * 60 * 1000     // 16 min — resolve within the 15m window + margin
+const PREDLOG_TIMEOUT_MS  = 15 * 60 * 1000    // 15 min window, then INCONCLUSIVE if no SL/TP hit
+const predLogs = new Map()                     // id → { pair, direction, entry, sl, tp, at, minP, maxP, sampled }
+
+function trackPredictionLog(id, pair, direction, entry, sl, tp) {
+  if (!id) return
+  predLogs.set(id, { pair, direction, entry, sl, tp, at: Date.now(), minP: entry, maxP: entry, sampled: {} })
+}
+
+async function resolvePredictionLogs(ticksByPair) {
+  if (predLogs.size === 0) return
+  const now = Date.now()
+  for (const [id, sig] of predLogs) {
+    if (now - sig.at > PREDLOG_MAX_AGE_MS) { predLogs.delete(id); continue }
+    const tick = ticksByPair[sig.pair]
+    if (!tick) continue
+    const price = tick.price
+    if (!(price > 0)) continue
+
+    // Track min/max excursion + fixed-interval price samples.
+    if (price < sig.minP) sig.minP = price
+    if (price > sig.maxP) sig.maxP = price
+    for (const [label, ms] of [['1m', 60_000], ['3m', 180_000], ['5m', 300_000], ['15m', 900_000]]) {
+      if (!sig.sampled[label] && now - sig.at >= ms) {
+        sig.sampled[label] = price
+        // Persist the sample immediately so a crash mid-window doesn't lose it.
+        await sbUpdate('prediction_logs', id, { [`price_after_${label}`]: price }).catch(() => {})
+      }
+    }
+
+    // Resolve on SL/TP hit (SL checked first — same priority as label route).
+    const pip = pipSize(sig.pair)
+    let outcome = null
+    if (sig.direction === 'BUY') {
+      if (price <= sig.sl) outcome = 'LOSS'
+      else if (price >= sig.tp) outcome = 'WIN'
+    } else if (sig.direction === 'SELL') {
+      if (price >= sig.sl) outcome = 'LOSS'
+      else if (price <= sig.tp) outcome = 'WIN'
+    }
+
+    const timedOut = now - sig.at >= PREDLOG_TIMEOUT_MS
+    if (outcome || timedOut) {
+      predLogs.delete(id)
+      const mfePips = sig.direction === 'BUY' ? (sig.maxP - sig.entry) : (sig.entry - sig.minP)
+      const maePips = sig.direction === 'BUY' ? (sig.entry - sig.minP) : (sig.maxP - sig.entry)
+      const finalOutcome = outcome ?? 'INCONCLUSIVE'
+      await sbUpdate('prediction_logs', id, {
+        outcome:   finalOutcome,
+        resolved_at: new Date().toISOString(),
+        mfe_pips:  +Math.max(0, mfePips / pip).toFixed(2),
+        mae_pips:  +Math.max(0, maePips / pip).toFixed(2),
+        // price_after_15m backfill: if we never sampled exactly at 15m, use the
+        // last observed price so the field is non-null for the pattern engine.
+        price_after_15m: sig.sampled['15m'] ?? price,
+      }).catch(() => {})
+      console.log(`[predlog] ${sig.pair} ${sig.direction} → ${finalOutcome} (${id.slice(0, 8)}) mfe=${(mfePips/pip).toFixed(1)}p mae=${(maePips/pip).toFixed(1)}p`)
+    }
+  }
+}
+
+// Reloads recent PENDING prediction_logs into the in-memory tracker so a worker
+// restart doesn't orphan rows that are still inside their resolution window.
+// Called once at startup (and after admin cache resets). Never gates execution.
+async function recoverPendingPredictionLogs() {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/prediction_logs`
+      + `?outcome=eq.PENDING`
+      + `&order=created_at.desc`
+      + `&limit=50`
+      + `&select=id,pair,direction,entry,sl,tp,created_at`
+    const res = await fetch(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+      signal:  AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) { console.error('[predlog] recovery fetch failed:', res.status); return }
+    const rows = await res.json()
+    if (!Array.isArray(rows)) return
+    let recovered = 0
+    for (const row of rows) {
+      const entry = parseFloat(row.entry)
+      const sl    = parseFloat(row.sl)
+      const tp    = parseFloat(row.tp)
+      if (!(entry > 0) || !(sl > 0) || !(tp > 0)) continue
+      predLogs.set(row.id, {
+        pair: row.pair, direction: row.direction, entry, sl, tp,
+        at: new Date(row.created_at).getTime(), minP: entry, maxP: entry, sampled: {},
+      })
+      recovered++
+    }
+    if (recovered > 0) console.log(`[predlog] recovered ${recovered} pending prediction logs`)
+  } catch (e) {
+    console.warn('[predlog] recovery failed:', e.message)
+  }
+}
+
 // ── Telegram ──────────────────────────────────────────────────────────────────
 
 async function tgSend(text) {
@@ -1320,6 +1426,50 @@ async function processSignal(pair, tick, strategy, session, direction) {
     }).then(row => {
       if (row?.id) trackSignal(row.id, pair, dir, entry, sl, tp)
     }).catch(() => {})
+
+    // Phase 4 (item 13): prediction_logs — auditable prediction record with
+    // MFE/MAE + price samples that the Similar-Pattern Engine consumes.
+    // Fire-and-forget; a logging failure must never affect the signal path.
+    if (WORKER_USER_ID && dir !== 'HOLD') {
+      const audit  = signal._audit ?? {}
+      const gating = [
+        ...(audit.disciplineAction ? [audit.disciplineAction] : []),
+        ...(signal.htfAction ? [signal.htfAction] : []),
+      ]
+      const predRow = {
+        user_id:             WORKER_USER_ID,
+        pair,
+        timeframe:           'scalper-worker',
+        direction:           dir,
+        predicted_direction: audit.preGateDirection ?? null,
+        gating_reasons:      gating,
+        confidence:          conf,
+        entry:               entry,
+        sl:                  sl,
+        tp:                  tp,
+        candle_close_time:   tick.lastCandleTime ? new Date(tick.lastCandleTime).getTime() + 5 * 60_000 : null,
+        regime:              signal.marketRegime ?? null,
+        agreement_score:     signal.agreementScore ?? null,
+        ml_model:            audit.mlModel ?? null,
+        ml_regime:           audit.mlRegime ?? null,
+        ml_calibration:      audit.mlCalibration ?? null,
+        ml_model_auc:        audit.mlModelAuc ?? null,
+        indicator_snapshot:  {
+          ...tick,
+          _computed: { entry, sl, tp },
+          _regime: {
+            marketRegime:         signal.marketRegime         ?? null,
+            effectiveMinStrength: signal.effectiveMinStrength ?? null,
+            suggestedSection:     signal.suggestedSection     ?? null,
+            adx:                  signal.adx                  ?? tick.adx ?? null,
+          },
+          _audit: audit,
+        },
+      }
+      sbInsertReturning('prediction_logs', predRow)
+        .then(row => { if (row?.id) trackPredictionLog(row.id, pair, dir, entry, sl, tp) })
+        .catch(() => {})
+    }
 
   }
 
@@ -1738,6 +1888,12 @@ async function runSweep() {
   // Check if any tracked signals have resolved
   await checkPendingOutcomes(ticksByPair)
 
+  // Prediction-log resolution (Phase 4, item 13) — MFE/MAE + price samples +
+  // WIN/LOSS/INCONCLUSIVE for the Similar-Pattern Engine. Observability only.
+  await resolvePredictionLogs(ticksByPair).catch(e =>
+    console.error('[predlog] sweep resolve failed:', e.message)
+  )
+
   // Signal Reconciliation — resolve any scalp/mirror signals that are due
   // (generated_at + timeframe elapsed). Observability layer only — never
   // gates or alters auto-trade execution.
@@ -2060,6 +2216,12 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   // London-NY overlap open/close Telegram notifications — fires once at the
   // exact boundary (12:00 and 14:00 UTC weekdays).
   scheduleOverlapBoundaryAlerts()
+
+  // Phase 4 (item 13): recover PENDING prediction_logs so a worker restart
+  // doesn't orphan rows still inside their resolution window.
+  await recoverPendingPredictionLogs().catch(e =>
+    console.warn('[predlog] startup recovery failed:', e.message)
+  )
 
   const startMsg = [
     `🚀 <b>SybexForexAI Worker Started</b>`,

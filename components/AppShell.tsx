@@ -17,6 +17,7 @@ import AdminPage from './pages/AdminPage'
 // import ScalpPage from './pages/ScalpPage'
 import ScalperPage from './pages/ScalperPage'
 import WorkerPage from './pages/WorkerPage'
+import IntelligencePage from './pages/IntelligencePage'
 import AuthPage from './AuthPage'
 import { usePriceFeed, useAccount, useNews, useStrategy, useTrades, useSignals } from '@/hooks/useForex'
 import { useScanner } from '@/hooks/useScanner'
@@ -43,6 +44,7 @@ function buildNav(isAdmin: boolean) {
     { id: 'broker',    label: 'Brokers',      icon: '🔌', shortcut: 'B' },
     // { id: 'scalp',     label: 'Scalp Mode',   icon: '⚡', shortcut: 'X' },
     { id: 'scalper',   label: 'AI Scalper',   icon: '🤖', shortcut: 'R' },
+    { id: 'intel',     label: 'Intelligence', icon: '🧠', shortcut: 'I' },
     { id: 'worker',    label: 'Worker Logs',  icon: '📟', shortcut: 'W' },
   ]
   if (isAdmin) nav.push({ id: 'admin', label: 'Admin', icon: '🛡', shortcut: 'Z' })
@@ -62,6 +64,7 @@ const PAGE_TITLES: Record<string, string> = {
   broker:    'BROKER CONNECTIONS',
   // scalp:     '⚡ 5M SCALPING MODE',
   scalper:   '🤖 FOREXAI SCALPER',
+  intel:     '🧠 HISTORICAL INTELLIGENCE',
   worker:    '📟 WORKER MONITOR',
   admin:     'ADMIN — USER MANAGEMENT',
 }
@@ -454,6 +457,7 @@ export default function AppShell() {
           {page === 'broker' && <BrokerPage onToast={addToast} onBrokerSaved={refreshAccount} />}
           {/* {page === 'scalp' && <ScalpPage prices={prices} account={account} strategy={strategy} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />} */}
           {page === 'scalper' && <ScalperPage prices={prices} account={account} strategy={strategy} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />}
+          {page === 'intel' && <IntelligencePage />}
           {page === 'worker' && <WorkerPage />}
           {page === 'admin' && isAdmin && <AdminPage onToast={addToast} account={account} />}
 
