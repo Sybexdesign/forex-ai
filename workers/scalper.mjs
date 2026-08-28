@@ -58,6 +58,9 @@ const HEARTBEAT_MS     = 30 * 60_000
 const FETCH_TIMEOUT_MS = 45_000       // Claude API can take 10-15 s
 const MAX_SIG_BATCH    = 3            // max concurrent Claude calls per sweep
 
+// ML service base URL — used by Phase 5 drift monitoring (checkModelDrift).
+const ML_URL = process.env.ML_SERVICE_URL || 'http://localhost:8100'
+
 // Live strategy snapshot, refreshed every STRATEGY_REFRESH_MS from /api/strategy.
 // Defaults mirror DEFAULT_STRATEGY in lib/supabase.ts so the worker has sensible
 // values before the first fetch completes (and if the fetch ever fails).
@@ -2041,6 +2044,67 @@ async function sendHeartbeat() {
       pairs:   PAIRS,
     },
   })
+
+  // Phase 5 (item 16): drift monitoring — query the ML service's PSI metric
+  // and alert on significant drift. Never gates execution; informational only.
+  await checkModelDrift().catch(() => {})
+}
+
+// ── Phase 5, item 16: model drift monitoring ──────────────────────────────────
+// Calls ML service /metrics/drift (PSI between training baseline and live
+// prediction distribution). Alerts on 'significant' drift with a retrain
+// hint. Runs on every heartbeat (~30 min); deduped by severity so we don't
+// spam Telegram while drift stays elevated.
+let lastDriftAlert = ''   // last severity we alerted on
+
+async function checkModelDrift() {
+  if (!ML_URL) return
+  try {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 5000)
+    const resp = await fetch(`${ML_URL}/metrics/drift`, { signal: ctrl.signal })
+    clearTimeout(timer)
+    if (!resp.ok) return
+    const d = await resp.json()
+    if (!d?.available || !d?.psi) return
+
+    stats.driftPsi = d.psi
+    stats.driftSeverity = d.severity
+
+    // Log drift level every heartbeat for the dashboard.
+    wlog('info', `Model drift PSI=${d.psi} (${d.severity}) · live n=${d.n}`, {
+      metadata: { psi: d.psi, severity: d.severity, n: d.n, message: d.message },
+    })
+
+    // Alert only on severity transitions (avoid repeat-spam while elevated).
+    if (d.severity === 'significant' && lastDriftAlert !== 'significant') {
+      lastDriftAlert = 'significant'
+      await tgSend(
+        `🚨 <b>MODEL DRIFT — SIGNIFICANT</b>
+
+` +
+        `PSI = ${d.psi} (threshold 0.25)
+` +
+        `Live samples: ${d.n}
+` +
+        `Baseline mean win-prob: ${d.baseline_mean_win_prob ?? '—'}
+` +
+        `Live mean win-prob:     ${d.live_mean_win_prob ?? '—'}
+
+` +
+        `The market no longer looks like the training data — schedule a retrain:
+` +
+        `<code>cd forex-ai/ml && python build_dataset.py && python train.py --dataset data/clean_dataset.csv --calibration sigmoid</code>`
+      )
+    } else if (d.severity === 'moderate' && lastDriftAlert === 'significant') {
+      // Recovered below significant → allow a future significant alert again.
+      lastDriftAlert = ''
+    }
+  } catch (e) {
+    // ML service unreachable — drift check is best-effort only.
+    if (!stats.driftCheckedOnce) console.warn('[drift] ML service unreachable:', e.message)
+    stats.driftCheckedOnce = true
+  }
 }
 
 // ── Midnight Restart ──────────────────────────────────────────────────────────

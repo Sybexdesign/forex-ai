@@ -3,6 +3,7 @@
 
 import os
 import json
+import math
 import subprocess
 import sys
 import threading
@@ -460,6 +461,160 @@ def health():
         'daily_model':   {'features': len(DAILY_FEATURE_NAMES), 'loaded': daily_model is not None},
     }
 
+
+# ─── Phase 5, item 17: calibration curve + drift metrics ───────────────────────
+# Computes the model's live calibration curve (predicted win-probability vs
+# observed win rate) and the Population Stability Index against the training
+# baseline, from the resolved prediction_logs the worker writes. Both are the
+# core inputs to the Phase 5 metrics dashboard.
+
+def _load_live_outcomes() -> list:
+    """Pull resolved prediction_logs (outcome + ML win-probability) via Supabase.
+
+    Returns a list of dicts with 'win_prob' (float) and 'win' (bool) for rows
+    that have BOTH a resolved outcome and a stored ML probability. Falls back
+    to an empty list when Supabase env vars are absent or the query fails.
+    """
+    url = os.environ.get('NEXT_PUBLIC_SUPABASE_URL') or os.environ.get('SUPABASE_URL')
+    key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY') or os.environ.get('SUPABASE_ANON_KEY')
+    if not url or not key:
+        return []
+    try:
+        import urllib.request
+        import urllib.error
+        # prediction_logs stores the ML win-probability inside
+        # indicator_snapshot._audit.mlWinProb (Phase 4).
+        sel = ('outcome, indicator_snapshot->_audit->>mlWinProb')
+        req = urllib.request.Request(
+            f'{url}/rest/v1/prediction_logs?select={sel}&outcome=in.(WIN,LOSS)&order=created_at.desc&limit=2000',
+            headers={'apikey': key, 'Authorization': f'Bearer {key}'},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read().decode())
+        out = []
+        for r in rows:
+            p = r.get('mlWinProb')
+            if p is None:
+                # fall back to nested indicator_snapshot audit
+                snap = r.get('indicator_snapshot') or {}
+                p = ((snap.get('_audit') or {}).get('mlWinProb'))
+            try:
+                pv = float(p)
+            except (TypeError, ValueError):
+                continue
+            if not (0.0 <= pv <= 1.0):
+                continue
+            out.append({'win_prob': pv, 'win': r['outcome'] == 'WIN'})
+        return out
+    except Exception as e:
+        print(f'⚠ [metrics] live outcome fetch failed: {e}')
+        return []
+
+
+def _psi(expected_counts: list, actual_counts: list, total_actual: int) -> float:
+    """Population Stability Index between two binned distributions."""
+    psi = 0.0
+    total_exp = sum(expected_counts)
+    for e, a in zip(expected_counts, actual_counts):
+        e_pct = (e + 0.5) / (total_exp + 0.5)      # smoothing avoids div-by-zero
+        a_pct = (a + 0.5) / (total_actual + 0.5)
+        if e_pct <= 0 or a_pct <= 0:
+            continue
+        psi += (a_pct - e_pct) * math.log(a_pct / e_pct)
+    return round(psi, 4)
+
+
+
+
+@app.get('/metrics/calibration')
+def metrics_calibration():
+    """Calibration curve: binned predicted win-probability vs observed win rate."""
+    live = _load_live_outcomes()
+    if not live:
+        return {'available': False, 'n': 0, 'bins': [], 'brier': None,
+                'message': 'No resolved prediction_logs with ML probability yet.'}
+
+    bins = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    n_bins = len(bins) - 1
+    bin_n    = [0] * n_bins
+    bin_win  = [0] * n_bins
+    bin_pred = [0.0] * n_bins
+    brier = 0.0
+    for r in live:
+        idx = min(n_bins - 1, int(r['win_prob'] * 10))
+        bin_n[idx] += 1
+        bin_win[idx] += 1 if r['win'] else 0
+        bin_pred[idx] += r['win_prob']
+        brier += (r['win_prob'] - (1 if r['win'] else 0)) ** 2
+
+    curve = []
+    for i in range(n_bins):
+        if bin_n[i] == 0:
+            continue
+        pred_avg = bin_pred[i] / bin_n[i]
+        obs_rate = bin_win[i] / bin_n[i]
+        curve.append({
+            'bin':      f'{bins[i]:.1f}-{bins[i+1]:.1f}',
+            'mid':      round((bins[i] + bins[i+1]) / 2, 2),
+            'n':        bin_n[i],
+            'predicted': round(pred_avg, 3),
+            'observed':  round(obs_rate, 3),
+            'absErr':    round(abs(pred_avg - obs_rate), 3),
+        })
+
+    return {
+        'available': True,
+        'n': len(live),
+        'bins': curve,
+        'brier': round(brier / len(live), 4),
+        'mean_abs_error': round(sum(b['absErr'] for b in curve) / len(curve), 4) if curve else None,
+    }
+
+
+@app.get('/metrics/drift')
+def metrics_drift():
+    """Population Stability Index between training baseline and live predictions."""
+    live = _load_live_outcomes()
+    if not live:
+        return {'available': False, 'psi': None, 'n': 0,
+                'message': 'No live predictions to compare yet.'}
+
+    baseline_path = os.path.join(MODEL_DIR, 'drift_baseline.json')
+    if not os.path.exists(baseline_path):
+        return {'available': False, 'psi': None, 'n': len(live),
+                'message': 'No drift_baseline.json — retrain with Phase 5 train.py first.'}
+
+    with open(baseline_path) as f:
+        baseline = json.load(f)
+    exp_counts = baseline.get('counts', [])
+    if not exp_counts:
+        return {'available': False, 'psi': None, 'n': len(live),
+                'message': 'Baseline has no histogram.'}
+
+    # Bin live predictions into the same 10 bins as the baseline.
+    act_counts = [0] * 10
+    for r in live:
+        idx = min(9, int(r['win_prob'] * 10))
+        act_counts[idx] += 1
+
+    psi = _psi(exp_counts, act_counts, len(live))
+    # PSI thresholds (industry convention): <0.1 no drift, 0.1-0.25 moderate,
+    # >0.25 significant drift → schedule retrain.
+    severity = 'none' if psi < 0.1 else ('moderate' if psi < 0.25 else 'significant')
+    return {
+        'available': True,
+        'psi': psi,
+        'severity': severity,
+        'n': len(live),
+        'baseline_total': baseline.get('total'),
+        'baseline_mean_win_prob': baseline.get('mean_win_prob'),
+        'live_mean_win_prob': round(float(sum(r['win_prob'] for r in live) / len(live)), 4),
+        'baseline_trained_at': baseline.get('trained_at'),
+        'message': ('⚠ significant drift — consider retraining'
+                    if severity == 'significant'
+                    else 'moderate drift — monitor' if severity == 'moderate'
+                    else 'no significant drift'),
+    }
 
 # ─── Worker endpoints ─────────────────────────────────────────────────────────
 

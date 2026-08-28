@@ -647,6 +647,34 @@ metrics = {
 with open(metrics_path, 'w') as f:
     json.dump(metrics, f, indent=2)
 
+# ─── Phase 5, item 16: drift baseline ──────────────────────────────────────────
+# Records the out-of-sample predicted-win-probability distribution (10 bins)
+# so serve.py can compute the Population Stability Index (PSI) between the
+# model's training-time behaviour and live predictions. A growing PSI means
+# the live market no longer looks like the data the model was trained on —
+# the signal to schedule a retrain.
+drift_path = os.path.join(MODEL_DIR, 'drift_baseline.json')
+try:
+    oob_arr = np.array(oob_proba, dtype=float) if ('oob_proba' in dir() and len(oob_proba) > 0) else y_proba
+    bins = np.linspace(0.0, 1.0, 11)  # 10 equal-width bins [0,0.1]...[0.9,1]
+    counts, _ = np.histogram(np.clip(oob_arr, 0, 1), bins=bins)
+    baseline = {
+        'bins': [round(float(b), 3) for b in bins],
+        'counts': [int(c) for c in counts],
+        'total': int(oob_arr.size),
+        'mean_win_prob': round(float(oob_arr.mean()), 4),
+        'n_samples': int(len(X)),
+        'n_wins': int(n_wins),
+        'n_loss': int(n_loss),
+        'walk_forward_auc': round(AVG_AUC, 4),
+        'trained_at': pd.Timestamp.utcnow().isoformat(),
+    }
+    with open(drift_path, 'w') as f:
+        json.dump(baseline, f, indent=2)
+    print(f"✓ Drift baseline → {drift_path} (n={baseline['total']}, mean_p={baseline['mean_win_prob']})")
+except Exception as e:
+    print(f"⚠ Drift baseline write failed ({e})")
+
 if ACCEPTED:
     print(f"\n✓ Model saved    → {model_path}")
     print(f"✓ Features saved → {features_path}")

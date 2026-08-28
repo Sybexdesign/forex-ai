@@ -8,7 +8,7 @@
 //      the historical edge actually live?
 
 import { useState, useEffect, useCallback } from 'react'
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts'
+import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts'
 import { Panel, StatCard } from '../ui'
 
 const TOOLTIP_STYLE = {
@@ -92,6 +92,23 @@ export default function IntelligencePage() {
       setAnalyticsError(e.message || 'analytics failed')
     }
   }, [days])
+
+  // Phase 5 (item 17): model metrics — calibration curve + drift PSI
+  const [modelMetrics, setModelMetrics] = useState<any>(null)
+  const [metricsError, setMetricsError] = useState('')
+
+  const fetchModelMetrics = useCallback(async () => {
+    setMetricsError('')
+    try {
+      const res = await fetch(`/api/scalper/ml-metrics?days=${Math.min(90, days)}`)
+      if (!res.ok) throw new Error(`ml-metrics ${res.status}`)
+      setModelMetrics(await res.json())
+    } catch (e: any) {
+      setMetricsError(e.message || 'ml-metrics failed')
+    }
+  }, [days])
+
+  useEffect(() => { fetchModelMetrics() }, [fetchModelMetrics])
 
   useEffect(() => { fetchAnalytics() }, [fetchAnalytics])
 
@@ -255,6 +272,53 @@ export default function IntelligencePage() {
           </div>
         </Panel>
       )}
+
+      {/* Phase 5 (item 17): model calibration curve + drift */}
+      <Panel title="Model Metrics" badge="Phase 5 · item 17">
+        {metricsError && <div style={{ color: '#ff6060', fontSize: 12, marginBottom: 8 }}>{metricsError}</div>}
+
+        {modelMetrics?.calibration?.bins?.length > 0 && (
+          <>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+              <StatCard label="Brier score" value={modelMetrics.calibration.brier?.toFixed?.(4) ?? '—'} color={modelMetrics.calibration.brier != null && modelMetrics.calibration.brier < 0.25 ? 'var(--color-buy)' : modelMetrics.calibration.brier != null && modelMetrics.calibration.brier < 0.35 ? '#ffb800' : 'var(--color-sell)'} />
+              <StatCard label="Mean abs error" value={modelMetrics.calibration.mean_abs_error?.toFixed?.(4) ?? '—'} color="var(--color-accent)" />
+              <StatCard label="Sample size" value={modelMetrics.n ?? '—'} color="var(--text-muted)" />
+              <StatCard label="Drift PSI" value={modelMetrics.drift?.psi?.toFixed?.(3) ?? '—'} color={modelMetrics.drift?.severity === 'none' ? 'var(--color-buy)' : modelMetrics.drift?.severity === 'moderate' ? '#ffb800' : 'var(--color-sell)'} />
+            </div>
+
+            {modelMetrics.drift?.message && (
+              <div style={{ fontSize: 11, marginBottom: 8, color: modelMetrics.drift.severity === 'none' ? 'var(--color-buy)' : modelMetrics.drift.severity === 'moderate' ? '#ffb800' : 'var(--color-sell)' }}>
+                Drift: {modelMetrics.drift.message}
+              </div>
+            )}
+
+            {/* Calibration curve: predicted vs observed win rate */}
+            <div style={{ height: 240 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={modelMetrics.calibration.bins} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1a2940" />
+                  <XAxis dataKey="mid" tick={{ fill: '#607080', fontSize: 10 }} name="Predicted p" />
+                  <YAxis domain={[0, 1]} tick={{ fill: '#607080', fontSize: 10 }} />
+                  <Tooltip {...TOOLTIP_STYLE} />
+                  <Line type="monotone" dataKey="observed" name="Observed win rate" stroke="#00ff87" strokeWidth={2} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="predicted" name="Predicted probability" stroke="#38bdf8" strokeWidth={2} strokeDasharray="4 4" dot={false} />
+                  {/* Perfect calibration reference line */}
+                  <Line dataKey={(d: any) => d.mid} name="Perfect" stroke="#607080" strokeWidth={1} strokeDasharray="2 2" dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 6 }}>
+              Blue = model predicted probability · Green = observed win rate · Grey = perfect calibration. If green sits below blue at high probabilities, the model is overconfident.
+            </div>
+          </>
+        )}
+
+        {(!modelMetrics?.calibration?.bins || modelMetrics.calibration.bins.length === 0) && !metricsError && (
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', fontStyle: 'italic' }}>
+            No resolved predictions with ML probability yet — the calibration curve appears once the worker has resolved enough prediction_logs.
+          </div>
+        )}
+      </Panel>
     </div>
   )
 }
