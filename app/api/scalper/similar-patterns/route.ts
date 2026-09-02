@@ -85,7 +85,7 @@ export async function POST(req: NextRequest) {
 
     // ── Build candidate pool + z-normalise across the whole pool ──────────
     const candidates: { row: any; vec: Record<string, number> }[] = []
-    for (const row of data || []) {
+    for (const row of (data || []) as any[]) {
       const vec = featureVector(row.indicator_snapshot)
       if (vec) candidates.push({ row, vec })
     }

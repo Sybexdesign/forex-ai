@@ -28,7 +28,7 @@ export interface StrategyHealth {
   }
 }
 
-const windows: Record<string, number> = { '1d': 1, '7d': 7, '30d': 30 }
+const windows = { '1d': 1, '7d': 7, '30d': 30 } as const
 export type HealthWindow = keyof typeof windows
 const HEALTH_TTL_MS = 15 * 60_000
 const _cache = new Map<string, { at: number; value: StrategyHealth }>()

@@ -155,7 +155,16 @@ export async function saveDiagnosis(row: SavedDiagnosisRow): Promise<string | nu
 }
 
 /** Aggregate the recurring failure patterns for the last N days. */
-export async function recurringFailurePatterns(days = 30, userId?: string | null) {
+export async function recurringFailurePatterns(
+  days = 30,
+  userId?: string | null,
+): Promise<{
+  counts: Record<string, number>
+  ranked: { code: string; count: number }[]
+  critical: number
+  warn: number
+  n: number
+}> {
   const admin = getAdminClient()
   let q = admin
     .from('trade_diagnoses')
@@ -165,7 +174,7 @@ export async function recurringFailurePatterns(days = 30, userId?: string | null
     .limit(2000)
   if (userId) q = q.eq('user_id', userId)
   const { data, error } = await q
-  if (error) return { counts: {}, critical: 0, warn: 0, n: 0 }
+  if (error) return { counts: {}, ranked: [], critical: 0, warn: 0, n: 0 }
   const counts: Record<string, number> = {}
   let critical = 0, warn = 0
   for (const r of data || []) {

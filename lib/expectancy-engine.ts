@@ -239,7 +239,7 @@ async function fetchClosedTradeSamples(userId: string | null, days: number, limi
   if (error) throw error
 
   const out: RSample[] = []
-  for (const row of (data || [])) {
+  for (const row of (data || []) as any[]) {
     const pair = row.pair
     const entry = num(row.entry_price)
     const sl = num(row.sl_price)
@@ -286,7 +286,7 @@ async function fetchPredictionSamples(userId: string | null, days: number, limit
   if (error) throw error
 
   const out: RSample[] = []
-  for (const row of (data || [])) {
+  for (const row of (data || []) as any[]) {
     const pair = row.pair
     if (row.direction !== 'BUY' && row.direction !== 'SELL') continue
     const direction = row.direction as 'BUY' | 'SELL'
@@ -408,11 +408,11 @@ export function computeSegments(samples: RSample[]): SegmentedBucket[] {
     if (seg.session && d.session !== seg.session) return false
     if (seg.volRegime && d.volRegime !== seg.volRegime) return false
     if (seg.spreadCond && d.spreadCond !== seg.spreadCond) return false
-    if (seg.signalStrengthLow !== undefined) {
+    if (seg.signalStrengthLow !== undefined && seg.signalStrengthHigh !== undefined) {
       const c = num(d.confidence)
       if (c === null || c < seg.signalStrengthLow || c >= seg.signalStrengthHigh) return false
     }
-    if (seg.mlConfLow !== undefined) {
+    if (seg.mlConfLow !== undefined && seg.mlConfHigh !== undefined) {
       const m = num(d.mlWinProb)
       if (m === null || m < seg.mlConfLow || m >= seg.mlConfHigh) return false
     }

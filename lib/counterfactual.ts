@@ -124,7 +124,7 @@ export async function runCounterfactualReplay(req: ReplayRequest): Promise<Repla
 
   // Build candidate pool with feature vectors.
   const candidates: { row: any; vec: Record<string, number> | null; distance: number | null }[] = []
-  for (const row of (data || [])) {
+  for (const row of (data || []) as any[]) {
     const vec = featureVector(row.indicator_snapshot)
     candidates.push({ row, vec, distance: null })
   }

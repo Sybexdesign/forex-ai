@@ -35,8 +35,8 @@ export async function GET(req: NextRequest) {
       ])
       return NextResponse.json({
         userId,
-        alerts: mergeUnique(ownA.data, gA.data),
-        setups: mergeUnique(ownS.data, gS.data),
+        alerts: mergeUnique(ownA.data ?? [], gA.data ?? []),
+        setups: mergeUnique(ownS.data ?? [], gS.data ?? []),
         errors: [ownA.error?.message, ownS.error?.message, gA.error?.message, gS.error?.message].filter(Boolean),
       })
     }
