@@ -239,10 +239,10 @@ create index if not exists filter_rejections_filter  on public.filter_rejections
 create table if not exists public.strategy_health (
   id          uuid primary key default gen_random_uuid(),
   user_id     uuid references auth.users(id) on delete cascade,
-  window      text not null check (window in ('1d', '7d', '30d')),
+  "window"    text not null check ("window" in ('1d', '7d', '30d')),
   payload     jsonb not null default '{}'::jsonb,
   recorded_at timestamptz not null default now(),
-  unique (user_id, window)
+  unique (user_id, "window")
 );
 create index if not exists strategy_health_recorded on public.strategy_health (recorded_at desc);
 
@@ -310,6 +310,6 @@ create policy "users read own or global strategy_health"
 -- (NULL user_id rows cannot collide in ordinary unique indexes, so partial
 -- unique indexes enforce one materialised global set per scope.)
 create unique index if not exists strategy_health_global_window_key
-  on public.strategy_health (window) where user_id is null;
+  on public.strategy_health ("window") where user_id is null;
 create unique index if not exists expectancy_stats_global_key
   on public.expectancy_statistics (segment_key, computed_from, window_days) where user_id is null;
