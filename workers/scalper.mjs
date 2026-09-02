@@ -474,7 +474,9 @@ const RECON_RESOLVE_BATCH        = parseInt(process.env.SIGNAL_RECON_RESOLVE_BAT
 // Called at signal generation time (in processSignal) for both the scalp
 // direction and its mirror inverse. Each gets its OWN row — they are separate
 // predictions graded against the same outcome.
-async function captureSignalReconciliation({ signalType, pair, direction, entryPrice, timeframe, signalId }) {
+// sl/tp are optional price levels that seed the Expectancy Engine's R-multiple
+// segmentation (mirror inverts the entry but keeps the same SL/TP distances).
+async function captureSignalReconciliation({ signalType, pair, direction, entryPrice, timeframe, signalId, slPrice, tpPrice }) {
   if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return
   if (!direction) return
   if (!entryPrice || entryPrice <= 0) return
@@ -489,6 +491,8 @@ async function captureSignalReconciliation({ signalType, pair, direction, entryP
       generated_at: new Date().toISOString(),
       signal_id:   signalId || null,
       outcome:     'PENDING',
+      sl:          slPrice ?? null,
+      tp:          tpPrice ?? null,
     })
     console.log(`[recon] captured ${signalType} ${pair} ${direction} @ ${entryPrice} (${timeframe})`)
   } catch (e) {
@@ -1495,11 +1499,17 @@ async function processSignal(pair, tick, strategy, session, direction) {
   if (WORKER_USER_ID) {
     const mirrorDir = dir === 'BUY' ? 'SELL' : 'BUY'
     const signalId  = `worker-${pair.replace('/', '')}-${Date.now()}`
+    // Price levels seed the Expectancy Engine's R-multiple segmentation.
+    const entryPrice = signal.entry || tick.price
+    const slPrice = signal.sl ?? null
+    const tpPrice = signal.tp ?? null
     captureSignalReconciliation({
       signalType: 'scalp',
       pair,
       direction:  dir,
-      entryPrice: signal.entry || tick.price,
+      entryPrice,
+      slPrice,
+      tpPrice,
       timeframe:  '5m',
       signalId,
     }).catch(() => {})
@@ -1508,7 +1518,9 @@ async function processSignal(pair, tick, strategy, session, direction) {
         signalType: 'mirror',
         pair,
         direction:  mirrorDir,
-        entryPrice: signal.entry || tick.price,
+        entryPrice,
+        slPrice,
+        tpPrice,
         timeframe:  '5m',
         signalId,
       }).catch(() => {})

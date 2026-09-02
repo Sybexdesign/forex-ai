@@ -7,6 +7,8 @@ import { llmComplete, hasLlmKey, providerLabel } from '@/lib/llm'
 import { getMarketCandles } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'
 import { getCalibratedMinStrengths } from '@/lib/threshold-calibration'
+import { sessionOf } from '@/lib/expectancy-engine'
+import { evaluateSetup } from '@/lib/setup-evaluator'
 
 type Strategy = 'Momentum' | 'Mean Reversion' | 'Breakout' | 'Order Flow' | 'Scalp'
 type Direction = 'BUY' | 'SELL' | 'HOLD'
@@ -836,6 +838,77 @@ Return JSON only:
         }
       } catch { /* non-critical */ }
     }
+
+
+    // ── Expectancy / Safety / Authority — SHADOW layer (2026-09-02) ──────────
+    // Advisory only: evaluates the final gated signal against historical
+    // segment expectancy + safety + authority, records the decision snapshot,
+    // and alerts only when a setup is genuinely qualified. NEVER alters the
+    // direction/confidence or the execution path above. Runs for Scalp (the
+    // canonical 5m XAU/XAG path) so both the browser AND the 24/7 worker
+    // benefit from the same server-side evaluation.
+    let intel: { expectancy: any; safety: any; authority: any; setupOutcome: any } | null = null
+    if (strategy === 'Scalp' && result.direction !== 'HOLD') {
+      try {
+        const slDistPips = result.sl && result.entry
+          ? Math.abs(result.sl - result.entry) / pip
+          : null
+        intel = await evaluateSetup({
+          pair,
+          direction: result.direction,
+          userId: userId || undefined,
+          mode: 'shadow',
+          timeframe: '5m',
+          regime: regimeMeta?.regime ?? null,
+          session: sessionOf(new Date()),
+          spreadPips: t.spreadPips,
+          atrPips: t.atrPips,
+          spreadSource: t.spreadSource ?? 'default',
+          slPips: slDistPips,
+          htfBias15m: htfBias15m as 'BUY' | 'SELL' | null,
+          htfBias1h: htfBias1h as 'BUY' | 'SELL' | null,
+          signalScore: result.confidence,
+          mlWinProb: mlData?.win_probability ?? null,
+          agreementScore: agreementScore,
+          reasons: result.reasons ?? [],
+          entry: result.entry ?? null,
+          sl: result.sl ?? null,
+          tp: result.tp ?? null,
+          snapshot: {
+            engine: fallback ? 'rules' : providerLabel(),
+            preGateDirection,
+            preGateConfidence,
+            regimeAdx: regimeMeta?.adx ?? null,
+            effectiveMinStrength: regimeMeta?.effectiveMinStrength ?? null,
+            tick: { price: t.price, spreadPips: t.spreadPips, atrPips: t.atrPips, adx: t.adx, rsi14: t.rsi14 },
+          },
+        })
+      } catch (e: any) {
+        console.warn('[scalper/signal] shadow intelligence skipped:', e?.message)
+      }
+    }
+
+    return NextResponse.json({
+      ...result,
+      fallback,
+      ml: mlData,
+      _audit: audit,
+      marketRegime:         regimeMeta?.regime ?? null,
+      effectiveMinStrength: regimeMeta?.effectiveMinStrength ?? null,
+      thresholdSource,       // Phase 2 (item 7): 'calibrated' | 'heuristic'
+      suggestedSection:     regimeMeta?.suggestedSection ?? null,
+      adx:                  regimeMeta?.adx ?? null,
+      // Phase 2 (item 8): unified agreement score across 5M/15M/1H/ML/rule.
+      agreementScore,        // 0-100, null when the signal was gated to HOLD
+      agreementVotes,        // [{ source, direction }] per component
+      htfBias15m,            // Phase 2 (item 6): 15m trend bias at signal time
+      htfBias1h,             // Phase 2 (item 6): 1H trend bias at signal time
+      htfAction,             // human-readable multi-TF filter outcome
+      // New expectancy-intelligence layer (shadow; see migration 20260902).
+      expectancy: intel?.expectancy ?? null,
+      safety:     intel?.safety ?? null,
+      authority:  intel?.authority ?? null,
+    })
 
     return NextResponse.json({
       ...result,

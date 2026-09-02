@@ -321,3 +321,57 @@ export async function alertTradeClosed(opts: {
   ].join('\n')
   await send(text)
 }
+
+// Qualified-setup notification — fired by lib/qualified-alerts.ts when the
+// Expectancy + Authority + Safety layers approve a genuinely tradeable setup.
+// Broadcast to admin chat + every active DB subscriber (like alertNewSignal).
+export async function alertQualifiedSetup(opts: {
+  pair: string
+  direction: 'BUY' | 'SELL'
+  signalScore?: number | null
+  expectancyR?: number | null
+  expectancyStatus?: string | null
+  sampleN?: number | null
+  safetyScore?: number | null
+  safetyGrade?: 'A' | 'B' | 'C' | 'D' | 'F' | null
+  reasons?: string[]
+  entry?: number | null
+  sl?: number | null
+  tp?: number | null
+  regime?: string | null
+  session?: string | null
+}) {
+  // Sanitise for Telegram HTML parse mode (& < > are reserved).
+  const esc = (s: string): string =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const dir = opts.direction
+  const why: string[] = []
+  if (opts.regime) why.push(`Regime: ${esc(opts.regime)}`)
+  if (opts.session) why.push(`Session: ${esc(opts.session)}`)
+  if (opts.expectancyR !== null && opts.expectancyR !== undefined)
+    why.push(`Historical expectancy: <code>+${opts.expectancyR.toFixed(2)}R</code>${opts.expectancyStatus ? ` (${esc(opts.expectancyStatus.toLowerCase().replace('_', ' '))})` : ''}${opts.sampleN ? ` · ${opts.sampleN} samples` : ''}`)
+  if (opts.safetyScore !== null && opts.safetyScore !== undefined)
+    why.push(`Safety score: <b>${opts.safetyScore}/100</b>${opts.safetyGrade ? ` (${opts.safetyGrade})` : ''}`)
+  for (const r of (opts.reasons ?? []).slice(0, 4)) why.push(esc(r))
+
+  const plan = [
+    opts.entry  !== null && opts.entry  !== undefined ? `Entry: <code>${opts.entry}</code>` : null,
+    opts.sl     !== null && opts.sl     !== undefined ? `SL: <code>${opts.sl}</code>`       : null,
+    opts.tp     !== null && opts.tp     !== undefined ? `TP: <code>${opts.tp}</code>`       : null,
+  ].filter(Boolean)
+
+  const lines = [
+    `🔔 <b>${opts.pair} ${dir} QUALIFIED SETUP DETECTED</b>`,
+    ``,
+    `WHY?`,
+    ...why.map(w => `• ${w}`),
+    ``,
+    plan.length ? [`TRADE PLAN`, ...plan.map(p => p), ``] : [],
+    `AI confidence: ${opts.signalScore ?? '—'}%`,
+    ``,
+    `<i>Shadow mode — this setup is being tracked, not auto-executed.</i>`,
+    `⏱ ${new Date().toUTCString()}`,
+  ].flat().filter(Boolean).join('\n')
+  await broadcast(lines)
+}
+

@@ -126,6 +126,27 @@ export async function clearAllServerCaches(): Promise<{
     errors.push(`signal-htf-bias: ${e?.message}`)
   }
 
+  // 6. Reset the Expectancy Engine's segmented-statistics + strategy-health
+  //    caches (2026-09-02) so the next evaluation recomputes from fresh rows.
+  try {
+    const { clearExpectancyCache } = await import('./expectancy-engine')
+    if (typeof clearExpectancyCache === 'function') {
+      clearExpectancyCache()
+      cleared.push('expectancy-engine')
+    }
+  } catch (e: any) {
+    errors.push(`expectancy-engine: ${e?.message}`)
+  }
+  try {
+    const { clearStrategyHealthCache } = await import('./strategy-health')
+    if (typeof clearStrategyHealthCache === 'function') {
+      clearStrategyHealthCache()
+      cleared.push('strategy-health')
+    }
+  } catch (e: any) {
+    errors.push(`strategy-health: ${e?.message}`)
+  }
+
   return { cleared, errors }
 }
 
