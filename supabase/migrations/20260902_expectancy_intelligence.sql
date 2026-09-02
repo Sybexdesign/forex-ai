@@ -56,6 +56,7 @@ create index if not exists trade_setups_status_idx on public.trade_setups (statu
 -- upserted per (segment_key, computed_from, window_days).
 create table if not exists public.expectancy_statistics (
   id                  uuid primary key default gen_random_uuid(),
+  user_id             uuid references auth.users(id) on delete cascade,  -- NULL = global stats
   segment_key         text not null,        -- json-stringified dimension vector
   segment             jsonb not null default '{}'::jsonb,  -- human-readable dims
   computed_from       text not null check (computed_from in ('closed_trades', 'predictions', 'mixed')),
@@ -89,6 +90,10 @@ create table if not exists public.expectancy_statistics (
                       check (expectancy_status in ('VERY_STRONG', 'STRONG', 'POSITIVE', 'NEUTRAL', 'NEGATIVE', 'INSUFFICIENT_DATA')),
   computed_at         timestamptz not null default now()
 );
+-- Safety net: if a prior (partial) run created this table before the user_id
+-- column existed, make sure the column is present before indexes/policies use it.
+alter table public.expectancy_statistics
+  add column if not exists user_id uuid references auth.users(id) on delete cascade;
 
 create unique index if not exists expectancy_stats_key
   on public.expectancy_statistics (user_id, segment_key, computed_from, window_days);
