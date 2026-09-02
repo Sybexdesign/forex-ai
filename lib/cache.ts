@@ -146,6 +146,15 @@ export async function clearAllServerCaches(): Promise<{
   } catch (e: any) {
     errors.push(`strategy-health: ${e?.message}`)
   }
+  try {
+    const { clearBacktestCache } = await import('./backtest')
+    if (typeof clearBacktestCache === 'function') {
+      clearBacktestCache()
+      cleared.push('backtest')
+    }
+  } catch (e: any) {
+    errors.push(`backtest: ${e?.message}`)
+  }
 
   return { cleared, errors }
 }

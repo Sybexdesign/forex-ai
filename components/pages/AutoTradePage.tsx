@@ -4,6 +4,9 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Panel, LoadingDots, CopyValue } from '../ui'
+import SetupBadges, {
+  type IntelExpectancyView, type IntelSafetyView, type IntelAuthorityView,
+} from '../SetupBadges'
 import { calcStandardPositionSize, getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { execSlTpPips } from '@/lib/trade-levels'
 import { authFetch } from '@/lib/api'
@@ -136,6 +139,10 @@ interface ScalpSignal {
   htfBias15m?: 'BUY' | 'SELL' | null
   htfBias1h?: 'BUY' | 'SELL' | null
   htfAction?: string | null
+  // Phase 6 — Expectancy / Safety / Authority (shadow) attached by the server
+  expectancy?: IntelExpectancyView | null
+  safety?: IntelSafetyView | null
+  authority?: IntelAuthorityView | null
 }
 
 function Pager({ page, total, onPage }: { page: number; total: number; onPage: (p: number) => void }) {
@@ -448,6 +455,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           htfBias15m:           sig.htfBias15m ?? null,
           htfBias1h:            sig.htfBias1h ?? null,
           htfAction:            sig.htfAction ?? null,
+          // Phase 6 — shadow expectancy intelligence from /api/scalper/signal
+          expectancy:           sig.expectancy ?? null,
+          safety:               sig.safety ?? null,
+          authority:            sig.authority ?? null,
           // fetchError cleared on success
         },
       }))
@@ -1832,6 +1843,16 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                   ) : null}
                 </div>
               </div>
+
+              {/* Phase 6 — Expectancy / Safety / Authority badges (shadow) —
+                  attached by /api/scalper/signal; advisory only, never gates. */}
+              {sig && !sig.blocked && dir !== 'HOLD' && (sig.expectancy?.metrics || sig.safety || sig.authority) && (
+                <SetupBadges
+                  expectancy={sig.expectancy ?? null}
+                  safety={sig.safety ?? null}
+                  authority={sig.authority ?? null}
+                />
+              )}
 
               {/* Price levels: entry / SL / TP — re-anchored to live bid/ask
                   every render, at the EXECUTION stop distances (clamp +

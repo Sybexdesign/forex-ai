@@ -34,7 +34,26 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
   const [diagnoses, setDiagnoses] = useState<any>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  // Phase 10 walk-forward backtest
+  const [bt, setBt] = useState<any>(null)
+  const [btLoading, setBtLoading] = useState(false)
+  const [btError, setBtError] = useState<string | null>(null)
+  const btStarted = useRef(false)
   const timer = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const loadBacktest = async (fresh = false) => {
+    if (btLoading) return
+    setBtLoading(true)
+    try {
+      const uq = userId ? `&userId=${encodeURIComponent(userId)}` : ''
+      const r = await fetch(`/api/backtest?window=90${uq}${fresh ? '&refresh=1' : ''}`).then(x => x.json())
+      if (!r?.error) { setBt(r); setBtError(null) } else setBtError(r.error)
+    } catch (e: any) {
+      setBtError(e?.message || 'Backtest failed')
+    } finally {
+      setBtLoading(false)
+    }
+  }
 
   const load = async () => {
     try {
@@ -80,6 +99,14 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId])
 
+  // ── Phase 10: kick the walk-forward backtest once (server-cached after) ──
+  useEffect(() => {
+    if (btStarted.current) return
+    btStarted.current = true
+    loadBacktest()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId])
+
 
   const h = health?.payload ?? null
 
@@ -113,6 +140,76 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
         ))}
       </div>
 
+
+      {/* Phase 10 — Walk-forward backtest */}
+      <section style={{ background: '#0b1120', border: '1px solid #1e293b', borderRadius: 8, padding: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+          <div style={{ fontSize: 13, fontWeight: 700 }}>PHASE 10 — WALK-FORWARD BACKTEST <span style={{ fontSize: 10, color: '#64748b', fontWeight: 400 }}>· no-lookahead segment stats · 90d</span></div>
+          {btLoading && <span style={{ fontSize: 11, color: '#94a3b8' }}>computing…</span>}
+          <button className="btn btn-ghost" disabled={btLoading}
+            onClick={() => loadBacktest(true)}
+            style={{ fontSize: 10, padding: '4px 10px', marginLeft: 'auto' }}>
+            ↻ RE-RUN
+          </button>
+        </div>
+
+        {btError && <div style={{ color: '#ef4444', fontSize: 11, marginBottom: 8 }}>{btError}</div>}
+        {!bt?.ok && !btError && bt && (bt.warnings ?? []).length > 0 && (
+          <div style={{ color: '#ffb800', fontSize: 11, marginBottom: 8 }}>
+            {(bt.warnings ?? []).map((w: string, i: number) => <div key={i}>⚠ {w}</div>)}
+          </div>
+        )}
+
+        {bt?.ok && (
+          <>
+            <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 11, color: '#94a3b8', marginBottom: 10 }}>
+              <span>{bt.candidates} candidates · {bt.evidence} evidence episodes</span>
+              {bt.dateFrom && <span>{(bt.dateFrom as string).slice(0, 10)} → {(bt.dateTo as string).slice(0, 10)}</span>}
+              <span>conf ≥ {bt.options.confFloor} · strict safety ≥ {bt.options.strictSafetyMin} · min n = {bt.options.minSamples}</span>
+              {(bt.warnings ?? []).length > 0 && <span style={{ color: '#ffb800' }}>⚠ {(bt.warnings as string[]).join(' · ')}</span>}
+            </div>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+                <thead><tr style={{ color: '#64748b', textAlign: 'left' }}>
+                  <th style={th}>System</th><th style={th}>Trades</th><th style={th}>Win</th>
+                  <th style={th}>Expect R</th><th style={th}>PF</th><th style={th}>Total R%</th>
+                  <th style={th}>MaxDD R</th><th style={th}>Lose Streak</th><th style={th}>Sharpe</th>
+                  <th style={th}>Sortino</th><th style={th}>Missed+</th><th style={th}>Exec Loss</th>
+                </tr></thead>
+                <tbody>
+                  {(['current', 'expectancy', 'authority', 'safety'] as const).map((k) => {
+                    const m = bt.runs?.[k]
+                    if (!m) return null
+                    const isBaseline = k === 'current'
+                    const color = isBaseline ? '#94a3b8' : (m.expectancyR >= 0 ? '#22c55e' : '#ef4444')
+                    return (
+                      <tr key={k} style={{ borderTop: '1px solid #1e293b' }}>
+                        <td style={{ ...td, fontFamily: 'inherit', color }}>{m.label}{isBaseline ? ' (baseline)' : ''}</td>
+                        <td style={td}>{m.trades}</td>
+                        <td style={td}>{pct(m.winRate)}</td>
+                        <td style={{ ...td, color }}>{fmt(m.expectancyR)}</td>
+                        <td style={td}>{fmt(m.profitFactor, 2)}</td>
+                        <td style={td}>{m.totalReturnPct !== null ? `${m.totalReturnPct.toFixed(2)}%` : '—'}</td>
+                        <td style={td}>{fmt(m.maxDrawdownR)}</td>
+                        <td style={td}>{m.losingStreak}</td>
+                        <td style={td}>{fmt(m.sharpePerTrade)}</td>
+                        <td style={td}>{fmt(m.sortinoPerTrade)}</td>
+                        <td style={td}>{!isBaseline ? `${m.missedWins} (${fmt(m.missedWinSumR)}R)` : '—'}</td>
+                        <td style={td}>{`${m.falsePositives} (${fmt(m.falsePositiveSumR)}R)`}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ fontSize: 10, color: '#475569', marginTop: 8 }}>
+              Total R% assumes 1% risk per trade (simple sum, no compounding). Missed+ = winning setups this layer skipped vs the
+              previous system; Exec Loss = losing setups this system still executed. Segment statistics are strictly point-in-time
+              (only outcomes knowable before each signal) — shadow run, never touches execution.
+            </div>
+          </>
+        )}
+      </section>
 
       {/* Segmented expectancy */}
       <section style={{ background: '#0b1120', border: '1px solid #1e293b', borderRadius: 8, padding: 14 }}>
