@@ -6,11 +6,11 @@ import { Toast, LiveDot } from './ui'
 import DashboardPage from './pages/DashboardPage'
 import AnalysisPage from './pages/AnalysisPage'
 import StrategyPage from './pages/StrategyPage'
-import JournalPage from './pages/JournalPage'
+// import JournalPage from './pages/JournalPage'
 import SignalsPage from './pages/SignalsPage'
 import BrokerPage from './pages/BrokerPage'
-import MetalsPage from './pages/MetalsPage'
-import AdvancedPage from './pages/AdvancedPage'
+// import MetalsPage from './pages/MetalsPage'
+// import AdvancedPage from './pages/AdvancedPage'
 import AutoTradePage from './pages/AutoTradePage'
 import PropFirmPage from './pages/PropFirmPage'
 import AdminPage from './pages/AdminPage'
@@ -37,10 +37,10 @@ function buildNav(isAdmin: boolean) {
     { id: 'auto',      label: 'Auto Trade',   icon: '🤖', shortcut: 'T' },
     { id: 'analysis',  label: 'AI Analysis',  icon: '⚡', shortcut: 'A' },
     { id: 'strategy',  label: 'Strategy',     icon: '⚙', shortcut: 'S' },
-    { id: 'journal',   label: 'Journal',      icon: '📋', shortcut: 'J' },
+    // { id: 'journal',   label: 'Journal',      icon: '📋', shortcut: 'J' },
     { id: 'signals',   label: 'Signals',      icon: '📡', shortcut: 'G' },
-    { id: 'advanced',  label: 'Advanced TA',  icon: '📐', shortcut: 'V' },
-    { id: 'metals',    label: 'Gold & Silver', icon: '🥇', shortcut: 'M' },
+    // { id: 'advanced',  label: 'Advanced TA',  icon: '📐', shortcut: 'V' },
+    // { id: 'metals',    label: 'Gold & Silver', icon: '🥇', shortcut: 'M' },
     { id: 'propfirm',  label: 'Prop Firm',    icon: '🏆', shortcut: 'P' },
     { id: 'broker',    label: 'Brokers',      icon: '🔌', shortcut: 'B' },
     // { id: 'scalp',     label: 'Scalp Mode',   icon: '⚡', shortcut: 'X' },
@@ -58,10 +58,10 @@ const PAGE_TITLES: Record<string, string> = {
   auto:      'AUTO TRADE — PHASE 1',
   analysis:  'AI MARKET ANALYSIS',
   strategy:  'STRATEGY SETTINGS',
-  journal:   'TRADE JOURNAL',
+  // journal:   'TRADE JOURNAL',
   signals:   'SIGNAL HISTORY',
-  advanced:  'ADVANCED TECHNICAL ANALYSIS',
-  metals:    'GOLD & SILVER TRADING',
+  // advanced:  'ADVANCED TECHNICAL ANALYSIS',
+  // metals:    'GOLD & SILVER TRADING',
   propfirm:  'PROP FIRM EVALUATION',
   broker:    'BROKER CONNECTIONS',
   // scalp:     '⚡ 5M SCALPING MODE',
@@ -452,10 +452,10 @@ export default function AppShell() {
             />
           )}
           {page === 'strategy' && <StrategyPage strategy={strategy} onSave={handleSaveStrategy} account={account} />}
-          {page === 'journal' && <JournalPage trades={trades} userId={user?.id} onTradeAdded={refreshTrades} account={account} />}
+          {/* {page === 'journal' && <JournalPage trades={trades} userId={user?.id} onTradeAdded={refreshTrades} account={account} />} */}
           {page === 'signals' && <SignalsPage signals={signals} />}
-          {page === 'advanced' && <AdvancedPage prices={prices} />}
-          {page === 'metals' && <MetalsPage prices={prices} strategy={strategy} news={news} account={account} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />}
+          {/* {page === 'advanced' && <AdvancedPage prices={prices} />} */}
+          {/* {page === 'metals' && <MetalsPage prices={prices} strategy={strategy} news={news} account={account} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />} */}
           {page === 'propfirm' && <PropFirmPage trades={trades} onToast={addToast} />}
           {page === 'broker' && <BrokerPage onToast={addToast} onBrokerSaved={refreshAccount} />}
           {/* {page === 'scalp' && <ScalpPage prices={prices} account={account} strategy={strategy} onToast={addToast} userId={user?.id} onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades} />} */}
