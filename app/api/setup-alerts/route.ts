@@ -15,8 +15,10 @@ export async function GET(req: NextRequest) {
     const admin = getAdminClient()
 
     // Query a scope: user's own rows, or global rows when no user is supplied.
+    // trade_setups timestamps use detected_at (no created_at column).
     const query = (t: string, uid: string | null) => {
-      let q = admin.from(t).select('*').order('created_at', { ascending: false }).limit(limit)
+      const orderCol = t === 'trade_setups' ? 'detected_at' : 'created_at'
+      let q = admin.from(t).select('*').order(orderCol, { ascending: false }).limit(limit)
       return uid ? q.eq('user_id', uid) : q.is('user_id', null)
     }
     const mergeUnique = (a: any[], b: any[]) => {
