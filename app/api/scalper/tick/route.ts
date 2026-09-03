@@ -48,6 +48,7 @@ function brokerOffsetMs(candles: any[], spanMs: number, now: number, cacheKey: s
   const cached = _offsetCache.get(cacheKey)
   if (cached && now - cached.at < 10 * 60_000) return cached.off
 
+  const lastOpen = times[times.length - 1]
   const maxOff = 14 * 3600_000
   let best = 0
   let bestScore = Number.MAX_SAFE_INTEGER
@@ -57,10 +58,19 @@ function brokerOffsetMs(candles: any[], spanMs: number, now: number, cacheKey: s
       // UTC open time = broker time − offset; candle closed when open + span ≤ now
       if (times[i] - o + spanMs <= now) closed++
     }
-    if (closed !== times.length - 1) continue
+    // Live EA feeds include the in-progress candle (len−1 closed). Some feeds /
+    // stores only hold closed candles (all len closed). Both are valid.
+    if (closed !== times.length - 1 && closed !== times.length) continue
+    // Prefer: (1) live forming-candle shape, (2) whole-hour/half-hour offsets
+    // (real timezone), (3) offset whose last-candle close is closest to "now"
+    // (recently closed), which disambiguates whole-hour shifts.
+    const formTier = closed === times.length - 1 ? 0 : 1
     const mod = ((o % 3600_000) + 3600_000) % 3600_000
     const hourTier = mod === 0 ? 0 : (mod === 1800_000 ? 1 : 2)
-    const score = hourTier * 1_000_000_000_000 + Math.abs(o)
+    const recency = Math.abs(now - (lastOpen - o + spanMs))
+    // Timezone realism first (broker offsets are whole/half hours), then prefer a
+    // live forming-candle shape, then the most recently consistent close.
+    const score = hourTier * 1e18 + formTier * 1e15 + recency
     if (score < bestScore) { bestScore = score; best = o }
   }
   _offsetCache.set(cacheKey, { at: now, off: best })
