@@ -396,6 +396,12 @@ function closeTimeMs(body: any): number | null {
   return null
 }
 
+/** ISO string form for TIMESTAMPTZ columns (PostgREST rejects epoch-ms numbers with 22008). */
+function closeTimeIso(body: any): string | null {
+  const ms = closeTimeMs(body)
+  return ms === null ? null : new Date(ms).toISOString()
+}
+
 function candleKeyOf(body: any): string | null {
   const pair = typeof body?.pair === 'string' && body.pair ? body.pair : null
   const ct = closeTimeMs(body)
@@ -918,7 +924,7 @@ Return JSON only:
           entry:               result.entry ?? null,
           sl:                  result.sl ?? null,
           tp:                  result.tp ?? null,
-          candle_close_time:   closeTimeMs(body),
+          candle_close_time:   closeTimeIso(body),
           regime:              regimeMeta?.regime ?? null,
           agreement_score:     agreementScore ?? null,
           ml_model:            audit.mlModel ?? null,
@@ -950,7 +956,7 @@ Return JSON only:
           risk_note:          result.risk_note,
           acted_on:           false,
           outcome:            'PENDING',
-          candle_close_time:  closeTimeMs(body),
+          candle_close_time:  closeTimeIso(body),
           indicator_snapshot: {
             ...body,
             _computed: { entry: result.entry, sl: result.sl, tp: result.tp },

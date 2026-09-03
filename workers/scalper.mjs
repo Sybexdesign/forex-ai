@@ -1467,7 +1467,7 @@ async function processSignal(pair, tick, strategy, session, direction) {
       risk_note:          signal.risk_note,
       acted_on:           false,
       outcome:            'PENDING',
-      candle_close_time:  candleCloseMs,
+      candle_close_time:  candleCloseMs ? new Date(candleCloseMs).toISOString() : null,
       indicator_snapshot: {
         ...tick,
         _regime: {
@@ -1512,7 +1512,7 @@ async function processSignal(pair, tick, strategy, session, direction) {
         entry:               entry,
         sl:                  sl,
         tp:                  tp,
-        candle_close_time:   candleCloseMs,
+        candle_close_time:   candleCloseMs ? new Date(candleCloseMs).toISOString() : null,
         regime:              signal.marketRegime ?? null,
         agreement_score:     signal.agreementScore ?? null,
         ml_model:            audit.mlModel ?? null,
