@@ -41,6 +41,9 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
   const btStarted = useRef(false)
   const [testAlerting, setTestAlerting] = useState(false)
   const [testMsg, setTestMsg] = useState<string | null>(null)
+  const [dh, setDh] = useState<any>(null)
+  const [dhError, setDhError] = useState<string | null>(null)
+  const [market, setMarket] = useState<any>(null)
   const timer = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const fireTestAlert = async () => {
@@ -82,16 +85,20 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
       const alertQ = userId
         ? `?userId=${encodeURIComponent(userId)}&limit=40`
         : '?limit=40'
-      const [seg, setup, hlth, diag] = await Promise.all([
+      const [seg, setup, hlth, diag, dhRes, tickRes] = await Promise.all([
         fetch(`/api/expectancy${userQ}`).then(r => r.json()),
         fetch(`/api/setup-alerts${alertQ}`).then(r => r.json()),
         fetch(`/api/strategy-health?window=7d${userQ}`).then(r => r.json()),
         fetch(`/api/loss-diagnostics?days=7${userQ}`).then(r => r.json()),
+        fetch('/api/data-health').then(r => r.json()),
+        fetch('/api/scalper/tick?pair=XAU%2FUSD&timeframe=5m').then(r => r.json()),
       ])
       if (!seg?.error) { setSegments(seg.segments ?? []); setConfig(seg.config ?? null) }
       if (!setup?.error) { setSetups(setup.setups ?? []); setAlerts(setup.alerts ?? []) }
       if (!hlth?.error) setHealth(hlth)
       if (!diag?.error) setDiagnoses(diag)
+      if (!dhRes?.error) { setDh(dhRes); setDhError(null) } else setDhError(dhRes.error)
+      if (!tickRes?.error) setMarket(tickRes)
       setError(null)
     } catch (e: any) {
       setError(e?.message || 'Failed to load intelligence data')
@@ -130,6 +137,13 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
 
 
   const h = health?.payload ?? null
+  const mh = market?.marketHealth ?? null
+  const mhGood = !!market && market.dataSuspended !== true && mh?.status === 'HEALTHY'
+  const mhLabel = !market ? '…'
+    : market.dataSuspended ? `🔴 MARKET DATA ${mh?.status ?? 'ERROR'}`
+    : mh?.status === 'STALE_FEED' ? '🟠 MARKET DATA STALE'
+    : mh?.status === 'TIME_ERROR' ? '🔴 MARKET DATA TIME ERROR'
+    : '🟢 MARKET DATA HEALTHY'
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -169,6 +183,58 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
         ))}
       </div>
 
+
+      {/* Data Health + Market Data (audit 2026-09-03) */}
+      <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px,1fr))', gap: 12 }}>
+        <div style={{ background: '#0b1120', border: `1px solid ${mhGood ? 'rgba(34,197,94,0.35)' : 'rgba(255,48,86,0.35)'}`, borderRadius: 8, padding: 14 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>{mhLabel}</div>
+          {mh ? (
+            <div style={{ fontSize: 11, color: '#94a3b8', display: 'flex', flexDirection: 'column', gap: 3, fontFamily: 'JetBrains Mono, monospace' }}>
+              <span>Broker offset: {mh.brokerOffsetSec >= 0 ? '+' : ''}{(mh.brokerOffsetSec / 3600).toFixed(1)}h</span>
+              <span>Candle state: {mh.candleClosed ? 'CLOSED' : 'FORMING'} · last candle {Math.max(0, mh.lastCandleAgeSec)}s ago</span>
+              <span>Last candle: {mh.lastCandleTime}</span>
+              {typeof mh.feedLatencyMs === 'number' && <span>Feed latency: {mh.feedLatencyMs}ms</span>}
+              <span style={{ color: mhGood ? '#4ade80' : '#f87171' }}>{mh.reason}</span>
+              {market?.dataSuspended === true && (
+                <span style={{ color: '#f87171', marginTop: 4 }}>⚠ Signal generation SUSPENDED until market data is healthy.</span>
+              )}
+            </div>
+          ) : <div style={{ fontSize: 11, color: '#64748b' }}>fetching…</div>}
+        </div>
+
+        <div style={{ background: '#0b1120', border: '1px solid #1e293b', borderRadius: 8, padding: 14 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>DATA HEALTH {dh?.status ? <span style={{ fontSize: 11, color: '#64748b' }}>· {dh.status}</span> : null}</div>
+          {dhError && <div style={{ fontSize: 11, color: '#ef4444' }}>{dhError}</div>}
+          {dh && (
+            <div style={{ fontSize: 11, display: 'flex', flexDirection: 'column', gap: 3, fontFamily: 'JetBrains Mono, monospace' }}>
+              <span>Prediction logs 7d: <b>{dh.predictionLogs?.last7d ?? 0}</b> · 30d: <b>{dh.predictionLogs?.last30d ?? 0}</b></span>
+              <span>Resolved: <b>{dh.predictionLogs?.resolvedTotal ?? 0}</b> (WIN {dh.predictionLogs?.resolved?.win ?? 0} · LOSS {dh.predictionLogs?.resolved?.loss ?? 0} · INC {dh.predictionLogs?.resolved?.inconclusive ?? 0})</span>
+              <span>Unresolved: <b>{dh.predictionLogs?.unresolved ?? 0}</b></span>
+              <span>Signals (non-HOLD): 24h <b>{dh.signals?.last24h ?? 0}</b> · 7d <b>{dh.signals?.last7d ?? 0}</b></span>
+              <span>Reconciliations 7d: <b>{dh.reconciliations?.last7d ?? 0}</b> · pending {dh.reconciliations?.pending ?? 0}</span>
+              <span>Closed trades 7d: <b>{dh.trades?.closed7d ?? 0}</b> · set-ups 7d {dh.setups?.tradeSetups7d ?? 0} · alerts {dh.setups?.alerts7d ?? 0}</span>
+              <span>Worker: <b>{dh.worker?.alive ? 'ALIVE' : 'DOWN'}</b> {dh.worker?.lastSeenAt ? '· last ' + dh.worker.lastSeenAt.slice(11, 19) + ' UTC' : ''}</span>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* Filter bottlenecks — where opportunities are lost (early gates + authority) */}
+      {dh && (dh.rejections?.last24h ?? []).length > 0 && (
+        <section style={{ background: '#0b1120', border: '1px solid #1e293b', borderRadius: 8, padding: 14 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>EARLY-GATE REJECTIONS (24h)</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}>
+            {(dh.rejections.last24h).slice(0, 12).map((b: any) => (
+              <div key={b.filter} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>{b.filter}</span><b>{b.n}</b>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 10, color: '#475569', marginTop: 6 }}>
+            Candle-open, market-data health, simulated-feed, insufficient-bars, ADX-chop, spread-gate and authority rejects are now logged from /api/scalper/signal.
+          </div>
+        </section>
+      )}
 
       {/* Phase 10 — Walk-forward backtest */}
       <section style={{ background: '#0b1120', border: '1px solid #1e293b', borderRadius: 8, padding: 14 }}>

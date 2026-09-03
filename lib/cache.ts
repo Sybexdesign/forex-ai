@@ -155,6 +155,15 @@ export async function clearAllServerCaches(): Promise<{
   } catch (e: any) {
     errors.push(`backtest: ${e?.message}`)
   }
+  try {
+    const { clearMarketHealthCache } = await import('./market-health')
+    if (typeof clearMarketHealthCache === 'function') {
+      clearMarketHealthCache()
+      cleared.push('market-health')
+    }
+  } catch (e: any) {
+    errors.push(`market-health: ${e?.message}`)
+  }
 
   return { cleared, errors }
 }

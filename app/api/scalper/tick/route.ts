@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic'  // live price data — must never be cac
 import { NextRequest, NextResponse } from 'next/server'
 import { getMarketCandles, getMarketPrices } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'
+import { evaluateMarketHealth } from '@/lib/market-health'
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const ti = require('technicalindicators')
@@ -20,61 +21,6 @@ function defaultSpread(pair: string): number {
   if (pair.startsWith('XAG')) return 0.03
   if (pair.includes('JPY')) return 0.012
   return 0.00012
-}
-
-// ── Broker-timezone calibration (audit fix 2026-09-03) ───────────────────────
-// The MT5 EA pushes MqlRates.time values in BROKER/server time (typically
-// UTC+2/+3 for MT5 EET), not UTC. Candle times were compared directly against
-// the UTC server clock, which skewed them ~3h into the future and made the
-// candle-closed gate `Date.now() >= open + span` permanently false — so every
-// signal was blocked as "candle not yet closed" and nothing was ever generated.
-//
-// MT5 always returns the in-progress candle as the last bar (CopyRates index
-// 0), so exactly (len-1) of the returned candles must already be closed. We
-// brute-force the fixed offset O (whole-minute candidates, ±14h) that satisfies
-// this against the UTC clock — i.e. where time − O + span ≤ now for exactly
-// len−1 candles. Whole-hour / half-hour offsets are preferred (real timezones),
-// then the smallest magnitude. Cached 10 min per pair+timeframe.
-const _offsetCache = new Map<string, { at: number; off: number }>()
-
-function brokerOffsetMs(candles: any[], spanMs: number, now: number, cacheKey: string): number {
-  if (!Array.isArray(candles) || candles.length < 2 || !(spanMs > 0)) return 0
-  const times: number[] = []
-  for (const c of candles) {
-    const t = new Date(c?.time).getTime()
-    if (Number.isFinite(t)) times.push(t)
-  }
-  if (times.length < 2) return 0
-  const cached = _offsetCache.get(cacheKey)
-  if (cached && now - cached.at < 10 * 60_000) return cached.off
-
-  const lastOpen = times[times.length - 1]
-  const maxOff = 14 * 3600_000
-  let best = 0
-  let bestScore = Number.MAX_SAFE_INTEGER
-  for (let o = -maxOff; o <= maxOff; o += 60_000) {
-    let closed = 0
-    for (let i = 0; i < times.length; i++) {
-      // UTC open time = broker time − offset; candle closed when open + span ≤ now
-      if (times[i] - o + spanMs <= now) closed++
-    }
-    // Live EA feeds include the in-progress candle (len−1 closed). Some feeds /
-    // stores only hold closed candles (all len closed). Both are valid.
-    if (closed !== times.length - 1 && closed !== times.length) continue
-    // Prefer: (1) live forming-candle shape, (2) whole-hour/half-hour offsets
-    // (real timezone), (3) offset whose last-candle close is closest to "now"
-    // (recently closed), which disambiguates whole-hour shifts.
-    const formTier = closed === times.length - 1 ? 0 : 1
-    const mod = ((o % 3600_000) + 3600_000) % 3600_000
-    const hourTier = mod === 0 ? 0 : (mod === 1800_000 ? 1 : 2)
-    const recency = Math.abs(now - (lastOpen - o + spanMs))
-    // Timezone realism first (broker offsets are whole/half hours), then prefer a
-    // live forming-candle shape, then the most recently consistent close.
-    const score = hourTier * 1e18 + formTier * 1e15 + recency
-    if (score < bestScore) { bestScore = score; best = o }
-  }
-  _offsetCache.set(cacheKey, { at: now, off: best })
-  return best
 }
 
 export async function GET(req: NextRequest) {
@@ -96,6 +42,7 @@ export async function GET(req: NextRequest) {
     getMarketCandles(authToken, pair, timeframe, 200),
     timedPrices,
   ])
+  const startedAt = Date.now()
 
   // Standard indicators (EMA20/50, RSI14, MACD, Bollinger, ADX)
   const ind = calculateIndicators(candles)
@@ -167,17 +114,16 @@ export async function GET(req: NextRequest) {
     '4h': 4 * 60 * 60_000, '1D': 24 * 60 * 60_000, 'Daily': 24 * 60 * 60_000,
   }
   const spanMs = TF_SPAN_MS[timeframe]
-  let candleClosed = false
-  if (spanMs && candles.length > 0) {
-    const lastCandleOpenMs = new Date(candles[candles.length - 1].time).getTime()
-    if (isFinite(lastCandleOpenMs)) {
-      // Correct for the broker/server-time offset the EA stamps on candle open
-      // times (audit fix 2026-09-03) — otherwise candleClosed is permanently
-      // false when the broker clock leads UTC and no signal can ever generate.
-      const brokerOffset = brokerOffsetMs(candles, spanMs, Date.now(), `${pair}:${timeframe}`)
-      candleClosed = Date.now() >= lastCandleOpenMs - brokerOffset + spanMs
-    }
-  }
+  // ── Market-data health + broker-clock watchdog (audit 2026-09-03) ──────────
+  // Combines the self-calibrated broker→UTC offset with last-candle freshness.
+  // When not HEALTHY the response carries dataSuspended=true so the signal
+  // pipeline refuses to generate (protects against silent clock failures like
+  // the original broker-timezone bug).
+  const marketHealth = evaluateMarketHealth(candles, spanMs, Date.now(), {
+    pair, timeframe,
+    feedLatencyMs: Date.now() - startedAt,
+  })
+  const candleClosed = marketHealth.candleClosed
 
   return NextResponse.json({
     price:          ind.currentPrice,
@@ -218,6 +164,11 @@ export async function GET(req: NextRequest) {
     // Phase 1.1: authoritative "is the last candle COMPLETE?" flag.
     // Prediction pipelines MUST gate on this flag before emitting a signal.
     candleClosed,
+    // Audit 2026-09-03: explicit market-data health verdict. dataSuspended=true
+    // tells downstream signal generation to REFUSE (protects against silent
+    // broker-clock / stale-feed failures).
+    marketHealth,
+    dataSuspended: marketHealth.dataSuspended,
     timestamp:      Date.now(),
   })
 }

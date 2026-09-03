@@ -359,6 +359,41 @@ async function queryMlService(body: any, pair: string, direction: Direction, con
   }
 }
 
+function logGateRejection(
+  body: any,
+  gate: { filterName: string; reason: string; value?: number | null; threshold?: number | null },
+  pair: string,
+  userId?: string,
+): void {
+  try {
+    const admin = getAdminClient()
+    void (async () => {
+      try {
+        await admin.from('filter_rejections').insert({
+          user_id: userId ?? null,
+          pair,
+          direction: 'HOLD',
+          filter_name: gate.filterName,
+          filter_stage: 'pre',
+          rejection_value: gate.value ?? null,
+          threshold: gate.threshold ?? null,
+          reason: gate.reason,
+          signal_id: null,
+          indicator_snapshot: {
+            simulated: body?.simulated ?? null,
+            candleCount: body?.candleCount ?? null,
+            candleClosed: body?.candleClosed ?? null,
+            lastCandleTime: body?.lastCandleTime ?? null,
+            marketHealth: body?.marketHealth ?? null,
+          },
+        })
+      } catch (e: any) {
+        console.warn('[gate-rejection]', e?.message)
+      }
+    })()
+  } catch { /* never throw */ }
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
@@ -366,6 +401,7 @@ export async function POST(req: NextRequest) {
 
     // Hard block: never generate a tradable signal from simulated market data
     if (body.simulated === true) {
+      logGateRejection(body, { filterName: 'simulated_feed', reason: 'Live data required — simulated feed detected' }, pair, userId)
       return NextResponse.json({
         direction: 'HOLD' as Direction,
         confidence: 0,
@@ -378,6 +414,26 @@ export async function POST(req: NextRequest) {
       })
     }
 
+    // ── Market-data health watchdog gate (audit 2026-09-03) ───────────────────
+    // If the tick route detected a broker-clock error or a stalled candle feed
+    // (dataSuspended=true) we REFUSE to generate — another silent clock bug
+    // must not produce invalid trades.
+    if (body.dataSuspended === true) {
+      const mh = body.marketHealth || {}
+      const reason = mh.reason || 'Market-data health watchdog: signal generation suspended'
+      logGateRejection(body, { filterName: 'market-data-time-error', reason, value: typeof mh.status === 'string' ? mh.status : null }, pair, userId)
+      return NextResponse.json({
+        direction:  'HOLD' as Direction,
+        confidence: 0,
+        reasons:    [reason],
+        risk_note:  'Signal blocked: market-data health check failed (broker clock / stale feed). No invalid trades will be generated while unhealthy.',
+        entry: body.price || 0, sl: body.price || 0, tp: body.price || 0,
+        fallback: false,
+        marketDataSuspended: true,
+        ml: null,
+      })
+    }
+
     // Candle-closed gate (audit Phase 1.1): predictions computed on an
     // unfinished candle are unreliable — indicator values change every tick
     // and produce flash signals that flip direction mid-candle. The tick route
@@ -386,6 +442,7 @@ export async function POST(req: NextRequest) {
     // emitted once the candle closes. Absent field (older callers / tests)
     // is not blocked.
     if (body.candleClosed === false) {
+      logGateRejection(body, { filterName: 'candle_open', reason: 'Candle not yet closed — waiting for current candle to complete', value: body.lastCandleTime ? 0 : null }, pair, userId)
       return NextResponse.json({
         direction:  'HOLD' as Direction,
         confidence: 0,
@@ -404,6 +461,7 @@ export async function POST(req: NextRequest) {
     // present whenever the tick route produced the data. Absent field (older
     // callers / tests) is not blocked.
     if (typeof body.candleCount === 'number' && body.candleCount < 100) {
+      logGateRejection(body, { filterName: 'insufficient_bars', reason: `Only ${body.candleCount} bars — indicators not warmed`, value: body.candleCount, threshold: 100 }, pair, userId)
       return NextResponse.json({
         direction:  'HOLD' as Direction,
         confidence: 0,
@@ -435,6 +493,7 @@ export async function POST(req: NextRequest) {
     // signals downstream while letting strong ranging setups through. Only true
     // chop (ADX<15, random moves) is blocked outright here.
     if (t.adx < 15) {
+      logGateRejection(body, { filterName: 'adx_chop', reason: `ADX ${t.adx.toFixed(1)} below 15 — true chop`, value: t.adx, threshold: 15 }, pair, userId)
       return NextResponse.json({
         direction:            'HOLD' as Direction,
         confidence:           0,
@@ -463,6 +522,7 @@ export async function POST(req: NextRequest) {
     if (t.spreadSource === 'live' && t.atrPips > 0 && t.spreadPips > t.atrPips * 0.4) {
       const reason = `Live spread ${t.spreadPips.toFixed(1)} pips exceeds 40% of ATR (${t.atrPips.toFixed(1)} pips) — wide-spread gate`
       console.log(`[scalper/signal] ${reason} (${pair})`)
+      logGateRejection(body, { filterName: 'spread_gate', reason, value: t.spreadPips, threshold: +(t.atrPips * 0.4).toFixed(1) }, pair, userId)
       return NextResponse.json({
         direction:            'HOLD' as Direction,
         confidence:           0,
