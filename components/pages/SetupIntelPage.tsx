@@ -39,7 +39,28 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
   const [btLoading, setBtLoading] = useState(false)
   const [btError, setBtError] = useState<string | null>(null)
   const btStarted = useRef(false)
+  const [testAlerting, setTestAlerting] = useState(false)
+  const [testMsg, setTestMsg] = useState<string | null>(null)
   const timer = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const fireTestAlert = async () => {
+    if (testAlerting) return
+    setTestAlerting(true)
+    setTestMsg(null)
+    try {
+      const r = await fetch('/api/setup-alerts/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId }),
+      }).then(x => x.json())
+      setTestMsg(r?.message ?? r?.error ?? 'test fired')
+      load()
+    } catch (e: any) {
+      setTestMsg(e?.message || 'test failed')
+    } finally {
+      setTestAlerting(false)
+    }
+  }
 
   const loadBacktest = async (fresh = false) => {
     if (btLoading) return
@@ -117,7 +138,15 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
         <span style={{ fontSize: 11, color: '#94a3b8' }}>
           Expectancy / Authority / Safety advisory layer — no execution impact
         </span>
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button className="btn btn-ghost" disabled={testAlerting}
+            onClick={fireTestAlert}
+            style={{ fontSize: 10, padding: '4px 10px' }}>
+            {testAlerting ? 'FIRING…' : '🔔 TEST ALERT (no trade)'}
+          </button>
+        </div>
       </div>
+      {testMsg && <div style={{ fontSize: 11, color: '#4ade80' }}>{testMsg}</div>}
       {error && <div style={{ color: '#ef4444', fontSize: 12 }}>{error}</div>}
       {loading && <div style={{ color: '#64748b', fontSize: 12 }}>Loading…</div>}
 
