@@ -4,10 +4,16 @@ export const dynamic = 'force-dynamic'  // live price data — must never be cac
 import { NextRequest, NextResponse } from 'next/server'
 import { getMarketCandles, getMarketPrices } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'
-import { evaluateMarketHealth } from '@/lib/market-health'
+import { evaluateMarketHealth, selectLatestClosedCandle } from '@/lib/market-health'
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const ti = require('technicalindicators')
+
+const TF_SPAN_MS: Record<string, number> = {
+  '1m': 60_000, '3m': 3 * 60_000, '5m': 5 * 60_000, '15m': 15 * 60_000,
+  '30m': 30 * 60_000, '1H': 60 * 60_000, '1h': 60 * 60_000, '4H': 4 * 60 * 60_000,
+  '4h': 4 * 60 * 60_000, '1D': 24 * 60 * 60_000, 'Daily': 24 * 60 * 60_000,
+}
 
 function pipSize(pair: string): number {
   if (pair.includes('JPY'))    return 0.01
@@ -44,14 +50,27 @@ export async function GET(req: NextRequest) {
   ])
   const startedAt = Date.now()
 
-  // Standard indicators (EMA20/50, RSI14, MACD, Bollinger, ADX)
-  const ind = calculateIndicators(candles)
+  // ── Closed-candle data set (audit fix 2026-09-04) ──────────────────────────
+  // The EA's newest bar is usually still forming. Signals must NEVER use the
+  // forming bar (no lookahead). We select the latest fully closed candle using
+  // the calibrated broker→UTC offset, then restrict the indicator/feature data
+  // to closed candles only. A forming bar is normal and is not a failure —
+  // it simply means we evaluate the previous closed candle.
+  const spanMs = TF_SPAN_MS[timeframe] || 5 * 60_000
+  const sel = selectLatestClosedCandle(candles, spanMs, Date.now(), `${pair}:${timeframe}`)
+  let data: any[] = candles
+  if (!sel.none && sel.closedCount > 1 && sel.closedCount <= candles.length) {
+    data = candles.slice(0, sel.closedCount)
+  }
 
-  const closes = candles.map((c: any) => c.close)
-  const highs  = candles.map((c: any) => c.high)
-  const lows   = candles.map((c: any) => c.low)
+  // Standard indicators (EMA20/50, RSI14, MACD, Bollinger, ADX) — closed candles only
+  const ind = calculateIndicators(data)
 
-  // Scalper-specific extras
+  const closes = data.map((c: any) => c.close)
+  const highs  = data.map((c: any) => c.high)
+  const lows   = data.map((c: any) => c.low)
+
+  // Scalper-specific extras (closed candles only)
   const rsi7Arr:     number[] = ti.RSI.calculate({ period: 7,  values: closes })
   const ema9Arr:     number[] = ti.EMA.calculate({ period: 9,  values: closes })
   const ema21Arr:    number[] = ti.EMA.calculate({ period: 21, values: closes })
@@ -60,19 +79,19 @@ export async function GET(req: NextRequest) {
     values: closes, rsiPeriod: 14, stochasticPeriod: 14, kPeriod: 3, dPeriod: 3,
   })
 
-  const rsi7      = +rsi7Arr[rsi7Arr.length     - 1].toFixed(2)
-  const ema9      = +ema9Arr[ema9Arr.length     - 1].toFixed(6)
-  const ema21     = +ema21Arr[ema21Arr.length   - 1].toFixed(6)
-  const atr       = +atrArr[atrArr.length       - 1].toFixed(6)
-  const stochLast = stochRsiArr[stochRsiArr.length - 1] ?? { k: 50, d: 50 }
+  const rsi7      = rsi7Arr.length ? +rsi7Arr[rsi7Arr.length - 1].toFixed(2) : 50
+  const ema9      = ema9Arr.length ? +ema9Arr[ema9Arr.length - 1].toFixed(6) : 0
+  const ema21     = ema21Arr.length ? +ema21Arr[ema21Arr.length - 1].toFixed(6) : 0
+  const atr       = atrArr.length ? +atrArr[atrArr.length - 1].toFixed(6) : 0.0001
+  const stochLast = stochRsiArr.length ? stochRsiArr[stochRsiArr.length - 1] : { k: 50, d: 50 }
   const stochRsiK = +stochLast.k.toFixed(2)
   const stochRsiD = +stochLast.d.toFixed(2)
 
-  // Buy pressure: ratio of bullish candles in last 20
-  const last20       = candles.slice(-20)
+  // Buy pressure: ratio of bullish candles in last 20 closed candles
+  const last20       = data.slice(-20)
   const bullishCount = last20.filter((c: any) => c.close >= c.open).length
   const buyPressure  = +(bullishCount / 20).toFixed(3)
-  const tickVolume   = candles[candles.length - 1]?.volume || 0
+  const tickVolume   = data.length ? data[data.length - 1]?.volume || 0 : 0
 
   // Volume SMA20 — used by worker pre-filter to reject below-average-volume breakouts
   const volumes  = last20.map((c: any) => c.volume || 0)
@@ -102,18 +121,6 @@ export async function GET(req: NextRequest) {
   const spreadPips = +(spread / pip).toFixed(1)
   const atrPips    = +(atr    / pip).toFixed(1)
 
-  // ── Candle-closed detection (audit Phase 1.1) ─────────────────────────────
-  // The last candle in the array may still be in progress. Signal generation
-  // must NOT run against an unfinished candle — the indicator values change
-  // every tick and produce flash predictions. Compute whether the candle has
-  // closed by comparing the final candle's open time + timeframe span against
-  // the server clock.
-  const TF_SPAN_MS: Record<string, number> = {
-    '1m': 60_000, '3m': 3 * 60_000, '5m': 5 * 60_000, '15m': 15 * 60_000,
-    '30m': 30 * 60_000, '1H': 60 * 60_000, '1h': 60 * 60_000, '4H': 4 * 60 * 60_000,
-    '4h': 4 * 60 * 60_000, '1D': 24 * 60 * 60_000, 'Daily': 24 * 60 * 60_000,
-  }
-  const spanMs = TF_SPAN_MS[timeframe]
   // ── Market-data health + broker-clock watchdog (audit 2026-09-03) ──────────
   // Combines the self-calibrated broker→UTC offset with last-candle freshness.
   // When not HEALTHY the response carries dataSuspended=true so the signal
@@ -123,7 +130,13 @@ export async function GET(req: NextRequest) {
     pair, timeframe,
     feedLatencyMs: Date.now() - startedAt,
   })
-  const candleClosed = marketHealth.candleClosed
+  // Phase 1.1 semantics kept for compatibility: candleClosed means "a fully
+  // closed candle is available to evaluate". The forming bar is normal.
+  const candleClosed = !sel.none
+  const closedCloseMs = sel.closedCloseTime ? new Date(sel.closedCloseTime).getTime() : null
+  const closedCandleAgeSec = closedCloseMs !== null
+    ? Math.max(0, Math.round((Date.now() - (closedCloseMs - marketHealth.brokerOffsetSec * 1000)) / 1000))
+    : null
 
   return NextResponse.json({
     price:          ind.currentPrice,
@@ -156,14 +169,17 @@ export async function GET(req: NextRequest) {
     stochRsiD,
     broker:         brokerName,
     simulated,
-    // Provenance for downstream integrity checks: how many bars the
-    // indicators were computed on and the close time of the final bar.
-    // `timestamp` is server time, NOT candle time — keep both.
-    candleCount:    candles.length,
-    lastCandleTime: candles[candles.length - 1]?.time ?? null,
-    // Phase 1.1: authoritative "is the last candle COMPLETE?" flag.
-    // Prediction pipelines MUST gate on this flag before emitting a signal.
-    candleClosed,
+    // Provenance: how many CLOSED bars the indicators were computed on (the
+    // forming bar is excluded), plus candle-state fields for the signal engine.
+    candleCount:    data.length,
+    lastCandleTime: sel.newestTime ?? null,           // newest bar (may be forming)
+    currentCandleTime: sel.newestTime ?? null,
+    candleClosed,                                     // a closed candle is available
+    formingCandle:  sel.formingPresent,
+    closedCandleCount: sel.closedCount,
+    closedCandleTime:  sel.closedOpenTime,            // open of latest closed candle (broker frame)
+    candleCloseTime:   sel.closedCloseTime,           // close of latest closed candle (broker frame)
+    closedCandleAgeSec,                               // seconds since the closed candle's close
     // Audit 2026-09-03: explicit market-data health verdict. dataSuspended=true
     // tells downstream signal generation to REFUSE (protects against silent
     // broker-clock / stale-feed failures).

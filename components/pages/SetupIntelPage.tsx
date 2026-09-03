@@ -191,8 +191,13 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
           {mh ? (
             <div style={{ fontSize: 11, color: '#94a3b8', display: 'flex', flexDirection: 'column', gap: 3, fontFamily: 'JetBrains Mono, monospace' }}>
               <span>Broker offset: {mh.brokerOffsetSec >= 0 ? '+' : ''}{(mh.brokerOffsetSec / 3600).toFixed(1)}h</span>
-              <span>Candle state: {mh.candleClosed ? 'CLOSED' : 'FORMING'} · last candle {Math.max(0, mh.lastCandleAgeSec)}s ago</span>
-              <span>Last candle: {mh.lastCandleTime}</span>
+              <span>Signal candle: {market?.formingCandle === true ? 'FORMING (normal — closed candle is evaluated)'
+                : (market?.candleClosed === true ? 'CLOSED_AVAILABLE' : 'NO_VALID_CLOSED_CANDLE')}
+                {market?.closedCandleTime ? ` · closed ${market.closedCandleTime.slice(11, 16)}` : ''}</span>
+              {typeof market?.closedCandleAgeSec === 'number' && (
+                <span>Closed candle age: {Math.max(0, Math.round(market.closedCandleAgeSec))}s</span>
+              )}
+              <span>Health last candle: {mh.lastCandleTime} · closed {mh.candleClosed ? 'yes' : 'no'} ({Math.max(0, mh.lastCandleAgeSec)}s ago)</span>
               {typeof mh.feedLatencyMs === 'number' && <span>Feed latency: {mh.feedLatencyMs}ms</span>}
               <span style={{ color: mhGood ? '#4ade80' : '#f87171' }}>{mh.reason}</span>
               {market?.dataSuspended === true && (

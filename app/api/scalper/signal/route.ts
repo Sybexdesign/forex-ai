@@ -6,6 +6,7 @@ import { getAdminClient } from '@/lib/supabase'
 import { llmComplete, hasLlmKey, providerLabel } from '@/lib/llm'
 import { getMarketCandles } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'
+import { selectLatestClosedCandle } from '@/lib/market-health'
 import { getCalibratedMinStrengths } from '@/lib/threshold-calibration'
 import { sessionOf } from '@/lib/expectancy-engine'
 import { evaluateSetup } from '@/lib/setup-evaluator'
@@ -138,6 +139,11 @@ export function classifyRegime(adx: number): {
 // the unified agreement score (item 8). A short TTL cache keeps repeated calls
 // cheap — the worker already refreshes its own HTF cache every 30s.
 const HTF_CACHE_MS = 20_000
+const HTF_SPAN_MS: Record<string, number> = {
+  '1m': 60_000, '3m': 3 * 60_000, '5m': 5 * 60_000, '15m': 15 * 60_000,
+  '30m': 30 * 60_000, '1H': 60 * 60_000, '1h': 60 * 60_000, '4H': 4 * 60 * 60_000,
+  '4h': 4 * 60 * 60_000, '1D': 24 * 60 * 60_000, 'Daily': 24 * 60 * 60_000,
+}
 const htfCache = new Map<string, { at: number; bias: 'BUY' | 'SELL' | null; simulated: boolean }>()
 
 async function fetchHtfBias(pair: string, timeframe: string): Promise<'BUY' | 'SELL' | null> {
@@ -146,7 +152,15 @@ async function fetchHtfBias(pair: string, timeframe: string): Promise<'BUY' | 'S
   if (hit && Date.now() - hit.at < HTF_CACHE_MS) return hit.simulated ? null : hit.bias
   try {
     const { candles, simulated } = await getMarketCandles(undefined, pair, timeframe, 200)
-    const ind = calculateIndicators(candles)
+    // Closed-candle audit 2026-09-04: never let a forming 15M/1H bar leak into
+    // the HTF confirmation — restrict indicators to fully closed candles.
+    const span = HTF_SPAN_MS[timeframe] || 15 * 60_000
+    const sel = selectLatestClosedCandle(candles, span, Date.now(), `htf:${key}`)
+    let data = candles
+    if (!sel.none && sel.closedCount > 1 && sel.closedCount <= candles.length) {
+      data = candles.slice(0, sel.closedCount)
+    }
+    const ind = calculateIndicators(data)
     const ema20AboveEma50 = ind.ema20 > ind.ema50
     let bias: 'BUY' | 'SELL' | null = null
     if (ema20AboveEma50 && ind.macdHistogram > 0 && ind.rsi > 50)  bias = 'BUY'
@@ -359,6 +373,35 @@ async function queryMlService(body: any, pair: string, direction: Direction, con
   }
 }
 
+// ── Per-candle evaluation cache (audit fix 2026-09-04) ─────────────────────
+// Candle identity = pair + broker-frame CLOSE time of the latest fully closed
+// candle. Repeats of the SAME closed candle return the cached result quickly
+// with candleDuplicate=true so worker/browser/API callers never double-run the
+// engine. DB uniqueness below is the durable backstop across restarts; this
+// cache just stops redundant LLM/AI spend while a candle remains current.
+const EVAL_CACHE_TTL_MS = 10 * 60_000
+const evalCache = new Map<string, { at: number; body: any }>()
+const _gateLog = new Map<string, number>()
+
+/** Broker-frame close time (ms) of the candle under evaluation. */
+function closeTimeMs(body: any): number | null {
+  if (body && typeof body.candleCloseTime === 'string') {
+    const t = new Date(body.candleCloseTime).getTime()
+    if (Number.isFinite(t)) return t
+  }
+  if (body && typeof body.lastCandleTime === 'string') {
+    const t = new Date(body.lastCandleTime).getTime()
+    if (Number.isFinite(t)) return t + 5 * 60_000
+  }
+  return null
+}
+
+function candleKeyOf(body: any): string | null {
+  const pair = typeof body?.pair === 'string' && body.pair ? body.pair : null
+  const ct = closeTimeMs(body)
+  return pair && ct !== null ? `${pair}:${ct}` : null
+}
+
 function logGateRejection(
   body: any,
   gate: { filterName: string; reason: string; value?: number | null; threshold?: number | null },
@@ -366,6 +409,17 @@ function logGateRejection(
   userId?: string,
 ): void {
   try {
+    // Suppress repeated rejections for the SAME candle (6-min window): with
+    // closed-candle evaluation a gate now fires once per candle, not once per
+    // worker sweep. Keeps rejection counters measuring evaluations, not polls.
+    const logKey = body
+      ? `${String(body?.pair ?? '?')}|${gate.filterName}|${closeTimeMs(body) ?? String(body?.lastCandleTime ?? 'no-candle')}`
+      : null
+    if (logKey) {
+      const last = _gateLog.get(logKey)
+      if (last && Date.now() - last < 6 * 60_000) return
+      _gateLog.set(logKey, Date.now())
+    }
     const admin = getAdminClient()
     void (async () => {
       try {
@@ -434,20 +488,43 @@ export async function POST(req: NextRequest) {
       })
     }
 
-    // Candle-closed gate (audit Phase 1.1): predictions computed on an
-    // unfinished candle are unreliable — indicator values change every tick
-    // and produce flash signals that flip direction mid-candle. The tick route
-    // now returns `candleClosed` when the final candle has fully formed.
-    // When the flag is present and false, HOLD — the confirmed signal is only
-    // emitted once the candle closes. Absent field (older callers / tests)
-    // is not blocked.
+    // ── Per-candle dedupe (audit fix 2026-09-04) ──────────────────────────────
+    // Evaluate each fully closed candle at most once: first caller runs the
+    // full pipeline; repeat requests for the SAME candle return the cached
+    // result marked candleDuplicate=true. Durable uniqueness on the DB tables
+    // (migration 20260904) is the backstop across process/API restarts.
+    const candleKey = candleKeyOf(body)
+    if (candleKey && body.candleClosed !== false) {
+      const hit = evalCache.get(candleKey)
+      if (hit && Date.now() - hit.at < EVAL_CACHE_TTL_MS) {
+        return NextResponse.json({
+          ...hit.body,
+          candleDuplicate: true,
+          cachedEvaluation: true,
+          _cachedAt: new Date(hit.at).toISOString(),
+          evaluatedAt: new Date().toISOString(),
+          evaluatedCandleTime: typeof body?.candleCloseTime === 'string'
+            ? body.candleCloseTime
+            : (candleKey ? new Date(Number(candleKey.slice(candleKey.indexOf(':') + 1))).toISOString() : null),
+          formingCandle: body?.formingCandle === true,
+        })
+      }
+    }
+
+    // Candle-closed gate (audit Phase 1.1 + 2026-09-04): the tick route now
+    // evaluates indicators over the latest FULLY CLOSED candle and returns
+    // candleClosed=true whenever such a candle exists (a forming current bar is
+    // normal — it never blocks evaluation of the previous closed candle). This
+    // gate therefore fires ONLY when the feed genuinely has no usable closed
+    // candle (empty/barely-warmed feed) — the former 1-2s timing bottleneck is
+    // gone. Absent field (older callers / tests) is not blocked.
     if (body.candleClosed === false) {
-      logGateRejection(body, { filterName: 'candle_open', reason: 'Candle not yet closed — waiting for current candle to complete', value: body.lastCandleTime ? 0 : null }, pair, userId)
+      logGateRejection(body, { filterName: 'candle_open', reason: 'No valid closed candle available in feed — waiting for the first completed candle', value: body.lastCandleTime ? 0 : null }, pair, userId)
       return NextResponse.json({
         direction:  'HOLD' as Direction,
         confidence: 0,
-        reasons:    ['Candle not yet closed — waiting for the current candle to complete before generating a signal'],
-        risk_note:  'Signal blocked: prediction requires a closed candle to avoid flash direction changes.',
+        reasons:    ['No valid closed candle available — feed has no completed candle to evaluate yet'],
+        risk_note:  'Signal blocked: a fully closed candle is required. A forming current candle is normal; the previous closed candle is used once available.',
         entry: body.price || 0, sl: body.price || 0, tp: body.price || 0,
         fallback: false,
         candleOpen: true,
@@ -841,7 +918,7 @@ Return JSON only:
           entry:               result.entry ?? null,
           sl:                  result.sl ?? null,
           tp:                  result.tp ?? null,
-          candle_close_time:   body.lastCandleTime ? new Date(body.lastCandleTime).getTime() + 5 * 60_000 : null,
+          candle_close_time:   closeTimeMs(body),
           regime:              regimeMeta?.regime ?? null,
           agreement_score:     agreementScore ?? null,
           ml_model:            audit.mlModel ?? null,
@@ -860,7 +937,7 @@ Return JSON only:
             _audit:    audit,
           },
         }
-        await admin.from('signals').insert({
+        await admin.from('signals').upsert({
           user_id:            userId,
           pair,
           timeframe:          'scalper',
@@ -873,7 +950,7 @@ Return JSON only:
           risk_note:          result.risk_note,
           acted_on:           false,
           outcome:            'PENDING',
-          candle_close_time:  body.lastCandleTime ? new Date(body.lastCandleTime).getTime() + 5 * 60_000 : null,
+          candle_close_time:  closeTimeMs(body),
           indicator_snapshot: {
             ...body,
             _computed: { entry: result.entry, sl: result.sl, tp: result.tp },
@@ -887,12 +964,12 @@ Return JSON only:
             } : null,
             _audit:    audit,
           },
-        })
+        }, { onConflict: 'user_id,pair,candle_close_time', ignoreDuplicates: true })
         // Phase 4 (item 13): prediction_logs — the same prediction, captured in
         // the auditable log the worker resolves into MFE/MAE + price samples.
         // Fire-and-forget: a logging failure must never affect the signal path.
         try {
-          await admin.from('prediction_logs').insert(predictionRow)
+          await admin.from('prediction_logs').upsert(predictionRow, { onConflict: 'user_id,pair,candle_close_time', ignoreDuplicates: true })
         } catch (e: any) {
           console.warn('[scalper/signal] prediction_logs insert skipped:', e?.message)
         }
@@ -948,7 +1025,7 @@ Return JSON only:
       }
     }
 
-    return NextResponse.json({
+    const payload = {
       ...result,
       fallback,
       ml: mlData,
@@ -968,6 +1045,24 @@ Return JSON only:
       expectancy: intel?.expectancy ?? null,
       safety:     intel?.safety ?? null,
       authority:  intel?.authority ?? null,
+    }
+
+    // Cache the evaluation against its closed-candle identity so repeat polls
+    // for the same candle are served (deduplicated) instead of re-run.
+    if (candleKey) evalCache.set(candleKey, { at: Date.now(), body: payload })
+
+    // Separate evaluation time from candle time (auditability): evaluatedAt =
+    // when this API request ran; evaluatedCandleTime = the candle that was
+    // evaluated (may be minutes older — that is valid and expected).
+    return NextResponse.json({
+      ...payload,
+      candleDuplicate:   false,
+      cachedEvaluation:  false,
+      evaluatedAt:       new Date().toISOString(),
+      evaluatedCandleTime: typeof body?.candleCloseTime === 'string'
+        ? body.candleCloseTime
+        : (candleKey ? new Date(Number(candleKey.slice(candleKey.indexOf(':') + 1))).toISOString() : null),
+      formingCandle:     body?.formingCandle === true,
     })
 
     return NextResponse.json({

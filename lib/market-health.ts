@@ -82,6 +82,77 @@ export function inferBrokerOffsetMs(candles: any[], spanMs: number, now: number,
   return best
 }
 
+// ── Latest-closed-candle selection (audit fix 2026-09-04) ─────────────────────
+// The MT5 EA sends the in-progress bar as the newest entry. Signals must be
+// built exclusively from the latest FULLY CLOSED candle — never the forming
+// bar. This helper identifies that candle from the broker-frame timestamps and
+// the calibrated broker→UTC offset (the same single source of truth used for
+// candleClosed / market-health).
+//
+// Timestamps are returned in the broker frame (same convention as the rest of
+// the app: lastCandleTime / candle_close_time) so dedup keys and persistence
+// stay consistent with existing rows. Only the CLOSURE TEST uses the UTC
+// correction.
+
+export interface ClosedCandleSelection {
+  none: boolean               // no closed candle in the feed (e.g. empty / all bars still forming)
+  formingPresent: boolean     // the newest bar is still in progress (normal, not an error)
+  closedCount: number         // number of fully closed candles available
+  newestTime: string | null   // broker-frame time of the newest bar (forming or closed)
+  closedOpenTime: string | null    // broker-frame OPEN time of the latest closed candle
+  closedCloseTime: string | null   // broker-frame CLOSE time of the latest closed candle
+  newestIsForming: boolean
+}
+
+export function selectLatestClosedCandle(
+  candles: any[],
+  spanMs: number,
+  now: number,
+  cacheKey: string,
+): ClosedCandleSelection {
+  if (!Array.isArray(candles) || candles.length === 0 || !(spanMs > 0)) {
+    return { none: true, formingPresent: false, closedCount: 0, newestTime: null,
+      closedOpenTime: null, closedCloseTime: null, newestIsForming: false }
+  }
+  // Work on (originalIndex → time), sorted ascending by time (robust to either
+  // feed orientation). The newest bar is the last in ascending order.
+  const entries: { idx: number; time: number }[] = []
+  for (let i = 0; i < candles.length; i++) {
+    const t = new Date(candles[i]?.time).getTime()
+    if (Number.isFinite(t)) entries.push({ idx: i, time: t })
+  }
+  if (entries.length === 0) {
+    return { none: true, formingPresent: false, closedCount: 0, newestTime: null,
+      closedOpenTime: null, closedCloseTime: null, newestIsForming: false }
+  }
+  entries.sort((a, b) => a.time - b.time)
+
+  const offset = inferBrokerOffsetMs(candles, spanMs, now, cacheKey)
+  const isClosed = (t: number) => t - offset + spanMs <= now
+  const newest = entries[entries.length - 1]
+  const newestIsForming = !isClosed(newest.time)
+
+  let closedIdx = -1
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (isClosed(entries[i].time)) { closedIdx = i; break }
+  }
+  const none = closedIdx === -1
+  const closedCount = none ? 0 : closedIdx + 1
+  const closed = none ? null : entries[closedIdx]
+
+  const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString())
+  return {
+    none,
+    formingPresent: entries.length > 0 && newestIsForming,
+    closedCount,
+    newestTime: iso(newest.time),
+    closedOpenTime: closed ? iso(closed.time) : null,
+    closedCloseTime: closed ? iso(closed.time + spanMs) : null,
+    newestIsForming,
+  }
+}
+
+
 
 /** Produce an explicit health verdict from a candle array + wall clock. */
 export function evaluateMarketHealth(

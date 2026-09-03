@@ -1,5 +1,6 @@
 node_modules/
 .next/
+.testbuild/
 .env.local
 .env.test
 .env*.local

@@ -299,7 +299,7 @@ async function checkForCacheReset() {
 }
 
 const stats = {
-  sweeps: 0, sigChecks: 0, alerts: 0, trades: 0, errors: 0,
+  sweeps: 0, sigChecks: 0, alerts: 0, trades: 0, errors: 0, sigDeduped: 0,
   startTime: Date.now(),
 }
 
@@ -390,6 +390,32 @@ async function sbInsertReturning(table, row) {
     return Array.isArray(rows) ? rows[0] : null
   } catch (e) {
     console.error('[sb/insert]', e.message)
+    return null
+  }
+}
+
+// Insert with ON CONFLICT DO NOTHING (returns the inserted row only). Used for
+// signal/prediction persistence so a closed candle is persisted at most once
+// per (user, pair, candle_close_time) even across worker/process restarts.
+async function sbUpsertIgnoreReturning(table, row, onConflictCols = 'user_id,pair,candle_close_time') {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?on_conflict=${encodeURIComponent(onConflictCols)}`, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey':        SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer':        'resolution=ignore-duplicates,return=representation',
+      },
+      body:   JSON.stringify(row),
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) { console.error(`[sb/${table}]`, res.status, await res.text()); return null }
+    const rows = await res.json()
+    return Array.isArray(rows) && rows.length ? rows[0] : null
+  } catch (e) {
+    console.error('[sb/upsert]', e.message)
     return null
   }
 }
@@ -1324,6 +1350,20 @@ async function processSignal(pair, tick, strategy, session, direction) {
   lastSigFetch.set(pair, Date.now())
   stats.sigChecks++
 
+  // Freshness guard (closed-candle audit 2026-09-04): we now evaluate the most
+  // recent fully closed candle instead of only inside the 1-2s window right
+  // after close. In the healthy case that candle is only seconds old. If we
+  // catch up mid-candle after a long pause the newest closed candle can be
+  // minutes old — executing at its close price would be a stale entry. Skip
+  // before any AI spend; a closed candle is only actionable when recent.
+  if (tick && typeof tick.closedCandleAgeSec === 'number' && tick.closedCandleAgeSec > 150) {
+    console.log(`[stale-candle] ${pair} — latest closed candle age ${Math.round(tick.closedCandleAgeSec)}s > 150s — skipping (no stale entries)`)
+    wlog('info', `Skipped stale closed candle (age ${Math.round(tick.closedCandleAgeSec)}s) — safe skip, waiting for a fresh close`, {
+      pair, session, metadata: { closedCandleTime: tick.candleCloseTime ?? null, reason: 'closed_candle_too_old' },
+    })
+    return
+  }
+
   // HTF alignment: check 15m trend before spending an AI call.
   // Scalp skips this — the regime classifier handles ranging conditions where
   // 15m is inherently ambiguous, and the regime-aware effectiveMinStrength gate
@@ -1351,6 +1391,23 @@ async function processSignal(pair, tick, strategy, session, direction) {
 
   const dir  = signal.direction
   const conf = signal.confidence ?? 0
+
+  // Per-candle dedupe (closed-candle audit 2026-09-04): /api/scalper/signal
+  // evaluates each fully closed candle once and marks repeats candleDuplicate.
+  // Worker sweeps run every ~10-60s, so without this guard the same candle
+  // would be re-logged/re-persisted on every sweep. DB uniqueness is the
+  // durable backstop across restarts.
+  if (signal.candleDuplicate === true) {
+    stats.sigDeduped++
+    console.log(`[dedupe] ${pair} — candle ${signal.evaluatedCandleTime ?? signal._cachedAt ?? '?'} already evaluated (cached ${signal.cachedEvaluation ? 'yes' : 'no'}) — skipping`)
+    return
+  }
+
+  // Broker-frame close time of the candle under evaluation (used as the durable
+  // per-candle dedup key in signals / prediction_logs).
+  const candleCloseMs = tick?.candleCloseTime
+    ? new Date(tick.candleCloseTime).getTime()
+    : (tick?.lastCandleTime ? new Date(tick.lastCandleTime).getTime() + 5 * 60_000 : null)
 
   // ── Session direction gate (precious metals) ──────────────────────────────
   // Block signals that go against the statistically dominant session direction.
@@ -1399,7 +1456,7 @@ async function processSignal(pair, tick, strategy, session, direction) {
     const sl      = signal.sl  || (dir === 'BUY' ? entry - slDist : entry + slDist)
     const tp      = signal.tp  || (dir === 'BUY' ? entry + tpDist : entry - tpDist)
 
-    sbInsertReturning('signals', {
+    sbUpsertIgnoreReturning('signals', {
       user_id:            WORKER_USER_ID,
       pair,
       timeframe:          'scalper-worker',
@@ -1410,6 +1467,7 @@ async function processSignal(pair, tick, strategy, session, direction) {
       risk_note:          signal.risk_note,
       acted_on:           false,
       outcome:            'PENDING',
+      candle_close_time:  candleCloseMs,
       indicator_snapshot: {
         ...tick,
         _regime: {
@@ -1454,7 +1512,7 @@ async function processSignal(pair, tick, strategy, session, direction) {
         entry:               entry,
         sl:                  sl,
         tp:                  tp,
-        candle_close_time:   tick.lastCandleTime ? new Date(tick.lastCandleTime).getTime() + 5 * 60_000 : null,
+        candle_close_time:   candleCloseMs,
         regime:              signal.marketRegime ?? null,
         agreement_score:     signal.agreementScore ?? null,
         ml_model:            audit.mlModel ?? null,
@@ -1473,7 +1531,7 @@ async function processSignal(pair, tick, strategy, session, direction) {
           _audit: audit,
         },
       }
-      sbInsertReturning('prediction_logs', predRow)
+      sbUpsertIgnoreReturning('prediction_logs', predRow)
         .then(row => { if (row?.id) trackPredictionLog(row.id, pair, dir, entry, sl, tp) })
         .catch(() => {})
     }
