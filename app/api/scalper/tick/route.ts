@@ -22,6 +22,51 @@ function defaultSpread(pair: string): number {
   return 0.00012
 }
 
+// ── Broker-timezone calibration (audit fix 2026-09-03) ───────────────────────
+// The MT5 EA pushes MqlRates.time values in BROKER/server time (typically
+// UTC+2/+3 for MT5 EET), not UTC. Candle times were compared directly against
+// the UTC server clock, which skewed them ~3h into the future and made the
+// candle-closed gate `Date.now() >= open + span` permanently false — so every
+// signal was blocked as "candle not yet closed" and nothing was ever generated.
+//
+// MT5 always returns the in-progress candle as the last bar (CopyRates index
+// 0), so exactly (len-1) of the returned candles must already be closed. We
+// brute-force the fixed offset O (whole-minute candidates, ±14h) that satisfies
+// this against the UTC clock — i.e. where time − O + span ≤ now for exactly
+// len−1 candles. Whole-hour / half-hour offsets are preferred (real timezones),
+// then the smallest magnitude. Cached 10 min per pair+timeframe.
+const _offsetCache = new Map<string, { at: number; off: number }>()
+
+function brokerOffsetMs(candles: any[], spanMs: number, now: number, cacheKey: string): number {
+  if (!Array.isArray(candles) || candles.length < 2 || !(spanMs > 0)) return 0
+  const times: number[] = []
+  for (const c of candles) {
+    const t = new Date(c?.time).getTime()
+    if (Number.isFinite(t)) times.push(t)
+  }
+  if (times.length < 2) return 0
+  const cached = _offsetCache.get(cacheKey)
+  if (cached && now - cached.at < 10 * 60_000) return cached.off
+
+  const maxOff = 14 * 3600_000
+  let best = 0
+  let bestScore = Number.MAX_SAFE_INTEGER
+  for (let o = -maxOff; o <= maxOff; o += 60_000) {
+    let closed = 0
+    for (let i = 0; i < times.length; i++) {
+      // UTC open time = broker time − offset; candle closed when open + span ≤ now
+      if (times[i] - o + spanMs <= now) closed++
+    }
+    if (closed !== times.length - 1) continue
+    const mod = ((o % 3600_000) + 3600_000) % 3600_000
+    const hourTier = mod === 0 ? 0 : (mod === 1800_000 ? 1 : 2)
+    const score = hourTier * 1_000_000_000_000 + Math.abs(o)
+    if (score < bestScore) { bestScore = score; best = o }
+  }
+  _offsetCache.set(cacheKey, { at: now, off: best })
+  return best
+}
+
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url)
   const pair      = searchParams.get('pair')      || 'XAU/USD'
@@ -116,7 +161,11 @@ export async function GET(req: NextRequest) {
   if (spanMs && candles.length > 0) {
     const lastCandleOpenMs = new Date(candles[candles.length - 1].time).getTime()
     if (isFinite(lastCandleOpenMs)) {
-      candleClosed = Date.now() >= lastCandleOpenMs + spanMs
+      // Correct for the broker/server-time offset the EA stamps on candle open
+      // times (audit fix 2026-09-03) — otherwise candleClosed is permanently
+      // false when the broker clock leads UTC and no signal can ever generate.
+      const brokerOffset = brokerOffsetMs(candles, spanMs, Date.now(), `${pair}:${timeframe}`)
+      candleClosed = Date.now() >= lastCandleOpenMs - brokerOffset + spanMs
     }
   }
 
