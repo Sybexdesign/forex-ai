@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "eslint",
     "build:market-health-test": "tsc lib/market-health.ts --outDir .testbuild --module commonjs --target es2020 --esModuleInterop --skipLibCheck",
-    "test:market-health": "npm run build:market-health-test && node tests/closed-candle.test.mjs"
+    "test:market-health": "npm run build:market-health-test && node tests/closed-candle.test.mjs",
+    "test:prediction-contract": "node tests/prediction-contract.test.mjs",
+    "test:phase2": "npm run test:market-health && npm run test:prediction-contract"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.92.0",

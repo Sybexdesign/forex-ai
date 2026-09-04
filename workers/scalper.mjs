@@ -12,6 +12,13 @@
  * - 4-hour heartbeat, daily midnight restart, graceful shutdown
  */
 
+// ── Canonical prediction contract (Phase 2) — single source of truth ─────────
+import {
+  PREDICTION_WINDOW_MS, PREDICTION_MAX_AGE_MS, PREDICTION_TIMEFRAME,
+  PREDICTION_FUTURE_CANDLES, PREDICTION_RESOLUTION_RULE, predictionExpiresAt,
+  resolveSampleOutcome, isWithinPredictionWindow,
+} from '../lib/prediction-contract.mjs'
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const BASE_URL       = process.env.APP_URL || 'https://forex.sybexdesigns.co.uk'
@@ -474,6 +481,29 @@ async function sbUpdate(table, id, data) {
     if (!res.ok) console.error(`[sb/update ${table}]`, res.status, await res.text())
   } catch (e) {
     console.error('[sb/update]', e.message)
+  }
+}
+
+async function sbUpdateWhere(table, where, data) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return 0
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${where}`, {
+      method:  'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey':        SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer':        'return=representation',
+      },
+      body:   JSON.stringify(data),
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) { console.error(`[sb/update-where ${table}]`, res.status, await res.text()); return 0 }
+    const rows = await res.json()
+    return Array.isArray(rows) ? rows.length : 0
+  } catch (e) {
+    console.error('[sb/update-where]', e.message)
+    return 0
   }
 }
 
@@ -948,8 +978,15 @@ async function checkPendingOutcomes(ticksByPair) {
 // Resolution window matches the label pipeline's CANDLE_WINDOW semantics
 // (15m = 3 × 5m candles). Never gates execution — observability only.
 
-const PREDLOG_MAX_AGE_MS = 16 * 60 * 1000     // 16 min — resolve within the 15m window + margin
-const PREDLOG_TIMEOUT_MS  = 15 * 60 * 1000    // 15 min window, then INCONCLUSIVE if no SL/TP hit
+// Resolution window = canonical prediction contract (lib/prediction-contract.mjs):
+// 15 minutes · up to 3 future M5 closes · TP before SL = WIN · SL before TP =
+// LOSS · neither = INCONCLUSIVE.
+const PREDLOG_TIMEOUT_MS = PREDICTION_WINDOW_MS           // 15 min window
+const PREDLOG_MAX_AGE_MS = PREDICTION_MAX_AGE_MS          // window + 60s margin
+// How often the expired-pending scanner runs. Runs on its own timer so
+// unresolved rows still resolve even while the market is closed / the sweep
+// loop is paused. Observability only — never touches execution.
+const EXPIRED_PENDING_SCAN_MS = 60 * 1000
 const predLogs = new Map()                     // id → { pair, direction, entry, sl, tp, at, minP, maxP, sampled }
 
 function trackPredictionLog(id, pair, direction, entry, sl, tp) {
@@ -961,7 +998,16 @@ async function resolvePredictionLogs(ticksByPair) {
   if (predLogs.size === 0) return
   const now = Date.now()
   for (const [id, sig] of predLogs) {
-    if (now - sig.at > PREDLOG_MAX_AGE_MS) { predLogs.delete(id); continue }
+    // Hard ceiling: NEVER silently orphan a tracked prediction. If it exceeds
+    // the window + margin without resolving, deterministically write
+    // INCONCLUSIVE via an idempotent conditional update (outcome IS NULL).
+    if (now - sig.at > PREDLOG_MAX_AGE_MS) {
+      predLogs.delete(id)
+      await sbUpdateWhere('prediction_logs', `id=eq.${id}&outcome=is.null`, {
+        outcome: 'INCONCLUSIVE', resolved_at: new Date().toISOString(),
+      }).catch(e => console.warn('[predlog] max-age resolve failed:', e.message))
+      continue
+    }
     const tick = ticksByPair[sig.pair]
     if (!tick) continue
     const price = tick.price
@@ -978,16 +1024,11 @@ async function resolvePredictionLogs(ticksByPair) {
       }
     }
 
-    // Resolve on SL/TP hit (SL checked first — same priority as label route).
+    // Resolve on SL/TP hit using the canonical contract rule
+    // (lib/prediction-contract.mjs — SL checked first, same priority as the
+    // label pipeline).
     const pip = pipSize(sig.pair)
-    let outcome = null
-    if (sig.direction === 'BUY') {
-      if (price <= sig.sl) outcome = 'LOSS'
-      else if (price >= sig.tp) outcome = 'WIN'
-    } else if (sig.direction === 'SELL') {
-      if (price >= sig.sl) outcome = 'LOSS'
-      else if (price <= sig.tp) outcome = 'WIN'
-    }
+    const outcome = resolveSampleOutcome(price, sig.direction, sig.sl, sig.tp)
 
     const timedOut = now - sig.at >= PREDLOG_TIMEOUT_MS
     if (outcome || timedOut) {
@@ -995,7 +1036,7 @@ async function resolvePredictionLogs(ticksByPair) {
       const mfePips = sig.direction === 'BUY' ? (sig.maxP - sig.entry) : (sig.entry - sig.minP)
       const maePips = sig.direction === 'BUY' ? (sig.entry - sig.minP) : (sig.maxP - sig.entry)
       const finalOutcome = outcome ?? 'INCONCLUSIVE'
-      await sbUpdate('prediction_logs', id, {
+      const update = {
         outcome:   finalOutcome,
         resolved_at: new Date().toISOString(),
         mfe_pips:  +Math.max(0, mfePips / pip).toFixed(2),
@@ -1003,23 +1044,74 @@ async function resolvePredictionLogs(ticksByPair) {
         // price_after_15m backfill: if we never sampled exactly at 15m, use the
         // last observed price so the field is non-null for the pattern engine.
         price_after_15m: sig.sampled['15m'] ?? price,
-      }).catch(() => {})
-      console.log(`[predlog] ${sig.pair} ${sig.direction} → ${finalOutcome} (${id.slice(0, 8)}) mfe=${(mfePips/pip).toFixed(1)}p mae=${(maePips/pip).toFixed(1)}p`)
+      }
+      // Idempotent conditional write: the outcome=is.null filter means the FIRST
+      // resolver wins and any duplicate attempt becomes a no-op.
+      const applied = await sbUpdateWhere('prediction_logs', `id=eq.${id}&outcome=is.null`, update).catch(() => 0)
+      if (applied > 0) {
+        console.log(`[predlog] ${sig.pair} ${sig.direction} → ${finalOutcome} (${id.slice(0, 8)}) mfe=${(mfePips/pip).toFixed(1)}p mae=${(maePips/pip).toFixed(1)}p`)
+      } else {
+        console.log(`[predlog] ${id.slice(0, 8)} already resolved elsewhere — idempotent skip`)
+      }
     }
   }
 }
 
-// Reloads recent PENDING prediction_logs into the in-memory tracker so a worker
-// restart doesn't orphan rows that are still inside their resolution window.
-// Called once at startup (and after admin cache resets). Never gates execution.
+// Expired-pending scanner (Phase 2). Runs on its own timer so predictions still
+// resolve to INCONCLUSIVE when the sweep loop is paused (market closed, long
+// outage) or after a restart. ONLY rows carrying the canonical
+// prediction_expires_at metadata are touched — historical rows without metadata
+// are never rewritten here (they are reported separately).
+async function resolveExpiredPendingPredictions() {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return 0
+  try {
+    const nowIso = new Date().toISOString()
+    const url = `${SUPABASE_URL}/rest/v1/prediction_logs`
+      + `?outcome=is.null`
+      + `&prediction_expires_at=not.is.null`
+      + `&prediction_expires_at=lte.${nowIso}`
+      + `&order=prediction_expires_at.asc`
+      + `&limit=50`
+      + `&select=id,pair,direction,prediction_expires_at`
+    const res = await fetch(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+      signal:  AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return 0
+    const rows = await res.json()
+    if (!Array.isArray(rows) || rows.length === 0) return 0
+    let resolved = 0
+    for (const row of rows) {
+      const applied = await sbUpdateWhere('prediction_logs',
+        `id=eq.${row.id}&outcome=is.null`,
+        { outcome: 'INCONCLUSIVE', resolved_at: new Date().toISOString() })
+      if (applied > 0) {
+        resolved++
+        console.log(`[predlog] expired-pending → INCONCLUSIVE (${row.id.slice(0, 8)}) ${row.pair} ${row.direction} expired ${(row.prediction_expires_at || '').slice(11, 19)}`)
+      }
+    }
+    if (resolved > 0) console.log(`[predlog] expired-pending scanner resolved ${resolved} → INCONCLUSIVE`)
+    return resolved
+  } catch (e) {
+    console.warn('[predlog] expired-pending scanner failed:', e.message)
+    return 0
+  }
+}
+
+// Reloads still-live PENDING prediction_logs into the in-memory tracker after a
+// worker restart. Only rows that carry the canonical prediction_expires_at AND
+// are still inside their window are resumed. Rows that already expired are left
+// for the expired-pending scanner; rows without metadata (pre-Phase-2
+// historical rows) are never touched.
 async function recoverPendingPredictionLogs() {
   if (!SUPABASE_URL || !SUPABASE_KEY) return
   try {
     const url = `${SUPABASE_URL}/rest/v1/prediction_logs`
-      + `?outcome=eq.PENDING`
-      + `&order=created_at.desc`
+      + `?outcome=is.null`
+      + `&prediction_expires_at=not.is.null`
+      + `&order=prediction_expires_at.asc`
       + `&limit=50`
-      + `&select=id,pair,direction,entry,sl,tp,created_at`
+      + `&select=id,pair,direction,entry,sl,tp,created_at,prediction_expires_at`
     const res = await fetch(url, {
       headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
       signal:  AbortSignal.timeout(10_000),
@@ -1027,19 +1119,22 @@ async function recoverPendingPredictionLogs() {
     if (!res.ok) { console.error('[predlog] recovery fetch failed:', res.status); return }
     const rows = await res.json()
     if (!Array.isArray(rows)) return
+    const nowMs = Date.now()
     let recovered = 0
     for (const row of rows) {
       const entry = parseFloat(row.entry)
       const sl    = parseFloat(row.sl)
       const tp    = parseFloat(row.tp)
       if (!(entry > 0) || !(sl > 0) || !(tp > 0)) continue
+      const expiresMs = new Date(row.prediction_expires_at).getTime()
+      if (!Number.isFinite(expiresMs) || !isWithinPredictionWindow(row.prediction_expires_at, nowMs)) continue  // expired → scanner resolves
       predLogs.set(row.id, {
         pair: row.pair, direction: row.direction, entry, sl, tp,
         at: new Date(row.created_at).getTime(), minP: entry, maxP: entry, sampled: {},
       })
       recovered++
     }
-    if (recovered > 0) console.log(`[predlog] recovered ${recovered} pending prediction logs`)
+    if (recovered > 0) console.log(`[predlog] recovered ${recovered} live pending prediction(s)`)
   } catch (e) {
     console.warn('[predlog] recovery failed:', e.message)
   }
@@ -1501,6 +1596,8 @@ async function processSignal(pair, tick, strategy, session, direction) {
         ...(audit.disciplineAction ? [audit.disciplineAction] : []),
         ...(signal.htfAction ? [signal.htfAction] : []),
       ]
+      // Phase 2 — canonical prediction metadata (contract in lib/prediction-contract.mjs).
+      const predStartedIso = new Date().toISOString()
       const predRow = {
         user_id:             WORKER_USER_ID,
         pair,
@@ -1513,6 +1610,12 @@ async function processSignal(pair, tick, strategy, session, direction) {
         sl:                  sl,
         tp:                  tp,
         candle_close_time:   candleCloseMs ? new Date(candleCloseMs).toISOString() : null,
+        prediction_window_ms:   PREDICTION_WINDOW_MS,
+        prediction_timeframe:   PREDICTION_TIMEFRAME,
+        prediction_candles:     PREDICTION_FUTURE_CANDLES,
+        resolution_rule:        PREDICTION_RESOLUTION_RULE,
+        prediction_expires_at:  predictionExpiresAt(predStartedIso),
+        evaluated_candle_time:  tick?.closedCandleTime ? new Date(tick.closedCandleTime).toISOString() : null,
         regime:              signal.marketRegime ?? null,
         agreement_score:     signal.agreementScore ?? null,
         ml_model:            audit.mlModel ?? null,
@@ -2356,6 +2459,12 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   await recoverPendingPredictionLogs().catch(e =>
     console.warn('[predlog] startup recovery failed:', e.message)
   )
+  // Phase 2: expired-pending scanner — independent timer so expired unresolved
+  // predictions deterministically resolve to INCONCLUSIVE even when the sweep
+  // loop is paused (market closed / outage) or after a restart.
+  setInterval(() => resolveExpiredPendingPredictions().catch(e =>
+    console.warn('[predlog] expired scanner failed:', e.message)
+  ), EXPIRED_PENDING_SCAN_MS)
 
   const startMsg = [
     `🚀 <b>SybexForexAI Worker Started</b>`,

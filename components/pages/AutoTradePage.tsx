@@ -113,6 +113,18 @@ interface DirCheckResult {
   simulated?: boolean
 }
 
+// Phase 2 — canonical prediction contract block attached by /api/scalper/signal
+interface PredictionContractClient {
+  timeframe: string
+  windowMinutes: number
+  futureCandleCloses: number
+  startsAt: string
+  expiresAt: string
+  entryPrice: number | null
+  resolutionRule: string
+  fallbackOutcome: string
+}
+
 interface ScalpSignal {
   pair: string
   direction: 'BUY' | 'SELL' | 'HOLD'
@@ -143,6 +155,48 @@ interface ScalpSignal {
   expectancy?: IntelExpectancyView | null
   safety?: IntelSafetyView | null
   authority?: IntelAuthorityView | null
+  // Phase 2 — canonical prediction contract (server-fixed start/expiry for the
+  // evaluated candle). Present on BUY/SELL payloads from the new API.
+  prediction?: PredictionContractClient | null
+  evaluatedCandleTime?: string | null
+}
+
+const fmtClock = (iso?: string | null) => iso
+  ? new Date(iso).toLocaleTimeString([], { hour12: false })
+  : '—'
+
+// Phase 2 — the Signal Card's prediction-contract block. Every value shown here
+// comes from the API response (which derives it from lib/prediction-contract),
+// so the UI can never drift from the backend contract.
+function PredictionPanel({ sig, dp }: { sig: ScalpSignal; dp: number }) {
+  const p = sig.prediction
+  if (!p?.expiresAt) return null
+  const expiresMs = new Date(p.expiresAt).getTime()
+  const remainingMs = Math.max(0, expiresMs - Date.now())
+  const remM = Math.floor(remainingMs / 60_000)
+  const remS = Math.floor((remainingMs % 60_000) / 1000)
+  return (
+    <div style={{
+      background: 'rgba(96,192,255,0.04)', border: '1px dashed rgba(96,192,255,0.3)',
+      borderRadius: 2, padding: '7px 9px', display: 'flex', flexDirection: 'column', gap: 4,
+    }}>
+      <div style={{ fontSize: 9, letterSpacing: 1, fontWeight: 700, color: 'var(--color-accent)' }}>
+        PREDICTION — NEXT {p.futureCandleCloses} × {p.timeframe} CLOSES · {p.windowMinutes}-MIN WINDOW
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--text)', fontFamily: 'JetBrains Mono', display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+        <span>REF (candle close): {sig.entry.toFixed(dp)}</span>
+        <span style={{ color: 'var(--color-profit)' }}>TP {sig.tp.toFixed(dp)}</span>
+        <span style={{ color: 'var(--color-loss)' }}>SL {sig.sl.toFixed(dp)}</span>
+      </div>
+      <div style={{ fontSize: 9, color: 'var(--text-dim)', display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+        <span>Prediction expires {fmtClock(p.expiresAt)}{p.startsAt ? ` · started ${fmtClock(p.startsAt)}` : ''}</span>
+        <span style={{ color: remainingMs < 60_000 ? 'var(--color-sell)' : 'var(--text-muted)' }}>{remM}m {String(remS).padStart(2, '0')}s left</span>
+      </div>
+      <div style={{ fontSize: 9, color: 'var(--text-dim)' }}>
+        Resolution: TP before SL → WIN · SL before TP → LOSS · Neither → {p.fallbackOutcome}
+      </div>
+    </div>
+  )
 }
 
 function Pager({ page, total, onPage }: { page: number; total: number; onPage: (p: number) => void }) {
@@ -459,6 +513,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           expectancy:           sig.expectancy ?? null,
           safety:               sig.safety ?? null,
           authority:            sig.authority ?? null,
+          // Phase 2 — canonical prediction contract (server-fixed, never
+          // extended by client polling) + evaluated candle identity.
+          prediction:           sig.prediction ?? null,
+          evaluatedCandleTime:  sig.evaluatedCandleTime ?? null,
           // fetchError cleared on success
         },
       }))
@@ -1753,7 +1811,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
               <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
                 <div style={{ minWidth: 0 }}>
                   <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, fontWeight: 700, marginBottom: 2 }}>
-                    {name} SCALP · 1–5m
+                    {name} SCALP{sig?.prediction?.timeframe ? ` · ${sig.prediction.timeframe}` : ''}
                   </div>
                   <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
                     <span className="signal-dir-text" style={{ color: dirColor }}>
@@ -1829,10 +1887,18 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                 <div style={{ textAlign: 'right', flexShrink: 0, fontSize: 10 }}>
                   {sig && !sig.blocked && dir !== 'HOLD' ? (
                     <>
-                      <div style={{ color: actualMsLeft < 60000 ? 'var(--color-sell)' : 'var(--text-muted)', fontFamily: 'JetBrains Mono', fontWeight: 700 }}>
-                        {mLeft}m {String(sLeft).padStart(2, '0')}s
-                      </div>
-                      <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>valid until</div>
+                      {sig?.prediction?.expiresAt ? (
+                        <div style={{ color: 'var(--text-dim)', fontFamily: 'JetBrains Mono' }}>
+                          ⏱ Prediction expires {fmtClock(sig.prediction.expiresAt)}
+                        </div>
+                      ) : (
+                        <>
+                          <div style={{ color: actualMsLeft < 60000 ? 'var(--color-sell)' : 'var(--text-muted)', fontFamily: 'JetBrains Mono', fontWeight: 700 }}>
+                            {mLeft}m {String(sLeft).padStart(2, '0')}s
+                          </div>
+                          <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>valid until</div>
+                        </>
+                      )}
                     </>
                   ) : sig?.fetchError ? (
                     <div style={{ color: 'var(--color-sell)', fontStyle: 'italic', maxWidth: 120, wordBreak: 'break-all' }}>
@@ -1843,6 +1909,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                   ) : null}
                 </div>
               </div>
+
+              {/* Phase 2 — canonical prediction contract (server-fixed horizon,
+                  expiry, entry/reference + TP/SL the prediction is graded on). */}
+              {sig && !sig.blocked && dir !== 'HOLD' && <PredictionPanel sig={sig} dp={dp} />}
 
               {/* Phase 6 — Expectancy / Safety / Authority badges (shadow) —
                   attached by /api/scalper/signal; advisory only, never gates. */}
@@ -1865,9 +1935,9 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                 return (
                   <div style={{ display: 'flex', gap: 6 }}>
                     {([
-                      { label: live.isLive ? 'ENTRY · LIVE' : 'ENTRY', val: live.entry, color: 'var(--color-accent)' },
-                      { label: 'SL',                                    val: live.sl,    color: 'var(--color-loss)' },
-                      { label: 'TP',                                    val: live.tp,    color: 'var(--color-profit)' },
+                      { label: live.isLive ? 'EXEC ENTRY · LIVE' : 'EXEC ENTRY', val: live.entry, color: 'var(--color-accent)' },
+                      { label: 'EXEC SL',                                 val: live.sl,    color: 'var(--color-loss)' },
+                      { label: 'EXEC TP',                                 val: live.tp,    color: 'var(--color-profit)' },
                     ] as const).map(({ label, val, color }) => (
                       <div key={label} style={{
                         flex: 1, minWidth: 0,
@@ -2020,7 +2090,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                 <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
                   <div style={{ minWidth: 0 }}>
                     <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: 1.5, fontWeight: 700, marginBottom: 2 }}>
-                      {name} MIRROR · 1–5m
+                      {name} MIRROR{sig?.prediction?.timeframe ? ` · ${sig.prediction.timeframe}` : ''}
                     </div>
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
                       <span style={{ fontSize: 28, fontWeight: 900, fontFamily: 'Rajdhani', letterSpacing: 2, color: dirColor, lineHeight: 1 }}>
@@ -2050,10 +2120,18 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                   <div style={{ textAlign: 'right', flexShrink: 0, fontSize: 10 }}>
                     {sig && !sig.blocked && dir !== 'HOLD' ? (
                       <>
-                        <div style={{ color: actualMsLeft < 60000 ? 'var(--color-sell)' : 'var(--text-muted)', fontFamily: 'JetBrains Mono', fontWeight: 700 }}>
-                          {mLeft}m {String(sLeft).padStart(2, '0')}s
+                      {sig?.prediction?.expiresAt ? (
+                        <div style={{ color: 'var(--text-dim)', fontFamily: 'JetBrains Mono' }}>
+                          ⏱ Prediction expires {fmtClock(sig.prediction.expiresAt)}
                         </div>
-                        <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>valid until</div>
+                      ) : (
+                        <>
+                          <div style={{ color: actualMsLeft < 60000 ? 'var(--color-sell)' : 'var(--text-muted)', fontFamily: 'JetBrains Mono', fontWeight: 700 }}>
+                            {mLeft}m {String(sLeft).padStart(2, '0')}s
+                          </div>
+                          <div style={{ color: 'var(--text-dim)', marginTop: 1 }}>valid until</div>
+                        </>
+                      )}
                       </>
                     ) : sig?.fetchError ? (
                       <div style={{ color: 'var(--color-sell)', fontStyle: 'italic', maxWidth: 120, wordBreak: 'break-all' }}>
@@ -2074,9 +2152,9 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
                   return (
                     <div style={{ display: 'flex', gap: 6 }}>
                       {([
-                        { label: live.isLive ? 'ENTRY · LIVE' : 'ENTRY', val: live.entry, color: 'var(--color-accent)' },
-                        { label: 'SL',                                    val: live.sl,    color: 'var(--color-loss)' },
-                        { label: 'TP',                                    val: live.tp,    color: 'var(--color-profit)' },
+                        { label: live.isLive ? 'EXEC ENTRY · LIVE' : 'EXEC ENTRY', val: live.entry, color: 'var(--color-accent)' },
+                        { label: 'EXEC SL',                                 val: live.sl,    color: 'var(--color-loss)' },
+                        { label: 'EXEC TP',                                 val: live.tp,    color: 'var(--color-profit)' },
                       ] as const).map(({ label, val, color }) => (
                         <div key={label} style={{
                           flex: 1, minWidth: 0,

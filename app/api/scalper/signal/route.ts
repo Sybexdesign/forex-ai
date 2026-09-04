@@ -7,6 +7,10 @@ import { llmComplete, hasLlmKey, providerLabel } from '@/lib/llm'
 import { getMarketCandles } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'
 import { selectLatestClosedCandle } from '@/lib/market-health'
+import {
+  PREDICTION_WINDOW_MS, PREDICTION_FUTURE_CANDLES, PREDICTION_RESOLUTION_RULE,
+  PREDICTION_TIMEFRAME, buildPredictionMeta,
+} from '@/lib/prediction-contract.mjs'
 import { getCalibratedMinStrengths } from '@/lib/threshold-calibration'
 import { sessionOf } from '@/lib/expectancy-engine'
 import { evaluateSetup } from '@/lib/setup-evaluator'
@@ -900,6 +904,19 @@ Return JSON only:
     }
     const regimeMeta = regimeInfo ? { ...regimeInfo, adx: t.adx } : null
 
+    // ── Canonical prediction contract (Phase 2) ──────────────────────────────
+    // Prediction start = the server timestamp of THIS evaluation. The DB's
+    // created_at (insert default) and prediction_expires_at are anchored to the
+    // same instant, so the API/UI/database never disagree on the window. The
+    // evaluated candle is the latest fully-closed M5 candle: broker-frame OPEN
+    // = closed-candle close time − 5 min.
+    const evalStartedAtIso = new Date().toISOString()
+    const evalCandleOpenIso = (() => {
+      const closeMs = closeTimeMs(body)
+      return closeMs === null ? null : new Date(closeMs - 5 * 60_000).toISOString()
+    })()
+    const predictionMeta = buildPredictionMeta(evalStartedAtIso, result.entry ?? null)
+
     // Persist to signals table (audit Phase 1.5)
     // `direction` remains the final gated direction. `predicted_direction`
     // stores the raw engine output before any gate (discipline/ML) touched it,
@@ -925,6 +942,13 @@ Return JSON only:
           sl:                  result.sl ?? null,
           tp:                  result.tp ?? null,
           candle_close_time:   closeTimeIso(body),
+          // Canonical prediction metadata (Phase 2 — lib/prediction-contract.mjs)
+          prediction_window_ms:   PREDICTION_WINDOW_MS,
+          prediction_timeframe:   PREDICTION_TIMEFRAME,
+          prediction_candles:     PREDICTION_FUTURE_CANDLES,
+          resolution_rule:        PREDICTION_RESOLUTION_RULE,
+          prediction_expires_at:  predictionMeta?.expiresAt ?? null,
+          evaluated_candle_time:  evalCandleOpenIso,
           regime:              regimeMeta?.regime ?? null,
           agreement_score:     agreementScore ?? null,
           ml_model:            audit.mlModel ?? null,
@@ -1036,6 +1060,13 @@ Return JSON only:
       fallback,
       ml: mlData,
       _audit: audit,
+      // Canonical prediction contract (Phase 2). expiresAt is server-fixed for
+      // the evaluated candle — repeat polls for the same candle return this same
+      // block (the frontend must never extend it).
+      prediction:       predictionMeta,
+      evaluatedCandleTime: typeof body?.candleCloseTime === 'string'
+        ? body.candleCloseTime
+        : (candleKey ? new Date(Number(candleKey.slice(candleKey.indexOf(':') + 1))).toISOString() : null),
       marketRegime:         regimeMeta?.regime ?? null,
       effectiveMinStrength: regimeMeta?.effectiveMinStrength ?? null,
       thresholdSource,       // Phase 2 (item 7): 'calibrated' | 'heuristic'
