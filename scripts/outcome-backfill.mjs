@@ -12,6 +12,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { linkRecords } from '../lib/outcome-linkage.mjs'
 import { summarize, classifyRecord, diagnose } from '../lib/outcome-reconciliation.mjs'
+import { diffRefresh } from '../lib/execution-truth.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const env = {}
@@ -70,8 +71,11 @@ if (records.length) {
 
 if (!commit) { console.log('\nDRY-RUN complete — no writes. Re-run with --commit after migration 20260912 is applied.'); process.exit(0) }
 
-// Insert into the analytical table (idempotent upsert, ignore duplicates).
-const rows = records.map(r => ({
+// Phase 4 — REFRESH (not delete-and-reinsert): fetch current stored rows for the
+// derived fields, diff against what we just derived, then merge-upsert on
+// setup_key so existing rows are UPDATED as new domains (execution, labels…)
+// arrive. Source tables are never touched.
+const derivedRows = records.map(r => ({
   user_id: r.user_id, pair: r.pair, direction: r.direction,
   signal_id: null, prediction_log_id: r.prediction_log_id, reconciliation_id: r.reconciliation_id ?? null,
   execution_id: r.execution_id ?? null, setup_key: r.setupKey,
@@ -86,11 +90,25 @@ const rows = records.map(r => ({
   disagreement_reasons: diagnose(r),
   contract_versions: { prediction: 'prediction_v2_phase2', signal_label: 'label_legacy', reconciliation: 'reconcile_v1', execution: null },
 }))
-const cols = 'setup_key'
-const res = await fetch(`${URL}/rest/v1/outcome_reconciliation?on_conflict=${cols}`, {
-  method: 'POST',
-  headers: { ...H, 'Content-Type': 'application/json', Prefer: 'resolution=ignore-duplicates,return=minimal' },
-  body: JSON.stringify(rows),
-})
-if (!res.ok) { console.error('insert failed:', res.status, await res.text()); process.exit(1) }
-console.log(`\nCOMMIT complete — inserted/ignored ${rows.length} analytical rows into outcome_reconciliation.`)
+const refreshFields = 'setup_key,prediction_outcome,prediction_resolved_at,signal_label_outcome,signal_label_source,signal_label_resolved_at,reconciliation_outcome,reconciliation_resolved_at,execution_outcome,execution_closed_at,execution_pnl_usd,execution_r,agreement_class,disagreement_reasons,contract_versions'
+const existingRes = await fetch(`${URL}/rest/v1/outcome_reconciliation?select=${refreshFields}&limit=5000`, { headers: H })
+const existingRows = existingRes.ok ? (await existingRes.json().catch(() => [])) : []
+const diff = diffRefresh(derivedRows, existingRows)
+const notComparable = summary.fourEngine?.NOT_COMPARABLE ?? 0
+
+if (commit) {
+  const res = await fetch(`${URL}/rest/v1/outcome_reconciliation?on_conflict=setup_key`, {
+    method: 'POST',
+    headers: { ...H, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify(derivedRows),
+  })
+  if (!res.ok) { console.error('refresh/upsert failed:', res.status, await res.text()); process.exit(1) }
+}
+console.log('\nREFRESH report:')
+console.log('  derived rows    :', derivedRows.length)
+console.log('  inserted        :', diff.inserted.length)
+console.log('  updated         :', diff.updated.length)
+console.log('  unchanged       :', diff.unchanged.length)
+console.log('  ambiguousSkipped:', JSON.stringify(ambiguousSkipped))
+console.log('  notComparable   :', notComparable)
+if (commit) console.log(`\nCOMMIT complete — refreshed ${derivedRows.length} analytical rows into outcome_reconciliation (no source rows touched).`)

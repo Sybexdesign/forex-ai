@@ -218,6 +218,9 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
               <span>Signals (non-HOLD): 24h <b>{dh.signals?.last24h ?? 0}</b> · 7d <b>{dh.signals?.last7d ?? 0}</b></span>
               <span>Reconciliations 7d: <b>{dh.reconciliations?.last7d ?? 0}</b> · pending {dh.reconciliations?.pending ?? 0}</span>
               <span>Closed trades 7d: <b>{dh.trades?.closed7d ?? 0}</b> · set-ups 7d {dh.setups?.tradeSetups7d ?? 0} · alerts {dh.setups?.alerts7d ?? 0}</span>
+              {dh.execution?.available && (
+                <span>Execution 7d: <b>{dh.execution.open ?? 0}</b> open · <b>{dh.execution.closed ?? 0}</b> closed · net-P&L missing {dh.execution.closedMissingNetPnl ?? 0} · no broker ticket {dh.execution.missingBrokerTicket ?? 0} · no signal link {dh.execution.missingSignalLink ?? 0}</span>
+              )}
               <span>Worker: <b>{dh.worker?.alive ? 'ALIVE' : 'DOWN'}</b> {dh.worker?.lastSeenAt ? '· last ' + dh.worker.lastSeenAt.slice(11, 19) + ' UTC' : ''}</span>
             </div>
           )}

@@ -75,6 +75,27 @@ export async function GET() {
       .from('worker_logs').select('created_at').order('created_at', { ascending: false }).limit(1)
     const lastSeen = lastLog?.[0]?.created_at ?? null
 
+    // ── Phase 4 — execution data health (graceful: falls back when the Phase 4
+    // columns are not yet applied). Lifecycle and profitability are counted
+    // separately from prediction health. ────────────────────────────────────
+    let executionHealth: any = { available: false }
+    try {
+      const t = (b: any) => b.select('id', { count: 'exact', head: true })
+      const [{ count: total7 }, { count: open7 }, { count: closed7 }, { count: closedNoPnl }, { count: noTicket }, { count: noSignal }] = await Promise.all([
+        t(admin.from('trades')).gte('opened_at', d7),
+        t(admin.from('trades')).gte('opened_at', d7).eq('trade_status', 'OPEN'),
+        t(admin.from('trades')).gte('opened_at', d7).eq('trade_status', 'CLOSED'),
+        t(admin.from('trades')).gte('opened_at', d7).eq('trade_status', 'CLOSED').is('pl_usd', null),
+        t(admin.from('trades')).gte('opened_at', d7).is('broker_ticket', null),
+        t(admin.from('trades')).gte('opened_at', d7).is('signal_id_ref', null),
+      ])
+      executionHealth = {
+        available: true, total7d: total7 ?? 0, open: open7 ?? 0, closed: closed7 ?? 0,
+        closedMissingNetPnl: closedNoPnl ?? 0, missingBrokerTicket: noTicket ?? 0,
+        missingSignalLink: noSignal ?? 0,
+      }
+    } catch { /* Phase 4 columns not applied yet — execution health unavailable */ }
+
     return NextResponse.json({
       generatedAt: new Date().toISOString(),
       predictionLogs: {
@@ -87,6 +108,7 @@ export async function GET() {
       signals: { last24h: sig24, last7d: sig7 },
       reconciliations: { last7d: recon7, pending: reconPending },
       trades: { closed7d: trades7 },
+      execution: executionHealth,
       setups: { tradeSetups7d: setups7, alerts7d: alerts7 },
       rejections: { last24h: bucket(rej24), last7d: bucket(rej7) },
       worker: { alive: !!lastSeen, lastSeenAt: lastSeen },

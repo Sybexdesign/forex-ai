@@ -9,6 +9,7 @@ import { calcPropFirmStatus, applyPropFirmGuards, DEFAULT_PROP_FIRM } from '@/li
 import type { PropFirmSettings } from '@/lib/propfirm'
 import { getAdminClient } from '@/lib/supabase'
 import { minStopPips, MAX_LOTS } from '@/lib/trade-levels'
+import { EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 
 import { alertOrderPlaced, alertOrderBlocked, alertOrderFailed, alertProfitTargetDisabled } from '@/lib/telegram'
 
@@ -46,6 +47,9 @@ export async function POST(req: NextRequest) {
       // callers; defaulted to safe values on insert.
       source, source_sl_pips, source_tp_pips,
       signal_at, signal_confidence, signal_id_ref,
+      // Phase 4 lineage (optional): explicit prediction/setup references so
+      // signal → prediction → execution does not rely on fuzzy timestamp matching.
+      predictionLogId, setupId,
     } = body
 
     const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
@@ -467,6 +471,13 @@ export async function POST(req: NextRequest) {
           signal_at:         signal_at ?? null,
           signal_confidence: signal_confidence ?? null,
           signal_id_ref:     signal_id_ref ?? (typeof signalId === 'string' ? signalId : null),
+          // Phase 4 — canonical lifecycle/provenance for new executions.
+          trade_status:              'OPEN',
+          execution_source:          String(source || 'manual').toUpperCase(),
+          execution_contract_version: EXECUTION_CONTRACT_VERSION,
+          broker_ticket:             orderResult.tradeId ?? null,
+          prediction_log_id:         predictionLogId ?? null,
+          setup_id:                  setupId ?? null,
         }).select().single()
 
         // Only attempt the signals-table update when signalId is a real UUID — the

@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 import { manageTrades } from '@/lib/trade-manager'
 import { alertRiskBreach, alertProfitReversal, alertCircuitBreaker } from '@/lib/telegram'
+import { normaliseExecution, EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 
 export const dynamic = 'force-dynamic'
 
@@ -179,14 +180,26 @@ export async function POST(req: NextRequest) {
         const plUsd  = typeof cp.profit === 'number' ? cp.profit : null
         const mfeUsd = typeof cp.mfe    === 'number' ? cp.mfe    : null
         const maeUsd = typeof cp.mae    === 'number' ? cp.mae    : null
+        // Phase 4 — lifecycle and profitability are separated. trade_status =
+        // 'CLOSED'; trade_result is derived ONLY from net realised P&L. The
+        // legacy `result` column keeps its existing write (best-effort, because
+        // 'CLOSED' is not in the legacy check constraint on some databases).
+        const execTruth = normaliseExecution({ result: 'CLOSED', closed_at: nowStr, netPnl: plUsd })
         await sb.from('trades').update({
-          result:     'CLOSED',
-          closed_at:  nowStr,
-          exit_price: typeof cp.closePrice === 'number' ? cp.closePrice : null,
-          pl_usd:     plUsd,
-          mfe_usd:    mfeUsd,
-          mae_usd:    maeUsd,
+          trade_status:              'CLOSED',
+          trade_result:              execTruth.trade_result,
+          closed_at:                 nowStr,
+          exit_price:                typeof cp.closePrice === 'number' ? cp.closePrice : null,
+          pl_usd:                    plUsd,
+          mfe_usd:                   mfeUsd,
+          mae_usd:                   maeUsd,
+          execution_source:          'MT5_SYNC',
+          execution_contract_version: EXECUTION_CONTRACT_VERSION,
         }).eq('id', matched.id)
+        // Legacy compatibility write — intentionally isolated so a check-constraint
+        // failure here can never lose the canonical execution truth above.
+        const legacyRes = await sb.from('trades').update({ result: 'CLOSED' }).eq('id', matched.id)
+        if (legacyRes.error) { /* legacy check constraint may reject 'CLOSED' — canonical fields above already stored */ }
         console.log(`[mt5-sync] CLOSED via closedPosition — ${pair} ${direction} pl=$${plUsd} mfe=$${mfeUsd} mae=$${maeUsd} → trade ${matched.id}`)
         // Realised >1R loss → fire alert + arm CB once (matches the unrealised path
         // in the legacy reconciliation below; either can arm, last-write wins).

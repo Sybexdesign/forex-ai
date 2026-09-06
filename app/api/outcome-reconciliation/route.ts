@@ -10,6 +10,7 @@ import { getAdminClient } from '@/lib/supabase'
 import { linkRecords } from '@/lib/outcome-linkage.mjs'
 import { summarize, classifyRecord, AGREEMENT } from '@/lib/outcome-reconciliation.mjs'
 import { OUTCOME_LABELS, OUTCOME_CONTRACTS, CONTRACT_VERSIONS } from '@/lib/outcome-contracts.mjs'
+import { executionExpectancy, conversionEfficiency, edgeLeakage, sampleConfidenceLabel } from '@/lib/execution-truth.mjs'
 
 export const dynamic = 'force-dynamic'
 
@@ -96,6 +97,18 @@ export async function GET(req: NextRequest) {
       fourClasses[c] = (fourClasses[c] || 0) + 1
     }
 
+    // ── Phase 4 — separated expectancy/conversion analytics ────────────────
+    // Prediction expectancy (R) uses the canonical prediction contract: each WIN
+    // realises the fixed contract reward (TP/SL ratio 5/3) and each LOSS −1R.
+    const predResolved = records.filter(r => r.prediction === 'WIN' || r.prediction === 'LOSS')
+    const predW = predResolved.filter(r => r.prediction === 'WIN').length
+    const predL = predResolved.length - predW
+    const predExpectancyR = predResolved.length > 0 ? +((predW * 5 / 3 - predL) / predResolved.length).toFixed(4) : null
+    const execClosed = trades.filter(t => (t.result === 'WIN' || t.result === 'LOSS' || t.result === 'BREAKEVEN' || t.trade_status === 'CLOSED'))
+      .map(t => ({ netPnl: t.pl_usd, planned_risk_amount: t.planned_risk_amount ?? null, realised_r: t.realised_r ?? null }))
+    const execExp = executionExpectancy(execClosed)
+    const conv = conversionEfficiency(execExp?.avgRealisedR ?? null, predExpectancyR, execExp?.n ?? 0)
+
     return NextResponse.json({
       contract: {
         engines: {
@@ -119,6 +132,17 @@ export async function GET(req: NextRequest) {
       },
       summary,
       fourEngineClassCounts: fourClasses,
+      executionTruth: {
+        predictionExpectancyR: predExpectancyR,
+        predictionSample: predResolved.length,
+        predictionSampleConfidence: sampleConfidenceLabel(predResolved.length),
+        executionExpectancyR: execExp?.avgRealisedR ?? null,
+        executionSample: execExp?.n ?? 0,
+        executionSampleConfidence: sampleConfidenceLabel(execExp?.n ?? 0),
+        conversion: conv,
+        edgeLeakageR: edgeLeakage(predExpectancyR, execExp?.avgRealisedR ?? null),
+        note: 'Prediction and execution expectancy are intentionally separated. Conversion only shows once execution samples are sufficient and meaningful.',
+      },
       sample: records.slice(0, 10).map(r => ({
         setupKey: r.setupKey, pair: r.pair, direction: r.direction,
         prediction: r.prediction, signalLabel: r.signalLabel,

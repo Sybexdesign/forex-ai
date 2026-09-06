@@ -77,6 +77,40 @@ export default function OutcomeReconciliation({ windowDays = 30 }: { windowDays?
             ))}
           </div>
 
+          {/* Phase 4 — separated execution truth (advisory; real broker outcomes) */}
+          {data.executionTruth && (
+            <div style={{
+              borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: 6, marginTop: 2,
+            }}>
+              <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, color: 'var(--text)' }}>
+                EXECUTION TRUTH — based on realised broker/trade outcomes
+              </div>
+              <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', marginTop: 4, color: 'var(--text-muted)' }}>
+                <span>Prediction expectancy: <b style={{ color: 'var(--text)' }}>
+                  {data.executionTruth.predictionExpectancyR === null || data.executionTruth.predictionExpectancyR === undefined ? '—'
+                    : `${data.executionTruth.predictionExpectancyR > 0 ? '+' : ''}${data.executionTruth.predictionExpectancyR}R`}</b>
+                  <span style={{ fontSize: 9 }}> ({data.executionTruth.predictionSample} pred · {data.executionTruth.predictionSampleConfidence?.toLowerCase().replace(/_/g, ' ')})</span>
+                </span>
+                <span>Execution expectancy: <b style={{ color: 'var(--text)' }}>
+                  {data.executionTruth.executionExpectancyR === null || data.executionTruth.executionExpectancyR === undefined ? '—'
+                    : `${data.executionTruth.executionExpectancyR > 0 ? '+' : ''}${data.executionTruth.executionExpectancyR}R`}</b>
+                  <span style={{ fontSize: 9 }}> ({data.executionTruth.executionSample} exec · {data.executionTruth.executionSampleConfidence?.toLowerCase().replace(/_/g, ' ')})</span>
+                </span>
+                <span>Conversion: <b style={{ color: 'var(--text)' }}>
+                  {data.executionTruth.conversion?.efficiency == null ? '—' : `${data.executionTruth.conversion.efficiency}%`}</b>
+                  {data.executionTruth.conversion?.reason && <span style={{ fontSize: 9 }}> ({data.executionTruth.conversion.reason.toLowerCase().replace(/_/g, ' ')})</span>}
+                </span>
+                <span>Edge leakage: <b style={{ color: 'var(--text)' }}>
+                  {data.executionTruth.edgeLeakageR == null ? '—' : `${data.executionTruth.edgeLeakageR > 0 ? '+' : ''}${data.executionTruth.edgeLeakageR}R`}</b>
+                </span>
+              </div>
+              <div style={{ fontSize: 9, color: 'var(--text-dim)', marginTop: 3 }}>
+                Prediction expectancy and execution expectancy are deliberately kept separate.
+                Conversion is hidden until execution samples are sufficient and meaningful.
+              </div>
+            </div>
+          )}
+
           {/* Top disagreement causes */}
           <div style={{ color: 'var(--text-muted)' }}>
             Top disagreement causes:{' '}
