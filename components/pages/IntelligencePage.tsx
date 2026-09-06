@@ -10,6 +10,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts'
 import { Panel, StatCard } from '../ui'
+import OutcomeReconciliation from '../OutcomeReconciliation'
 
 const TOOLTIP_STYLE = {
   contentStyle: { background: '#0a1628', border: '1px solid #1a2940', borderRadius: 3, fontSize: 12 },
@@ -155,6 +156,9 @@ export default function IntelligencePage() {
 
       {analyticsError && <div style={{ color: '#ff6060', fontSize: 12 }}>{analyticsError}</div>}
 
+
+      {/* Phase 3 — Outcome Reconciliation (read-only cross-engine agreement) */}
+      <OutcomeReconciliation windowDays={30} />
 
       {/* Item 13: Similar-Pattern Engine */}
       <Panel title="Similar-Pattern Engine" badge="Phase 4 · item 13">

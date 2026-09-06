@@ -10,7 +10,9 @@
     "build:market-health-test": "tsc lib/market-health.ts --outDir .testbuild --module commonjs --target es2020 --esModuleInterop --skipLibCheck",
     "test:market-health": "npm run build:market-health-test && node tests/closed-candle.test.mjs",
     "test:prediction-contract": "node tests/prediction-contract.test.mjs",
-    "test:phase2": "npm run test:market-health && npm run test:prediction-contract"
+    "test:outcome-reconciliation": "node tests/outcome-reconciliation.test.mjs",
+    "test:phase2": "npm run test:market-health && npm run test:prediction-contract",
+    "test:phase3": "npm run test:market-health && npm run test:prediction-contract && npm run test:outcome-reconciliation"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.92.0",

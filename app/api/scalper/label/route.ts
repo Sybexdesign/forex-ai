@@ -160,9 +160,20 @@ export async function GET(req: NextRequest) {
       const outcome  = labelFromCandles(candles, signalTs, sl, tp, sig.direction)
       if (!outcome) { skipped++; continue }
 
+      // Phase 3 source attribution: legacy signals.outcome is still written for
+      // backwards compatibility, but the verdict is ALSO recorded under its own
+      // label-contract columns with source + timestamp so analytics can tell who
+      // produced it and under which contract (~30-min M5 high/low, timeout LOSS).
+      const resolvedNowIso = new Date().toISOString()
       const { error: updateErr } = await sb
         .from('signals')
-        .update({ outcome })
+        .update({
+          outcome,
+          outcome_source:         'LABEL_CRON',
+          signal_label_outcome:   outcome,
+          signal_label_source:    'LABEL_CRON',
+          signal_label_resolved_at: resolvedNowIso,
+        })
         .eq('id', sig.id)
 
       if (!updateErr) {

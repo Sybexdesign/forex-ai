@@ -959,7 +959,7 @@ async function checkPendingOutcomes(ticksByPair) {
       // Without this, the next signal would still see the pre-close count for up to 2 min
       // and could be incorrectly throttled by the maxPositions gate.
       cachedRisk = null
-      await sbUpdate('signals', id, { outcome })
+      await sbUpdate('signals', id, { outcome, outcome_source: 'WORKER_TRACKER' })
       console.log(`[outcome] ${sig.pair} ${sig.direction} → ${outcome} (${id.slice(0, 8)})`)
       wlog('info', `Signal outcome: ${sig.pair} ${sig.direction} → ${outcome}`, {
         pair: sig.pair, session: getSession(),
