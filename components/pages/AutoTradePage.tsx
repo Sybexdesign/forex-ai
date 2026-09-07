@@ -425,20 +425,28 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
     return () => clearInterval(id)
   }, [])
 
-  // Fetch prop firm settings once to know if risk is capped
+  // Fetch prop firm settings to know if risk is capped AND whether the Overnight /
+  // Outside-Overlap session restriction applies. Refreshed every 30s so toggling
+  // Prop Firm Mode in the settings page reflects here without a full reload.
   useEffect(() => {
-    authFetch('/api/prop-firm')
-      .then(r => r.json())
-      .then(({ settings }) => {
-        if (!settings?.enabled) return
-        const baseCap = settings.maxDailyLossPct / 2
-        const cap = settings.consistencyRulePct > 0
-          ? Math.min(baseCap, settings.consistencyRulePct)
-          : baseCap
-        setPfEnabled(true)
-        setPfRiskCap(cap)
-      })
-      .catch(() => {})
+    const loadPf = () => {
+      authFetch('/api/prop-firm')
+        .then(r => r.json())
+        .then(({ settings }) => {
+          if (!settings) return
+          setPfEnabled(!!settings.enabled)
+          if (!settings.enabled) { setPfRiskCap(null); return }
+          const baseCap = settings.maxDailyLossPct / 2
+          const cap = settings.consistencyRulePct > 0
+            ? Math.min(baseCap, settings.consistencyRulePct)
+            : baseCap
+          setPfRiskCap(cap)
+        })
+        .catch(() => {})
+    }
+    loadPf()
+    const id = setInterval(loadPf, 30_000)
+    return () => clearInterval(id)
   }, [])
 
   const fetchScalpSignalForPair = useCallback(async (pair: string) => {
@@ -1119,7 +1127,9 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   const _utcLabel = _utcNow.toISOString().slice(11, 19)
   const _isWeekday = _utcDay >= 1 && _utcDay <= 5
   const isLondonNYOverlap = _isWeekday && _utcHour >= 12 && _utcHour < 14
-  const sessionBlocked    = !isLondonNYOverlap
+  // Overnight / Outside-Overlap restriction applies ONLY when Prop Firm Mode is ON.
+  // Prop Firm OFF ⇒ auto-trading is allowed across the full market-open week.
+  const sessionBlocked    = pfEnabled && !isLondonNYOverlap
   // Time-until / time-remaining helpers — recomputed each render via scalpTick.
   function fmtHM(mins: number) {
     const h = Math.floor(mins / 60); const m = mins % 60
@@ -1136,8 +1146,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
   function timeRemainingInWindow() {
     return fmtHM((14 - _utcHour) * 60 - _utcMin) + ' remaining'
   }
-  const sessionLabel = isLondonNYOverlap ? 'London-NY Overlap' : 'Overlap Closed'
-  const sessionColor = isLondonNYOverlap ? '#00e5b4' : '#6b7280'
+  const sessionLabel = pfEnabled
+    ? (isLondonNYOverlap ? 'London-NY Overlap' : 'Overlap Closed')
+    : 'Prop Firm OFF — Any Session'
+  const sessionColor = sessionBlocked ? '#6b7280' : '#00e5b4'
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -1169,8 +1181,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
             ? `⚡ AUTO-TRADE PAUSED · ${cbCountdown} remaining`
             : (autoTradeEnabled
               ? (sessionBlocked
-                  ? `⏸ OUTSIDE OVERLAP — next: ${timeUntilNextOverlap()}`
-                  : `▶ OVERLAP ACTIVE · ${timeRemainingInWindow()}`)
+                  ? `⏸ OUTSIDE OVERLAP (PROP FIRM ON) — next: ${timeUntilNextOverlap()}`
+                  : pfEnabled
+                    ? `▶ OVERLAP ACTIVE · ${timeRemainingInWindow()}`
+                    : '▶ AUTO-TRADE ACTIVE — outside-overlap allowed (Prop Firm OFF)')
               : '○ Auto-trading off')}
         </div>
       </div>
