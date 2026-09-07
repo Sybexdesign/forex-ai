@@ -91,6 +91,12 @@ let liveStrategy = {
   autoTradeEnabled:  false,
   autoTradeSections: ['scalp'],
   autoTradePairs:    ['XAU/USD', 'XAG/USD'],
+  // Prop Firm Mode drives the Overnight / Outside-Overlap session restrictions.
+  // Conservative default TRUE (restrictions on) until /api/strategy explicitly
+  // reports propFirm.enabled=false. Prop Firm OFF ⇒ the wider trading hours are
+  // allowed; Prop Firm ON ⇒ the 12:00-13:59 UTC London-NY window restriction
+  // (and the orders-route prop overnight guard) stay active.
+  propFirmEnabled:   true,
 }
 
 // ── Pairs + Strategy Defaults ─────────────────────────────────────────────────
@@ -1286,10 +1292,16 @@ async function loadStrategy() {
       liveStrategy.autoTradeSections = Array.isArray(data.autoTrade.sections) ? data.autoTrade.sections : ['scalp']
       liveStrategy.autoTradePairs    = Array.isArray(data.autoTrade.pairs)    ? data.autoTrade.pairs    : ['XAU/USD','XAG/USD']
     }
+    // Prop Firm Mode decides whether Overnight / Outside-Overlap restrictions
+    // apply. Default stays TRUE (restricted) when the strategy endpoint doesn't
+    // report propFirm yet, so an unknown state never silently widens hours.
+    if (data?.propFirm && typeof data.propFirm.enabled === 'boolean') {
+      liveStrategy.propFirmEnabled = data.propFirm.enabled
+    }
     const lotMode = (typeof liveStrategy.manualLots === 'number' && liveStrategy.manualLots > 0)
       ? `manual=${liveStrategy.manualLots}lot`
       : 'auto'
-    console.log(`[strategy] loaded — minStrength=${liveStrategy.minStrength}% riskPct=${liveStrategy.riskPct}% SL=${liveStrategy.slPips}p TP=${liveStrategy.tpPips}p maxPos=${liveStrategy.maxPositions} sizing=${lotMode} | autoEnabled=${liveStrategy.autoTradeEnabled} sections=[${liveStrategy.autoTradeSections.join(',')}] pairs=[${liveStrategy.autoTradePairs.join(',')}]`)
+    console.log(`[strategy] loaded — minStrength=${liveStrategy.minStrength}% riskPct=${liveStrategy.riskPct}% SL=${liveStrategy.slPips}p TP=${liveStrategy.tpPips}p maxPos=${liveStrategy.maxPositions} sizing=${lotMode} | autoEnabled=${liveStrategy.autoTradeEnabled} sections=[${liveStrategy.autoTradeSections.join(',')}] pairs=[${liveStrategy.autoTradePairs.join(',')}] propFirm=${liveStrategy.propFirmEnabled}`)
   } catch (e) {
     console.warn('[strategy] fetch failed — using cached values:', e.message)
   }
@@ -1874,14 +1886,18 @@ async function processSignal(pair, tick, strategy, session, direction) {
     })
   } else if (tradingHalted) {
     logAutoTradeDecision('skipped-daily-loss-halted', pair, dir, signal)
-  } else if (!isLondonNYOverlap()) {
-    // Single allowlist: only 12:00-13:59 UTC Mon-Fri. Replaces daily-close +
-    // sunday-pre-open + per-section session-bias gates.
+  } else if (liveStrategy.propFirmEnabled && !isLondonNYOverlap()) {
+    // Single allowlist when Prop Firm Mode is ON: only 12:00-13:59 UTC Mon-Fri
+    // (replaces daily-close + sunday-pre-open + per-section session-bias gates).
+    // When Prop Firm Mode is OFF this time window restriction is disabled, so
+    // auto-trading may run any hour the market is open — every other gate
+    // (risk, signals, confirmations, health) still applies unchanged.
     const now = new Date()
     logAutoTradeDecision('skipped-outside-overlap', pair, dir, signal, {
       utcHour: now.getUTCHours(),
       utcDay:  now.getUTCDay(),
       nextWindow: nextOverlapInfo(now),
+      propFirmEnabled: liveStrategy.propFirmEnabled,
     })
   } else {
     {

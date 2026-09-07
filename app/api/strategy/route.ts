@@ -12,7 +12,7 @@ const DEFAULT_AUTO_TRADE = {
 
 export async function GET(req: NextRequest) {
   const userId = req.nextUrl.searchParams.get('userId')
-  if (!userId) return NextResponse.json({ settings: DEFAULT_STRATEGY, autoTrade: DEFAULT_AUTO_TRADE })
+  if (!userId) return NextResponse.json({ settings: DEFAULT_STRATEGY, autoTrade: DEFAULT_AUTO_TRADE, propFirm: { enabled: false } })
 
   try {
     const admin = getAdminClient()
@@ -21,6 +21,14 @@ export async function GET(req: NextRequest) {
       .select('settings, auto_trade_enabled, auto_trade_sections, auto_trade_pairs')
       .eq('user_id', userId)
       .single()
+    // Prop Firm Mode (single global row). When the row is absent the system
+    // treats prop-firm as OFF — which also means the Overnight / Outside-Overlap
+    // session restrictions are disabled (see workers/scalper.mjs gate).
+    let propFirmEnabled = false
+    try {
+      const pf = await admin.from('prop_firm_settings').select('enabled').single()
+      if (pf.data && typeof pf.data.enabled === 'boolean') propFirmEnabled = pf.data.enabled
+    } catch { /* no row → prop firm OFF */ }
     return NextResponse.json({
       settings: data?.settings || DEFAULT_STRATEGY,
       autoTrade: {
@@ -28,10 +36,11 @@ export async function GET(req: NextRequest) {
         sections: data?.auto_trade_sections ?? DEFAULT_AUTO_TRADE.sections,
         pairs:    data?.auto_trade_pairs    ?? DEFAULT_AUTO_TRADE.pairs,
       },
+      propFirm: { enabled: propFirmEnabled },
     })
   } catch (e: any) {
     console.error('[strategy GET]', e?.message)
-    return NextResponse.json({ settings: DEFAULT_STRATEGY, autoTrade: DEFAULT_AUTO_TRADE, isDefault: true })
+    return NextResponse.json({ settings: DEFAULT_STRATEGY, autoTrade: DEFAULT_AUTO_TRADE, propFirm: { enabled: false }, isDefault: true })
   }
 }
 
