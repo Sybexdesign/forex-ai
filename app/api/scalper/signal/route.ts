@@ -11,6 +11,7 @@ import {
   PREDICTION_WINDOW_MS, PREDICTION_FUTURE_CANDLES, PREDICTION_RESOLUTION_RULE,
   PREDICTION_TIMEFRAME, buildPredictionMeta,
 } from '@/lib/prediction-contract.mjs'
+import { signalMaxAgeSeconds } from '@/lib/execution-guards.mjs'
 import { getCalibratedMinStrengths } from '@/lib/threshold-calibration'
 import { sessionOf } from '@/lib/expectancy-engine'
 import { evaluateSetup } from '@/lib/setup-evaluator'
@@ -1064,6 +1065,10 @@ Return JSON only:
       // the evaluated candle — repeat polls for the same candle return this same
       // block (the frontend must never extend it).
       prediction:       predictionMeta,
+      // Authoritative execution TTL (seconds) — same value /api/orders enforces
+      // (SIGNAL_MAX_AGE_SECONDS). The UI action window must use this, anchored to
+      // prediction.startsAt, so UI and server can never disagree on validity.
+      signalTtlSeconds: signalMaxAgeSeconds(),
       evaluatedCandleTime: typeof body?.candleCloseTime === 'string'
         ? body.candleCloseTime
         : (candleKey ? new Date(Number(candleKey.slice(candleKey.indexOf(':') + 1))).toISOString() : null),

@@ -96,6 +96,68 @@ export async function GET() {
       }
     } catch { /* Phase 4 columns not applied yet — execution health unavailable */ }
 
+    // ── Auto Trade / Signal health (distinguishes "engine running but producing
+    // HOLD" from "engine stalled / feed stale / worker offline"). ──────────────
+    let autoTradeHealth: any = { available: true }
+    try {
+      const logsResp = await admin.from('worker_logs')
+        .select('level,message,metadata,created_at')
+        .order('created_at', { ascending: false })
+        .limit(300)
+      const rows = logsResp.data || []
+      const feedRes = await admin.from('broker_configs')
+        .select('updated_at').order('updated_at', { ascending: false }).limit(1)
+      const nowMsH = Date.now()
+      const lastSeenMs = lastSeen ? new Date(lastSeen).getTime() : null
+      const feedAt = feedRes.data?.[0]?.updated_at ?? null
+      const feedAgeSec = feedAt ? Math.round((nowMsH - new Date(feedAt).getTime()) / 1000) : null
+
+      let lastSigCheckAt: string | null = null
+      let lastSignalAt: string | null = null
+      let lastOrderAt: string | null = null
+      let lastActionableAt: string | null = null
+      let lastHoldAt: string | null = null
+      let marketOpen: boolean | null = null
+      let staleLikeLogCount = 0
+      for (const r of rows) {
+        const m = r.metadata || {}
+        if (lastSigCheckAt === null && (m.sigChecks || 0) > 0) lastSigCheckAt = r.created_at
+        if (marketOpen === null && m.market) marketOpen = String(m.market).includes('OPEN')
+        const msg = String(r.message || '')
+        if (r.level === 'signal') {
+          if (lastSignalAt === null) lastSignalAt = r.created_at
+          if (/HOLD/.test(msg) && lastHoldAt === null) lastHoldAt = r.created_at
+          if (!/HOLD/.test(msg) && lastActionableAt === null) lastActionableAt = r.created_at
+        }
+        if (r.level === 'order' && lastOrderAt === null) lastOrderAt = r.created_at
+        if (/skipped-outside-overlap|skipped-stale|stale closed candle|REJECTED stale_signal|entry_drift|duplicate_signal/i.test(msg)) staleLikeLogCount++
+      }
+      const workerAlive = lastSeenMs !== null && (nowMsH - lastSeenMs) < 180_000
+      const workerAgeSec = lastSeenMs !== null ? Math.round((nowMsH - lastSeenMs) / 1000) : null
+      const sigCheckAgeSec = lastSigCheckAt ? Math.round((nowMsH - new Date(lastSigCheckAt).getTime()) / 1000) : null
+      const feedFresh = feedAgeSec !== null && feedAgeSec <= 600
+      const engineStalled = workerAlive && (marketOpen === true || marketOpen === null) &&
+        (sigCheckAgeSec === null || sigCheckAgeSec > 300)
+      const status = !workerAlive ? 'WORKER OFFLINE'
+        : (!feedFresh && feedAgeSec !== null) ? 'MARKET DATA STALE'
+        : engineStalled ? 'SIGNAL ENGINE STALLED'
+        : 'HEALTHY'
+      autoTradeHealth = {
+        status,
+        worker: { alive: workerAlive, lastHeartbeatAt: lastSeen, heartbeatAgeSec: workerAgeSec },
+        marketData: { lastUpdateAt: feedAt, feedAgeSec, fresh: feedFresh },
+        signals: {
+          engineRunning: sigCheckAgeSec !== null && sigCheckAgeSec <= 300,
+          lastSigCheckAt, sigCheckAgeSec,
+          lastSignalAt, lastActionableAt, lastHoldAt,
+          note: marketOpen === false
+            ? 'Market closed — no signal evaluation expected (not a stall).'
+            : 'Engine is running; HOLD signals are normal strategy output, not a stall.',
+        },
+        execution: { lastOrderAt, rejectedStaleLikeLogsInWindow: staleLikeLogCount },
+      }
+    } catch { autoTradeHealth = { available: false } }
+
     return NextResponse.json({
       generatedAt: new Date().toISOString(),
       predictionLogs: {
@@ -109,6 +171,7 @@ export async function GET() {
       reconciliations: { last7d: recon7, pending: reconPending },
       trades: { closed7d: trades7 },
       execution: executionHealth,
+      autoTradeHealth,
       setups: { tradeSetups7d: setups7, alerts7d: alerts7 },
       rejections: { last24h: bucket(rej24), last7d: bucket(rej7) },
       worker: { alive: !!lastSeen, lastSeenAt: lastSeen },

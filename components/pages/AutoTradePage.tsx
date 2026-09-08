@@ -159,6 +159,8 @@ interface ScalpSignal {
   // evaluated candle). Present on BUY/SELL payloads from the new API.
   prediction?: PredictionContractClient | null
   evaluatedCandleTime?: string | null
+  // Authoritative execution TTL (seconds) from the server (SIGNAL_MAX_AGE_SECONDS).
+  signalTtlSeconds?: number
 }
 
 const fmtClock = (iso?: string | null) => iso
@@ -503,7 +505,14 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           sl:         sig.sl     || tick.price,
           tp:         sig.tp     || tick.price,
           reasons:    sig.reasons || [],
-          expiresAt:  Date.now() + SCALP_EXPIRY_MS,
+          // Action window = server-authoritative TTL anchored to the candle
+          // evaluation time (prediction.startsAt). Never extended by polling —
+          // mirrors /api/orders stale-signal enforcement.
+          signalTtlSeconds: typeof sig.signalTtlSeconds === 'number' ? sig.signalTtlSeconds : 180,
+          expiresAt: (sig.prediction?.startsAt
+            ? new Date(sig.prediction.startsAt).getTime()
+            : Date.now())
+            + (typeof sig.signalTtlSeconds === 'number' ? sig.signalTtlSeconds : 180) * 1000,
           fetchedAt:  Date.now(),
           fallback:   sig.fallback ?? false,
           marketRegime:         sig.marketRegime ?? null,
@@ -904,7 +913,7 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
       source:               isMirror ? 'mirror' : 'scalp',
       source_sl_pips:       derivedSlPips,
       source_tp_pips:       derivedTpPips,
-      signal_at:            new Date(sig.fetchedAt).toISOString(),
+      signal_at:            sig.prediction?.startsAt ?? new Date(sig.fetchedAt).toISOString(),
       signal_confidence:    sig.confidence,
       signal_id_ref:        signalRef,
     }
@@ -1332,6 +1341,11 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
             {fixedProfitUsd > 0 && (
               <div style={{ fontSize: 10, color: '#00e5b4', marginTop: 6 }}>
                 Active — closes at +{currencySymbol(account?.currency)}{(fixedProfitUsd * profitTargetPct / 100).toFixed(2)} ({currencySymbol(account?.currency)}{fixedProfitUsd.toFixed(2)} × {profitTargetPct}%)
+              </div>
+            )}
+            {fixedProfitUsd <= 0 && (
+              <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 6 }}>
+                Fixed USD profit close disabled — <b>Auto Trade remains active</b>. Positions use strategy TP/SL and trade-manager protection (break-even, profit-lock, trailing, decay, time-exit).
               </div>
             )}
 

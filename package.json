@@ -12,6 +12,8 @@
     "test:prediction-contract": "node tests/prediction-contract.test.mjs",
     "test:outcome-reconciliation": "node tests/outcome-reconciliation.test.mjs",
     "test:execution-truth": "node tests/execution-truth.test.mjs",
+    "test:execution-guards": "node tests/execution-guards.test.mjs",
+    "test:trade-state": "node tests/trade-state.test.mjs",
     "test:phase2": "npm run test:market-health && npm run test:prediction-contract",
     "test:phase3": "npm run test:market-health && npm run test:prediction-contract && npm run test:outcome-reconciliation",
     "test:phase4": "npm run test:market-health && npm run test:prediction-contract && npm run test:outcome-reconciliation && npm run test:execution-truth"

@@ -286,18 +286,17 @@ export async function alertProfitReversal(opts: {
   await send(lines)
 }
 
-// Profit-target safety warning — fires once per process when an order is placed
-// while broker_configs.config.profitFixedUsd is 0 or null. Without this set the
-// trade closes only via SL/TP/trail/decay; the operator may have intended a
-// fixed-dollar TP and silently disabled it.
+// Fixed-USD profit-close warning — advisory only. Auto Trade is NOT disabled;
+// without a fixed-dollar TP the position simply closes via strategy SL/TP +
+// trade-manager protection (break-even, partial-lock, trail, decay, time-exit).
 export async function alertProfitTargetDisabled(opts: { pair?: string } = {}) {
   const lines = [
-    `⚠️ <b>PROFIT TARGET DISABLED</b>`,
+    `ℹ️ <b>FIXED USD PROFIT CLOSE DISABLED — AUTO TRADE REMAINS ACTIVE</b>`,
     ``,
-    opts.pair ? `Order on ${opts.pair} placed without a fixed-dollar TP.` : `Order placed without a fixed-dollar TP.`,
-    `Trades will rely on SL / TP / trailing stop / decay exit only.`,
+    opts.pair ? `Order on ${opts.pair} placed without a fixed-dollar profit target.` : `Order placed without a fixed-dollar profit target.`,
+    `Positions will use strategy SL/TP and trade-manager protection (break-even, profit-lock, trailing, decay, time-exit).`,
     ``,
-    `Set <b>Fixed USD Target</b> on the AutoTrade page to enable.`,
+    `This is informational — set <b>Fixed USD Target</b> only if you want fixed-dollar closes.`,
   ].join('\n')
   await send(lines)
 }

@@ -993,6 +993,10 @@ const PREDLOG_MAX_AGE_MS = PREDICTION_MAX_AGE_MS          // window + 60s margin
 // unresolved rows still resolve even while the market is closed / the sweep
 // loop is paused. Observability only — never touches execution.
 const EXPIRED_PENDING_SCAN_MS = 60 * 1000
+// Authoritative execution signal TTL (seconds) — shared with /api/orders and the
+// signal API (SIGNAL_MAX_AGE_SECONDS). A closed-M5-candle entry is actionable
+// only while the evaluated candle is fresh.
+const SIGNAL_MAX_AGE_SECONDS = parseInt(process.env.SIGNAL_MAX_AGE_SECONDS || '150', 10)
 const predLogs = new Map()                     // id → { pair, direction, entry, sl, tp, at, minP, maxP, sampled }
 
 function trackPredictionLog(id, pair, direction, entry, sl, tp) {
@@ -1438,13 +1442,16 @@ async function placeOrder(pair, direction, signal, section = 'scalp') {
       aiConfidence:        signal.confidence,
       checklistScore:      (signal.reasons || []).length,
       currentPrice:        signal.entry,
+      signalPrice:         signal.entry,
       userId:              WORKER_USER_ID || undefined,
       maxConcurrentTrades: liveStrategy.maxPositions,
       // Audit attribution — see 20260606_trades_source_tracking migration.
       source,
       source_sl_pips:      sourceSlPips,
       source_tp_pips:      sourceTpPips,
-      signal_at:           nowIso,
+      // Canonical signal time: anchored to the server's candle-evaluation time so
+      // the /api/orders TTL checks real signal age, not the fetch time.
+      signal_at:           signal?.prediction?.startsAt ?? nowIso,
       signal_confidence:   signal.confidence,
       signal_id_ref:       signalRef,
     }),
@@ -1463,8 +1470,8 @@ async function processSignal(pair, tick, strategy, session, direction) {
   // catch up mid-candle after a long pause the newest closed candle can be
   // minutes old — executing at its close price would be a stale entry. Skip
   // before any AI spend; a closed candle is only actionable when recent.
-  if (tick && typeof tick.closedCandleAgeSec === 'number' && tick.closedCandleAgeSec > 150) {
-    console.log(`[stale-candle] ${pair} — latest closed candle age ${Math.round(tick.closedCandleAgeSec)}s > 150s — skipping (no stale entries)`)
+  if (tick && typeof tick.closedCandleAgeSec === 'number' && tick.closedCandleAgeSec > SIGNAL_MAX_AGE_SECONDS) {
+    console.log(`[stale-candle] ${pair} — latest closed candle age ${Math.round(tick.closedCandleAgeSec)}s > ${SIGNAL_MAX_AGE_SECONDS}s — skipping (no stale entries)`)
     wlog('info', `Skipped stale closed candle (age ${Math.round(tick.closedCandleAgeSec)}s) — safe skip, waiting for a fresh close`, {
       pair, session, metadata: { closedCandleTime: tick.candleCloseTime ?? null, reason: 'closed_candle_too_old' },
     })
@@ -2441,13 +2448,13 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
     const acct0 = await apiFetch('/api/account').catch(() => null)
     const ptUsd = Number(acct0?.profitFixedUsd ?? 0)
     if (!isFinite(ptUsd) || ptUsd <= 0) {
-      console.warn(`[worker] WARNING — profit-target disabled (profitFixedUsd=${acct0?.profitFixedUsd ?? 'null'}). Trades will rely on SL/TP/trail/decay only.`)
-      wlog('warn', 'Profit target disabled at worker startup', { metadata: { profitFixedUsd: acct0?.profitFixedUsd ?? null } })
+      console.warn(`[worker] INFO — fixed-USD profit close disabled (profitFixedUsd=${acct0?.profitFixedUsd ?? 'null'}). AUTO TRADE REMAINS ACTIVE — positions use strategy SL/TP + trade-manager protection.`)
+      wlog('info', 'Fixed USD profit close disabled — Auto Trade remains active', { metadata: { profitFixedUsd: acct0?.profitFixedUsd ?? null } })
       await tgSend(
-        `⚠️ <b>PROFIT TARGET DISABLED</b>\n\n` +
-        `Worker started but <code>profitFixedUsd</code> is 0 / null.\n` +
-        `Trades will rely on SL / TP / trailing stop / decay exit only.\n\n` +
-        `Set <b>Fixed USD Target</b> on the AutoTrade page to enable.`
+        `ℹ️ <b>FIXED USD PROFIT CLOSE DISABLED — AUTO TRADE REMAINS ACTIVE</b>\n\n` +
+        `Worker started with <code>profitFixedUsd</code> = 0 / null.\n` +
+        `Positions will use strategy SL/TP and trade-manager protection (break-even, profit-lock, trailing, decay, time-exit).\n\n` +
+        `This is informational — set <b>Fixed USD Target</b> only if you want fixed-dollar closes.`
       ).catch(() => {})
     } else {
       console.log(`[worker] Profit target: $${ptUsd.toFixed(2)} × ${acct0?.profitTargetPct ?? '?'}% = $${(ptUsd * (acct0?.profitTargetPct ?? 0) / 100).toFixed(2)} per-trade close`)

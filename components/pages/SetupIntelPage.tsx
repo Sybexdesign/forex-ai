@@ -221,6 +221,11 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
               {dh.execution?.available && (
                 <span>Execution 7d: <b>{dh.execution.open ?? 0}</b> open · <b>{dh.execution.closed ?? 0}</b> closed · net-P&L missing {dh.execution.closedMissingNetPnl ?? 0} · no broker ticket {dh.execution.missingBrokerTicket ?? 0} · no signal link {dh.execution.missingSignalLink ?? 0}</span>
               )}
+              {dh.autoTradeHealth && (
+                <span style={{ color: dh.autoTradeHealth.status === 'HEALTHY' ? '#4ade80' : '#ffb800' }}>
+                  AUTO TRADE HEALTH: <b>{dh.autoTradeHealth.status}</b>{dh.autoTradeHealth.marketData?.feedAgeSec != null ? ` · feed ${dh.autoTradeHealth.marketData.feedAgeSec}s` : ''}{dh.autoTradeHealth.signals?.sigCheckAgeSec != null ? ` · last signal check ${dh.autoTradeHealth.signals.sigCheckAgeSec}s ago` : ''}
+                </span>
+              )}
               <span>Worker: <b>{dh.worker?.alive ? 'ALIVE' : 'DOWN'}</b> {dh.worker?.lastSeenAt ? '· last ' + dh.worker.lastSeenAt.slice(11, 19) + ' UTC' : ''}</span>
             </div>
           )}

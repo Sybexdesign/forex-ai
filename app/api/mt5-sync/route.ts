@@ -5,6 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 import { manageTrades } from '@/lib/trade-manager'
+import { mergeTradeState } from '@/lib/trade-state.mjs'
 import { alertRiskBreach, alertProfitReversal, alertCircuitBreaker } from '@/lib/telegram'
 import { normaliseExecution, EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 
@@ -382,6 +383,9 @@ export async function POST(req: NextRequest) {
       ? openPositions
       : (row.config?.openPositions || [])
     let tradeState: Record<string, any> = row.config?.tradeState || {}
+    // Monotonic sequence for the persisted state so a stale/cold-start writer can
+    // never regress newer management state (see fresh-read merge below).
+    let stateSeq = Number(row.config?.stateSeq ?? 0)
 
     if (activePositions.length > 0) {
       const { tradeState: nextState, commands, log, riskEvents } = manageTrades(
@@ -393,7 +397,10 @@ export async function POST(req: NextRequest) {
         // trade-manager enforces the absolute USD cap dynamically per user.
         { accountBalance: balance, riskPct, hardCapMultiplier },
       )
-      tradeState = nextState
+      // Monotonic merge — protection markers (BE/partial-lock applied, peak
+      // profit, original open time, reversal-alert sent) are sticky across
+      // restarts and cannot be regressed by an older or overlapping writer.
+      tradeState = mergeTradeState(row.config?.tradeState || {}, nextState)
       for (const line of log) console.log(line)
 
       // Fix 8 — fire Telegram alerts for any hard-cap or emergency-1.5R breach.
@@ -436,6 +443,20 @@ export async function POST(req: NextRequest) {
       }).catch(() => {})
     }
 
+    // ── Restart / cold-start overlap safety ────────────────────────────────
+    // Re-read the latest stored config immediately before writing. If a newer
+    // writer (higher stateSeq) already persisted management state while we were
+    // computing, merge it in monotonically so this older request can never
+    // regress peak-profit / BE / partial-lock markers.
+    try {
+      const latest = await sb.from('broker_configs').select('config').eq('id', row.id).single()
+      const lc = latest.data?.config
+      if (lc && Number(lc.stateSeq ?? 0) > stateSeq) {
+        stateSeq = Number(lc.stateSeq)
+        tradeState = mergeTradeState(tradeState, lc.tradeState || {})
+      }
+    } catch { /* best-effort — the monotonic merge above already protects state */ }
+
     // ── Update broker config with latest balance ──────────────────────────
     const updatedConfig = {
       ...row.config,
@@ -449,6 +470,7 @@ export async function POST(req: NextRequest) {
       latestPrices,
       candleCache,
       tradeState,
+      stateSeq: stateSeq + 1,
       openPositions: activePositions,
       lastLabelAt: labelDue ? now : (row.config?.lastLabelAt ?? now),
     }
