@@ -7,6 +7,7 @@ export const dynamic = 'force-dynamic'
 
 import { NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
+import { classifyAutoTradeHealth } from '@/lib/auto-trade-health.mjs'
 
 const iso = (h: number) => new Date(Date.now() - h * 3600_000).toISOString()
 
@@ -96,13 +97,12 @@ export async function GET(request: Request) {
       }
     } catch { /* Phase 4 columns not applied yet — execution health unavailable */ }
 
-    // ── Auto Trade / Signal health (distinguishes "engine running but producing
-    // HOLD" from "engine stalled / feed stale / worker offline"). ──────────────
+    // ── Auto Trade / Signal health (account-scoped classifier) ───────────────
     let autoTradeHealth: any = { available: true }
     try {
-      // Optional explicit account/config identifier. When absent we analyse the
-      // primary (most recently synced) ACTIVE account — but we NEVER hide a
-      // stale sibling account behind it.
+      // Optional explicit account/config identifier. When absent the classifier
+      // targets the newest ACTIVE account — but sibling accounts are always
+      // listed so one healthy account can never mask a stale one.
       const url = new URL(request?.url ?? 'http://local')
       const configId = url.searchParams.get('configId')?.trim() || null
 
@@ -112,91 +112,57 @@ export async function GET(request: Request) {
         .limit(300)
       const rows = logsResp.data || []
 
-      // Account-scoped feed analysis. Every broker_configs row is an account/
-      // broker configuration. Global 'most recent row' liveness is replaced by a
-      // per-account feed list so one healthy account can never mask another
-      // stale one.
+      // Account rows (ids passed to the classifier for internal selection only —
+      // the classifier never emits raw ids; only anonymised acct-<n> labels).
       const cfgRes = await admin.from('broker_configs')
-        .select('id,user_id,is_active,updated_at')
+        .select('id,is_active,updated_at')
         .order('updated_at', { ascending: false })
-      const cfgs = (cfgRes.data || []).map((c: any) => {
-        const ageSec = c.updated_at
-          ? Math.round((Date.now() - new Date(c.updated_at).getTime()) / 1000) : null
-        return {
-          configId: c.id,
-          account: (c.user_id || String(c.id)).slice(0, 8),
-          isActive: !!c.is_active,
-          lastSyncAt: c.updated_at ?? null,
-          feedAgeSec: ageSec,
-          fresh: ageSec !== null && ageSec <= 600,
-        }
-      })
+      const cfgRows = (cfgRes.data || []).map((c: any) => ({
+        id: String(c.id),
+        isActive: !!c.is_active,
+        lastSyncMs: c.updated_at ? new Date(c.updated_at).getTime() : null,
+      }))
 
       const nowMsH = Date.now()
       const lastSeenMs = lastSeen ? new Date(lastSeen).getTime() : null
-      const feedList = cfgs.filter((c: any) => c.lastSyncAt)
-      const primary = configId
-        ? feedList.find((c: any) => c.configId === configId) ?? feedList[0] ?? null
-        : feedList[0] ?? null
-      const activeAccounts = cfgs.filter((c: any) => c.isActive)
-      const staleActive = activeAccounts.filter((c: any) => !c.fresh)
-      const feedAt = primary?.lastSyncAt ?? null
-      const feedAgeSec = primary?.feedAgeSec ?? null
-      const feedFresh = !!primary?.fresh
-      const anyActiveStale = staleActive.length > 0
 
-      let lastSigCheckAt: string | null = null
-      let lastSignalAt: string | null = null
-      let lastOrderAt: string | null = null
-      let lastActionableAt: string | null = null
-      let lastHoldAt: string | null = null
+      let lastSigCheckMs: number | null = null
+      let lastSignalMs: number | null = null
+      let lastOrderMs: number | null = null
+      let lastActionableMs: number | null = null
+      let lastHoldMs: number | null = null
       let marketOpen: boolean | null = null
-      let staleLikeLogCount = 0
+      // Phase J — distinct observable counters. A routinely-old closed candle is
+      // operational filtering (staleCandleSkip), NOT an order-level rejection.
+      const gates = { staleCandleSkip: 0, staleSignalReject: 0, duplicateSignalReject: 0, entryDriftReject: 0 }
       for (const r of rows) {
         const m = r.metadata || {}
-        if (lastSigCheckAt === null && (m.sigChecks || 0) > 0) lastSigCheckAt = r.created_at
+        if (lastSigCheckMs === null && (m.sigChecks || 0) > 0) lastSigCheckMs = new Date(r.created_at).getTime()
         if (marketOpen === null && m.market) marketOpen = String(m.market).includes('OPEN')
         const msg = String(r.message || '')
+        const gateHit = String(m.gate || '')
         if (r.level === 'signal') {
-          if (lastSignalAt === null) lastSignalAt = r.created_at
-          if (/HOLD/.test(msg) && lastHoldAt === null) lastHoldAt = r.created_at
-          if (!/HOLD/.test(msg) && lastActionableAt === null) lastActionableAt = r.created_at
+          if (lastSignalMs === null) lastSignalMs = new Date(r.created_at).getTime()
+          if (/HOLD/.test(msg) && lastHoldMs === null) lastHoldMs = new Date(r.created_at).getTime()
+          if (!/HOLD/.test(msg) && lastActionableMs === null) lastActionableMs = new Date(r.created_at).getTime()
         }
-        if (r.level === 'order' && lastOrderAt === null) lastOrderAt = r.created_at
-        if (/skipped-outside-overlap|skipped-stale|stale closed candle|REJECTED stale_signal|entry_drift|duplicate_signal/i.test(msg)) staleLikeLogCount++
+        if (r.level === 'order' && lastOrderMs === null) lastOrderMs = new Date(r.created_at).getTime()
+        if (/stale closed candle/i.test(msg)) gates.staleCandleSkip++
+        else if (/stale_signal|signal expired/i.test(msg) || gateHit === 'stale_signal') gates.staleSignalReject++
+        else if (/duplicate_signal|duplicate execution/i.test(msg) || gateHit === 'duplicate_signal') gates.duplicateSignalReject++
+        else if (/entry_drift|beyond entry/i.test(msg) || gateHit === 'entry_drift') gates.entryDriftReject++
       }
-      const workerAlive = lastSeenMs !== null && (nowMsH - lastSeenMs) < 180_000
-      const workerAgeSec = lastSeenMs !== null ? Math.round((nowMsH - lastSeenMs) / 1000) : null
-      const sigCheckAgeSec = lastSigCheckAt ? Math.round((nowMsH - new Date(lastSigCheckAt).getTime()) / 1000) : null
-      const engineStalled = workerAlive && (marketOpen === true || marketOpen === null) &&
-        (sigCheckAgeSec === null || sigCheckAgeSec > 300)
-      const marketStale = (!feedFresh && feedAgeSec !== null) || anyActiveStale
-      const status = !workerAlive ? 'WORKER OFFLINE'
-        : marketStale ? (feedFresh && anyActiveStale ? 'WARNING' : 'MARKET DATA STALE')
-        : engineStalled ? 'SIGNAL ENGINE STALLED'
-        : 'HEALTHY'
-      autoTradeHealth = {
-        status,
-        scope: configId ? { mode: 'config', configId } : { mode: 'primary-active' },
-        accounts: cfgs,
-        worker: { alive: workerAlive, lastHeartbeatAt: lastSeen, heartbeatAgeSec: workerAgeSec },
-        marketData: {
-          lastUpdateAt: feedAt, feedAgeSec, fresh: feedFresh,
-          account: primary?.account ?? null,
-          accountCount: feedList.length,
-          activeAccountCount: activeAccounts.length,
-          staleActiveAccounts: staleActive.length,
-        },
-        signals: {
-          engineRunning: sigCheckAgeSec !== null && sigCheckAgeSec <= 300,
-          lastSigCheckAt, sigCheckAgeSec,
-          lastSignalAt, lastActionableAt, lastHoldAt,
-          note: marketOpen === false
-            ? 'Market closed — no signal evaluation expected (not a stall).'
-            : 'Engine is running; HOLD signals are normal strategy output, not a stall.',
-        },
-        execution: { lastOrderAt, rejectedStaleLikeLogsInWindow: staleLikeLogCount },
-      }
+
+      autoTradeHealth = classifyAutoTradeHealth({
+        nowMs: nowMsH,
+        configId,
+        accounts: cfgRows,
+        workerLastSeenMs: lastSeenMs,
+        lastSigCheckMs,
+        marketOpen,
+        events: { lastSignalMs, lastActionableMs, lastHoldMs, lastOrderMs },
+        gates,
+      })
     } catch { autoTradeHealth = { available: false } }
 
     return NextResponse.json({
