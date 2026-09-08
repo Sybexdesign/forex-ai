@@ -223,7 +223,7 @@ export default function SetupIntelPage({ userId }: SetupIntelPageProps) {
               )}
               {dh.autoTradeHealth && (
                 <span style={{ color: dh.autoTradeHealth.status === 'HEALTHY' ? '#4ade80' : '#ffb800' }}>
-                  AUTO TRADE HEALTH: <b>{dh.autoTradeHealth.status}</b>{dh.autoTradeHealth.marketData?.feedAgeSec != null ? ` · feed ${dh.autoTradeHealth.marketData.feedAgeSec}s` : ''}{dh.autoTradeHealth.signals?.sigCheckAgeSec != null ? ` · last signal check ${dh.autoTradeHealth.signals.sigCheckAgeSec}s ago` : ''}
+                  AUTO TRADE HEALTH: <b>{dh.autoTradeHealth.status}</b>{dh.autoTradeHealth.marketData?.accountCount != null ? ` · ${dh.autoTradeHealth.marketData.accountCount} account(s)` : ''}{dh.autoTradeHealth.marketData?.feedAgeSec != null ? ` · feed ${dh.autoTradeHealth.marketData.feedAgeSec}s` : ''}{dh.autoTradeHealth.marketData?.staleActiveAccounts ? ` · ⚠ ${dh.autoTradeHealth.marketData.staleActiveAccounts} stale active account(s)` : ''}{dh.autoTradeHealth.signals?.sigCheckAgeSec != null ? ` · last signal check ${dh.autoTradeHealth.signals.sigCheckAgeSec}s ago` : ''}
                 </span>
               )}
               <span>Worker: <b>{dh.worker?.alive ? 'ALIVE' : 'DOWN'}</b> {dh.worker?.lastSeenAt ? '· last ' + dh.worker.lastSeenAt.slice(11, 19) + ' UTC' : ''}</span>

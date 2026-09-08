@@ -24,7 +24,7 @@ async function count(table: string, col: string, gte?: string, extra: Record<str
   return typeof c === 'number' ? c : 0
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
     const admin = getAdminClient()
     const h24 = iso(24), d7 = iso(24 * 7), d30 = iso(24 * 30)
@@ -100,17 +100,50 @@ export async function GET() {
     // HOLD" from "engine stalled / feed stale / worker offline"). ──────────────
     let autoTradeHealth: any = { available: true }
     try {
+      // Optional explicit account/config identifier. When absent we analyse the
+      // primary (most recently synced) ACTIVE account — but we NEVER hide a
+      // stale sibling account behind it.
+      const url = new URL(request?.url ?? 'http://local')
+      const configId = url.searchParams.get('configId')?.trim() || null
+
       const logsResp = await admin.from('worker_logs')
         .select('level,message,metadata,created_at')
         .order('created_at', { ascending: false })
         .limit(300)
       const rows = logsResp.data || []
-      const feedRes = await admin.from('broker_configs')
-        .select('updated_at').order('updated_at', { ascending: false }).limit(1)
+
+      // Account-scoped feed analysis. Every broker_configs row is an account/
+      // broker configuration. Global 'most recent row' liveness is replaced by a
+      // per-account feed list so one healthy account can never mask another
+      // stale one.
+      const cfgRes = await admin.from('broker_configs')
+        .select('id,user_id,is_active,updated_at')
+        .order('updated_at', { ascending: false })
+      const cfgs = (cfgRes.data || []).map((c: any) => {
+        const ageSec = c.updated_at
+          ? Math.round((Date.now() - new Date(c.updated_at).getTime()) / 1000) : null
+        return {
+          configId: c.id,
+          account: (c.user_id || String(c.id)).slice(0, 8),
+          isActive: !!c.is_active,
+          lastSyncAt: c.updated_at ?? null,
+          feedAgeSec: ageSec,
+          fresh: ageSec !== null && ageSec <= 600,
+        }
+      })
+
       const nowMsH = Date.now()
       const lastSeenMs = lastSeen ? new Date(lastSeen).getTime() : null
-      const feedAt = feedRes.data?.[0]?.updated_at ?? null
-      const feedAgeSec = feedAt ? Math.round((nowMsH - new Date(feedAt).getTime()) / 1000) : null
+      const feedList = cfgs.filter((c: any) => c.lastSyncAt)
+      const primary = configId
+        ? feedList.find((c: any) => c.configId === configId) ?? feedList[0] ?? null
+        : feedList[0] ?? null
+      const activeAccounts = cfgs.filter((c: any) => c.isActive)
+      const staleActive = activeAccounts.filter((c: any) => !c.fresh)
+      const feedAt = primary?.lastSyncAt ?? null
+      const feedAgeSec = primary?.feedAgeSec ?? null
+      const feedFresh = !!primary?.fresh
+      const anyActiveStale = staleActive.length > 0
 
       let lastSigCheckAt: string | null = null
       let lastSignalAt: string | null = null
@@ -135,17 +168,25 @@ export async function GET() {
       const workerAlive = lastSeenMs !== null && (nowMsH - lastSeenMs) < 180_000
       const workerAgeSec = lastSeenMs !== null ? Math.round((nowMsH - lastSeenMs) / 1000) : null
       const sigCheckAgeSec = lastSigCheckAt ? Math.round((nowMsH - new Date(lastSigCheckAt).getTime()) / 1000) : null
-      const feedFresh = feedAgeSec !== null && feedAgeSec <= 600
       const engineStalled = workerAlive && (marketOpen === true || marketOpen === null) &&
         (sigCheckAgeSec === null || sigCheckAgeSec > 300)
+      const marketStale = (!feedFresh && feedAgeSec !== null) || anyActiveStale
       const status = !workerAlive ? 'WORKER OFFLINE'
-        : (!feedFresh && feedAgeSec !== null) ? 'MARKET DATA STALE'
+        : marketStale ? (feedFresh && anyActiveStale ? 'WARNING' : 'MARKET DATA STALE')
         : engineStalled ? 'SIGNAL ENGINE STALLED'
         : 'HEALTHY'
       autoTradeHealth = {
         status,
+        scope: configId ? { mode: 'config', configId } : { mode: 'primary-active' },
+        accounts: cfgs,
         worker: { alive: workerAlive, lastHeartbeatAt: lastSeen, heartbeatAgeSec: workerAgeSec },
-        marketData: { lastUpdateAt: feedAt, feedAgeSec, fresh: feedFresh },
+        marketData: {
+          lastUpdateAt: feedAt, feedAgeSec, fresh: feedFresh,
+          account: primary?.account ?? null,
+          accountCount: feedList.length,
+          activeAccountCount: activeAccounts.length,
+          staleActiveAccounts: staleActive.length,
+        },
         signals: {
           engineRunning: sigCheckAgeSec !== null && sigCheckAgeSec <= 300,
           lastSigCheckAt, sigCheckAgeSec,
