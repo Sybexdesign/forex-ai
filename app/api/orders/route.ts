@@ -100,6 +100,45 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // ─── Final signal freshness / duplication validation (execution audit) ───
+    // Authoritative server-side checks just before any order is sent. A stale or
+    // already-executed signal must never be filled simply because it is the most
+    // recently stored one. Missing fields (legacy/manual callers) skip the check;
+    // these guards are additive and never block a genuinely fresh order.
+    const _now = Date.now()
+    const sigAtMs = typeof body.signal_at === 'string' ? new Date(body.signal_at).getTime() : NaN
+    if (Number.isFinite(sigAtMs)) {
+      const sigAgeSec = Math.round((_now - sigAtMs) / 1000)
+      const SIGNAL_TTL_SEC = 5 * 60
+      if (sigAgeSec > SIGNAL_TTL_SEC) {
+        const reason = `Signal expired — ${sigAgeSec}s old (max ${SIGNAL_TTL_SEC}s). A fresh closed-candle signal is required.`
+        console.warn(`[orders] REJECTED stale_signal — ${pair} ${direction} age=${sigAgeSec}s`)
+        return NextResponse.json({ success: false, blocked: true, reasons: [reason], gate: 'stale_signal' }, { status: 422 })
+      }
+    }
+    const refEntry = Number(body.signalPrice)
+    const execRef  = Number(body.currentPrice)
+    if (Number.isFinite(refEntry) && Number.isFinite(execRef) && refEntry > 0 && execRef > 0) {
+      const driftPct = (Math.abs(execRef - refEntry) / refEntry) * 100
+      if (driftPct > 0.25) {
+        const reason = `Price moved beyond entry tolerance — reference ${refEntry} vs live ${execRef} (${driftPct.toFixed(2)}% > 0.25%). Re-scan for a fresh signal.`
+        console.warn(`[orders] REJECTED entry_drift — ${pair} ${direction} drift=${driftPct.toFixed(2)}%`)
+        return NextResponse.json({ success: false, blocked: true, reasons: [reason], gate: 'entry_drift' }, { status: 422 })
+      }
+    }
+    if (typeof body.signal_id_ref === 'string' && body.signal_id_ref && userId) {
+      try {
+        const dupRes = await getAdminClient()
+          .from('trades').select('id').eq('user_id', userId)
+          .eq('signal_id_ref', body.signal_id_ref).eq('result', 'OPEN').maybeSingle()
+        if (dupRes.data) {
+          const reason = 'Duplicate execution — an OPEN trade already exists for this signal'
+          console.warn(`[orders] REJECTED duplicate_signal — ${pair} ${direction} ref=${body.signal_id_ref} openTrade=${dupRes.data.id}`)
+          return NextResponse.json({ success: false, blocked: true, reasons: [reason], gate: 'duplicate_signal' }, { status: 422 })
+        }
+      } catch { /* duplicate check is best-effort */ }
+    }
+
     // ─── Account protection: equity ratio guard ───────────────────────────
     // Block new trades if floating losses have consumed more than 25% of balance.
     // Only runs when broker data is confirmed live (brokerSynced) — skipped if
