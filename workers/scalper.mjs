@@ -2442,6 +2442,14 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   console.log(`[worker] Poll   : ${POLL_MS / 1000}s | Alert threshold: ≥${liveStrategy.minStrength}%`)
   console.log(`[worker] Window : London-NY Overlap 12:00-13:59 UTC weekdays only`)
   console.log(`[worker] Status : ${isLondonNYOverlap() ? '🟢 OVERLAP ACTIVE' : '⚪ closed — next: ' + nextOverlapInfo()}`)
+  // Profit-giveback protection shadow mode (audit 2026-09-09): report the
+  // effective configuration at startup. SAFE DEFAULT = SHADOW (the new ratchet
+  // computes/logs only — SL/close are never modified by it; existing BE/trail/
+  // decay operate normally). Live requires PROFIT_PROTECTION_MODE=live.
+  const forceShadow = process.env.PROFIT_PROTECTION_SHADOW_MODE === 'true'
+  const ppMode = forceShadow || (process.env.PROFIT_PROTECTION_MODE || 'shadow') !== 'live' ? 'shadow' : 'live'
+  console.log(`[worker] PROFIT PROTECTION = ${ppMode === 'shadow' ? 'SHADOW (new giveback ratchet logs only — SL/close NOT modified)' : 'LIVE (new giveback ratchet active)'}`)
+  wlog('info', ppMode === 'shadow' ? 'Profit protection shadow mode' : 'Profit protection live mode', { metadata: { profitProtectionMode: ppMode } })
   // Profit-target safety check — surface a warning if profitFixedUsd is 0 or
   // null so the operator notices before trades start firing without a TP.
   try {

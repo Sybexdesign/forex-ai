@@ -388,6 +388,13 @@ export async function POST(req: NextRequest) {
     let stateSeq = Number(row.config?.stateSeq ?? 0)
 
     if (activePositions.length > 0) {
+      // Shadow mode: the NEW peak-giveback ratchet logs only — it must never
+      // modify SL or close because of its own rule. Existing BE/trail/decay are
+      // unaffected. SAFE DEFAULT = shadow; live requires explicit opt-in:
+      //   PROFIT_PROTECTION_SHADOW_MODE=true  (forces shadow, observation)
+      //   PROFIT_PROTECTION_MODE=live          (explicit enable of the new rule)
+      const forceShadow = process.env.PROFIT_PROTECTION_SHADOW_MODE === 'true'
+      const shadowProtection = forceShadow || (process.env.PROFIT_PROTECTION_MODE || 'shadow') !== 'live'
       const { tradeState: nextState, commands, log, riskEvents, telemetry } = manageTrades(
         activePositions,
         latestPrices,
@@ -395,9 +402,7 @@ export async function POST(req: NextRequest) {
         tradeState,
         // Fix 8 — pass live balance + user's riskPct + hardCapMultiplier so
         // trade-manager enforces the absolute USD cap dynamically per user.
-        { accountBalance: balance, riskPct, hardCapMultiplier,
-          // Shadow mode: new peak-giveback ratchet logs only — never modifies/close.
-          shadowProtection: process.env.PROFIT_PROTECTION_SHADOW_MODE === 'true' },
+        { accountBalance: balance, riskPct, hardCapMultiplier, shadowProtection },
       )
       // Monotonic merge — protection markers (BE/partial-lock applied, peak
       // profit, original open time, reversal-alert sent) are sticky across
@@ -407,7 +412,10 @@ export async function POST(req: NextRequest) {
       // Profit-giveback telemetry (audit 2026-09-09): emitted on protection
       // decisions and ~60s periodic while a trade is in profit.
       for (const t of telemetry) {
-        console.log(`[tm-telemetry] ${t.pair}#${t.ticket} stage=${t.protectionStage} profit=$${t.currentProfit.toFixed(2)} peak=$${t.peakProfit.toFixed(2)} retained=${t.retainedPct !== null ? (t.retainedPct * 100).toFixed(1) : '?'}% giveback=${t.givebackPct !== null ? (t.givebackPct * 100).toFixed(1) : '?'}% R=${t.currentR.toFixed(2)} peakR=${t.peakR.toFixed(2)} sl=${t.currentSl} proposedSl=${t.proposedSl ?? '—'} targetFloor=$${t.floorUsd != null ? t.floorUsd.toFixed(2) : '—'} action=${t.action ?? 'none'} ${t.shadow ? '[SHADOW]' : '[LIVE]'}`)
+        console.log(`[tm-telemetry] ${t.pair}#${t.ticket} ${t.direction} lots=${t.lots} open=${t.openPrice} initSL=${t.initialSl} risk=$${(t.plannedRiskUsd ?? 0).toFixed(2)} profit=$${t.currentProfit.toFixed(2)} peak=$${t.peakProfit.toFixed(2)} retained=${t.retainedPct != null ? (t.retainedPct * 100).toFixed(1) : '?'}% giveback=${t.givebackPct != null ? (t.givebackPct * 100).toFixed(1) : '?'}% R=${t.currentR.toFixed(2)} peakR=${t.peakR.toFixed(2)} stage=${t.protectionStage} targetFloor=$${t.targetFloorUsd != null ? t.targetFloorUsd.toFixed(2) : '—'} proposedSl=${t.proposedProtectionSl ?? '—'} liveSl=${t.currentLiveSl} existing=${t.existingManagerAction ?? 'none'} decision=${t.shadowDecision} ${t.shadow ? '[SHADOW]' : '[LIVE]'}`)
+      }
+      if (telemetry.length > 0 && shadowProtection) {
+        console.log('[mt5-sync] PROFIT PROTECTION = SHADOW — new giveback ratchet computes/logs only; SL/close NOT modified by it (existing BE/trail/decay untouched)')
       }
 
       // Fix 8 — fire Telegram alerts for any hard-cap or emergency-1.5R breach.

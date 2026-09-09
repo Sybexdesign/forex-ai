@@ -69,22 +69,31 @@ export interface ManageResult {
    */
   telemetry:  Array<{
     ticket:        number | string
+    tradeId?:      string | null      // DB id — linked in mt5-sync when matched (null here)
     pair:          string
+    direction:     'BUY' | 'SELL'
+    lots:          number
+    openPrice:     number
+    initialSl:     number
+    currentPrice:  number | null
     currentProfit: number
     peakProfit:    number
-    retainedPct:   number | null
-    givebackPct:   number | null
+    plannedRiskUsd: number            // exact runtime 1R (entry→initialSL × pvpl × lots)
     currentR:      number
     peakR:         number
+    retainedPct:   number | null
+    givebackPct:   number | null
     protectionStage: string
-    currentSl:     number
-    proposedSl:    number | null
+    targetFloorUsd: number | null
+    proposedProtectionSl: number | null
+    currentLiveSl: number
+    existingManagerAction: string | null
+    shadowDecision: string            // NONE | WOULD_MOVE_SL | WOULD_MOVE_SL_TO_BE |
+                                      // WOULD_CLOSE | MOVED_SL | BLOCKED_BY_MIN_STOP |
+                                      // EXISTING_RULE_MORE_PROTECTIVE | EXISTING_*_CLOSE | SHADOW_ONLY
     action:        string | null
     actionAt:      string | null
     shadow?:       boolean
-    // Intended (target) protection floor in $ and as a fraction of peak — an
-    // intent under normal execution, NOT a guaranteed realised profit (spread,
-    // slippage, gaps and modification latency can change the fill).
     floorUsd?:     number
     floorPct?:     number
   }>
@@ -324,6 +333,40 @@ export function manageTrades(
     const midPx = px ? (dir === 'BUY' ? px.bid : px.ask) : 0
 
     let newSl: number | null = null
+    // Which existing rule last improved the stop (for shadow telemetry so we can
+    // tell EXISTING_RULE_MORE_PROTECTIVE apart from the new ratchet).
+    let existingManagerAction: string | null = null
+
+    // Close-telemetry emitter for EXISTING rules (peak-BE / time-exit / decay) so
+    // shadow analysis sees every profit-management closure with full runtime R.
+    const emitCloseTelemetry = (rule: string): void => {
+      telemetry.push({
+        ticket: pos.ticket,
+        tradeId: null,
+        pair,
+        direction: dir,
+        lots: pos.lots,
+        openPrice: pos.openPrice,
+        initialSl: originalSl,
+        currentPrice: midPx > 0 ? midPx : null,
+        currentProfit: pos.profit,
+        peakProfit,
+        plannedRiskUsd: initialRiskUsd,
+        currentR,
+        peakR: peakProfit / initialRiskUsd,
+        retainedPct: peakProfit > 0 ? pos.profit / peakProfit : null,
+        givebackPct: peakProfit > 0 ? (peakProfit - pos.profit) / peakProfit : null,
+        protectionStage: state.protectionStage || 'DEVELOP',
+        targetFloorUsd: state.retentionFloorUsd ?? null,
+        proposedProtectionSl: null,
+        currentLiveSl: pos.sl,
+        existingManagerAction,
+        shadowDecision: `EXISTING_${rule}_CLOSE`,
+        action: `${rule.toLowerCase().replace(/_/g, '-')}-close`,
+        actionAt: new Date(now).toISOString(),
+        shadow: shadowProtection,
+      })
+    }
 
     // ── 1. Break-even at +1R ────────────────────────────────────────────────
     if (!state.beApplied && currentR >= BE_TRIGGER_R) {
@@ -331,6 +374,7 @@ export function manageTrades(
       if (beImproves) {
         newSl           = originalEntry
         state.beApplied = true
+        existingManagerAction = 'BE'
         log.push(`[tm] ${sym}#${key} BE: R=${currentR.toFixed(2)} → SL to entry ${originalEntry}`)
       }
     }
@@ -346,6 +390,7 @@ export function manageTrades(
         : lockSl < (newSl ?? pos.sl)
       if (lockImproves) {
         newSl = lockSl
+        existingManagerAction = 'PARTIAL_LOCK'
         log.push(`[tm] ${sym}#${key} partial-lock: R=${currentR.toFixed(2)} → SL to +0.5R=${lockSl.toFixed(dp)}`)
       }
     }
@@ -365,6 +410,7 @@ export function manageTrades(
       const betterPrev = dir === 'BUY' ? trailSl > (newSl ?? pos.sl) : trailSl < (newSl ?? pos.sl)
       if (inProfit && betterLive && betterPrev) {
         newSl = trailSl
+        existingManagerAction = 'ATR_TRAIL'
         log.push(`[tm] ${sym}#${key} trail: price=${midPx} ATR=${atr.toFixed(dp)} → SL=${trailSl.toFixed(dp)}`)
       }
     }
@@ -398,6 +444,7 @@ export function manageTrades(
       }
       if (g.close && pp.closeRequested) {
         log.push(`[tm] ${sym}#${key} GIVEBACK-COLLAPSE-CLOSE: peak=$${peakProfit.toFixed(2)} now=$${pos.profit.toFixed(2)} stage=${pp.stage} floor=$${pp.floorUsd.toFixed(2)}`)
+        emitCloseTelemetry('GIVEBACK_COLLAPSE')
         commands.push({
           id: crypto.randomUUID(), type: 'close', symbol: sym, ticket: pos.ticket,
           createdAt: new Date(now).toISOString(), expiresAt: nowSec + CMD_TTL_S,
@@ -410,21 +457,38 @@ export function manageTrades(
       const periodicDue = (now - (state.telemetryAt || 0)) > 60_000
       if (pp.action !== null || pp.closeRequested || periodicDue) {
         state.telemetryAt = now
+        const ppx = pp.action === 'early-giveback-be'
+        const shadowDecisionToken = shadowProtection
+          ? (pp.closeRequested ? 'WOULD_CLOSE' : pp.newSl !== null ? (ppx ? 'WOULD_MOVE_SL_TO_BE' : 'WOULD_MOVE_SL') : 'NONE')
+          : (adopted ? (ppx ? 'WOULD_MOVE_SL_TO_BE' : 'MOVED_SL')
+            : (pp.newSl !== null && !pp.closeRequested ? 'EXISTING_RULE_MORE_PROTECTIVE' : 'NONE'))
         telemetry.push({
-          ticket: pos.ticket, pair,
-          currentProfit: pos.profit, peakProfit,
+          ticket: pos.ticket,
+          tradeId: null,
+          pair,
+          direction: dir,
+          lots: pos.lots,
+          openPrice: pos.openPrice,
+          initialSl: originalSl,
+          currentPrice: midPx > 0 ? midPx : null,
+          currentProfit: pos.profit,
+          peakProfit,
+          plannedRiskUsd: initialRiskUsd,
+          currentR,
+          peakR: peakProfit / initialRiskUsd,
           retainedPct:   pos.profit / peakProfit,
           givebackPct:   (peakProfit - pos.profit) / peakProfit,
-          currentR,
-          peakR:         peakProfit / initialRiskUsd,
           protectionStage: pp.stage || state.protectionStage || 'DEVELOP',
-          currentSl:     pos.sl,
-          proposedSl:    adopted ? pp.newSl : (shadowProtection ? pp.newSl : null),
-          action:        adopted ? pp.action : (shadowProtection ? (pp.action || (pp.closeRequested ? 'shadow-close' : null)) : null),
-          actionAt:      pp.action ? pp.actionAt : null,
-          shadow:        shadowProtection,
-          floorUsd:      pp.floorUsd,
-          floorPct:      pp.floorPct,
+          targetFloorUsd: pp.floorUsd,
+          proposedProtectionSl: pp.newSl,
+          currentLiveSl: pos.sl,
+          existingManagerAction,
+          shadowDecision: shadowDecisionToken,
+          action: adopted ? pp.action : (shadowProtection ? (pp.action || (pp.closeRequested ? 'shadow-close' : null)) : null),
+          actionAt: pp.action ? pp.actionAt : null,
+          shadow: shadowProtection,
+          floorUsd: pp.floorUsd,
+          floorPct: pp.floorPct,
         })
       }
     }
@@ -451,6 +515,7 @@ export function manageTrades(
     // so it never closes a still-winning position.
     if (peakProfit >= PEAK_BE_THRESHOLD_USD && pos.profit <= 0) {
       log.push(`[tm] ${sym}#${key} PEAK-BE-CLOSE: peak=$${peakProfit.toFixed(2)} → profit=$${pos.profit.toFixed(2)} (≤0) — close at current to lock BE`)
+      emitCloseTelemetry('PEAK_BE')
       commands.push({
         id:        crypto.randomUUID(),
         type:      'close',
@@ -467,6 +532,7 @@ export function manageTrades(
     const durationMs = now - new Date(state.openedAt).getTime()
     if (durationMs > MAX_HOLD_MS && currentR < MIN_PROFIT_R) {
       log.push(`[tm] ${sym}#${key} TIME-EXIT: ${Math.round(durationMs / 60000)}m elapsed, R=${currentR.toFixed(2)} < ${MIN_PROFIT_R}`)
+      emitCloseTelemetry('TIME_EXIT')
       commands.push({
         id:        crypto.randomUUID(),
         type:      'close',
@@ -487,6 +553,7 @@ export function manageTrades(
     const decayCloseFloor = Math.min(1.5 * pvpl * pos.lots, 0.25)
     if (peakProfit >= DECAY_MIN_PEAK_USD && pos.profit < peakProfit * DECAY_THRESHOLD && pos.profit >= decayCloseFloor) {
       log.push(`[tm] ${sym}#${key} DECAY-EXIT: profit=$${pos.profit.toFixed(2)} < 50% of peak $${peakProfit.toFixed(2)} (peak≥$${DECAY_MIN_PEAK_USD}, floor=$${decayCloseFloor.toFixed(2)})`)
+      emitCloseTelemetry('DECAY')
       commands.push({
         id:        crypto.randomUUID(),
         type:      'close',
