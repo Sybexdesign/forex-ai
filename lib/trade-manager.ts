@@ -13,6 +13,7 @@
 // Close commands (type "close") are already supported by the existing EA.
 
 import { getPipValue, getPipValuePerLot } from './brokers/interface'
+import { profitProtection } from './profit-protection.mjs'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -39,6 +40,11 @@ export interface TradeState {
   // True once we've fired the "profit reversal" Telegram alert for this ticket
   // (gate to one alert per trade — see REVERSAL_ALERT_USD / REVERSAL_ALERT_FRAC).
   reversalAlertSent?: boolean
+  // Peak-giveback protection (lib/profit-protection.mjs) — persisted so a
+  // restart can never reset protection to zero.
+  protectionStage?:   string    // DEVELOP | EARLY_GIVEBACK_BE | PROTECT | LOCK | STRONG | EXCEPTIONAL
+  retentionFloorUsd?: number    // monotonic dollar floor = % of peak already locked via SL
+  telemetryAt?:       number    // last cycle a periodic telemetry line was emitted (ms)
 }
 
 export interface ManagementCommand {
@@ -55,6 +61,27 @@ export interface ManageResult {
   tradeState: Record<string, TradeState>
   commands:   ManagementCommand[]
   log:        string[]
+  /**
+   * Profit-protection / giveback telemetry emitted for open profitable trades
+   * (on every decision and periodically ~60s otherwise). Consumed by mt5-sync
+   * for logging; the fields let an operator see exactly why a trade is still
+   * open and what protection is active.
+   */
+  telemetry:  Array<{
+    ticket:        number | string
+    pair:          string
+    currentProfit: number
+    peakProfit:    number
+    retainedPct:   number | null
+    givebackPct:   number | null
+    currentR:      number
+    peakR:         number
+    protectionStage: string
+    currentSl:     number
+    proposedSl:    number | null
+    action:        string | null
+    actionAt:      string | null
+  }>
   /**
    * Risk events emitted this tick — hard-cap, emergency-1.5R closes, or
    * profit-reversal info alerts. mt5-sync routes these to Telegram.
@@ -170,6 +197,7 @@ export function manageTrades(
   const commands: ManagementCommand[] = []
   const log:      string[] = []
   const riskEvents: ManageResult['riskEvents'] = []
+  const telemetry: ManageResult['telemetry'] = []
   const nextState: Record<string, TradeState> = {}
   const openTickets = new Set(openPositions.map(p => String(p.ticket)))
 
@@ -327,6 +355,57 @@ export function manageTrades(
       }
     }
 
+    // ── 3b. Peak-giveback protection (retention ratchet) ─────────────────────
+    // lib/profit-protection.mjs — progressive protection of accumulated profit.
+    // Evaluated AFTER BE/partial-lock/trail so each management cycle still yields
+    // ONE authoritative SL: this rule only wins when it is the most protective
+    // forward-moving candidate. floor/stage are monotonic & persisted.
+    if (pos.profit > 0 && peakProfit > 0) {
+      const pp = profitProtection({
+        dir, entry: originalEntry, currentSl: pos.sl,
+        currentProfit: pos.profit, peakProfit,
+        riskUsd: initialRiskUsd, lots: pos.lots,
+        pipValuePerLot: pvpl, pip,
+        stage: state.protectionStage || '',
+        retentionFloorUsd: state.retentionFloorUsd || 0,
+      })
+      if (pp.stage) state.protectionStage = pp.stage
+      if (pp.floorUsd > 0) state.retentionFloorUsd = Math.max(state.retentionFloorUsd || 0, pp.floorUsd)
+      const bestSoFar = newSl ?? pos.sl
+      const ppImproves = pp.newSl !== null && (dir === 'BUY' ? pp.newSl > bestSoFar : pp.newSl < bestSoFar)
+      if (ppImproves && pp.newSl !== null) {
+        newSl = pp.newSl
+        log.push(`[tm] ${sym}#${key} ${pp.action}: peak=$${peakProfit.toFixed(2)} now=$${pos.profit.toFixed(2)} retention=${((pos.profit / peakProfit) * 100).toFixed(0)}% stage=${pp.stage} floor=$${pp.floorUsd.toFixed(2)} → SL=${pp.newSl.toFixed(dp)}`)
+      } else if (pp.closeRequested) {
+        log.push(`[tm] ${sym}#${key} GIVEBACK-COLLAPSE-CLOSE: peak=$${peakProfit.toFixed(2)} now=$${pos.profit.toFixed(2)} stage=${pp.stage} floor=$${pp.floorUsd.toFixed(2)}`)
+        commands.push({
+          id: crypto.randomUUID(), type: 'close', symbol: sym, ticket: pos.ticket,
+          createdAt: new Date(now).toISOString(), expiresAt: nowSec + CMD_TTL_S,
+        })
+        nextState[key] = state
+        continue
+      }
+      // Telemetry: every protection decision, plus a ~60s periodic line while a
+      // trade is in profit, so giveback is observable even between actions.
+      const periodicDue = (now - (state.telemetryAt || 0)) > 60_000
+      if (pp.action !== null || periodicDue) {
+        state.telemetryAt = now
+        telemetry.push({
+          ticket: pos.ticket, pair,
+          currentProfit: pos.profit, peakProfit,
+          retainedPct:   pos.profit / peakProfit,
+          givebackPct:   (peakProfit - pos.profit) / peakProfit,
+          currentR,
+          peakR:         peakProfit / initialRiskUsd,
+          protectionStage: pp.stage || state.protectionStage || 'DEVELOP',
+          currentSl:     pos.sl,
+          proposedSl:    pp.newSl,
+          action:        pp.action,
+          actionAt:      pp.action ? pp.actionAt : null,
+        })
+      }
+    }
+
     // ── Queue single SL modification if any rule improved the stop ───────────
     if (newSl !== null) {
       commands.push({
@@ -400,12 +479,15 @@ export function manageTrades(
     nextState[key] = state
   }
 
-  // Log positions that disappeared (closed naturally at broker)
+  // Log positions that disappeared (closed naturally at broker) — include the
+  // last known peak so MFE evidence is visible even when the EA close event
+  // (which writes mfe_usd) arrives later or not at all.
   for (const key of Object.keys(prevState)) {
     if (!openTickets.has(key)) {
-      log.push(`[tm] ticket ${key} gone from EA — purging state`)
+      const peak = Number(prevState[key]?.peakProfit) || 0
+      log.push(`[tm] ticket ${key} gone from EA — purging state${peak > 0 ? ` (last known peak/MFE $${peak.toFixed(2)})` : ''}`)
     }
   }
 
-  return { tradeState: nextState, commands, log, riskEvents }
+  return { tradeState: nextState, commands, log, riskEvents, telemetry }
 }

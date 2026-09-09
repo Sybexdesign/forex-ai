@@ -388,7 +388,7 @@ export async function POST(req: NextRequest) {
     let stateSeq = Number(row.config?.stateSeq ?? 0)
 
     if (activePositions.length > 0) {
-      const { tradeState: nextState, commands, log, riskEvents } = manageTrades(
+      const { tradeState: nextState, commands, log, riskEvents, telemetry } = manageTrades(
         activePositions,
         latestPrices,
         candleCache,
@@ -402,6 +402,11 @@ export async function POST(req: NextRequest) {
       // restarts and cannot be regressed by an older or overlapping writer.
       tradeState = mergeTradeState(row.config?.tradeState || {}, nextState)
       for (const line of log) console.log(line)
+      // Profit-giveback telemetry (audit 2026-09-09): emitted on protection
+      // decisions and ~60s periodic while a trade is in profit.
+      for (const t of telemetry) {
+        console.log(`[tm-telemetry] ${t.pair}#${t.ticket} stage=${t.protectionStage} profit=$${t.currentProfit.toFixed(2)} peak=$${t.peakProfit.toFixed(2)} retained=${t.retainedPct !== null ? (t.retainedPct * 100).toFixed(1) : '?'}% giveback=${t.givebackPct !== null ? (t.givebackPct * 100).toFixed(1) : '?'}% R=${t.currentR.toFixed(2)} peakR=${t.peakR.toFixed(2)} sl=${t.currentSl} proposedSl=${t.proposedSl ?? '—'} action=${t.action ?? 'none'}`)
+      }
 
       // Fix 8 — fire Telegram alerts for any hard-cap or emergency-1.5R breach.
       // Non-blocking; failures are logged inside lib/telegram.
