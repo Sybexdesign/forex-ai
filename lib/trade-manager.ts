@@ -13,7 +13,7 @@
 // Close commands (type "close") are already supported by the existing EA.
 
 import { getPipValue, getPipValuePerLot } from './brokers/interface'
-import { profitProtection } from './profit-protection.mjs'
+import { profitProtection, profitFloorToSl, shadowDecision, pickMostProtectiveSl } from './profit-protection.mjs'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -81,6 +81,12 @@ export interface ManageResult {
     proposedSl:    number | null
     action:        string | null
     actionAt:      string | null
+    shadow?:       boolean
+    // Intended (target) protection floor in $ and as a fraction of peak — an
+    // intent under normal execution, NOT a guaranteed realised profit (spread,
+    // slippage, gaps and modification latency can change the fill).
+    floorUsd?:     number
+    floorPct?:     number
   }>
   /**
    * Risk events emitted this tick — hard-cap, emergency-1.5R closes, or
@@ -108,6 +114,10 @@ export interface RiskContext {
   accountBalance:     number    // live balance from broker (USD)
   riskPct:            number    // user's risk per trade (%) e.g. 0.5
   hardCapMultiplier?: number    // multiplier on 1R for the hard USD cap (default 1.25)
+  // PROFIT_PROTECTION_SHADOW_MODE — when true the NEW peak-giveback ratchet only
+  // computes/logs (telemetry) and must never modify SL or close; existing
+  // BE/trail/decay behaviour continues normally.
+  shadowProtection?:  boolean
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -213,6 +223,10 @@ export function manageTrades(
   const hardCapUsd = (riskCtx && riskCtx.accountBalance > 0 && riskCtx.riskPct > 0)
     ? riskCtx.accountBalance * (riskCtx.riskPct / 100) * hardCapMult
     : 0
+  // Shadow mode: new giveback ratchet computes+logs only; existing management
+  // rules (BE / partial-lock / ATR trail / decay / time / peak-BE) continue
+  // exactly as before. See RiskContext.shadowProtection.
+  const shadowProtection = !!(riskCtx && riskCtx.shadowProtection)
 
   for (const pos of openPositions) {
     const key   = String(pos.ticket)
@@ -371,12 +385,18 @@ export function manageTrades(
       })
       if (pp.stage) state.protectionStage = pp.stage
       if (pp.floorUsd > 0) state.retentionFloorUsd = Math.max(state.retentionFloorUsd || 0, pp.floorUsd)
+      const g = shadowDecision({ shadowMode: shadowProtection, newSl: pp.newSl, closeRequested: pp.closeRequested })
       const bestSoFar = newSl ?? pos.sl
-      const ppImproves = pp.newSl !== null && (dir === 'BUY' ? pp.newSl > bestSoFar : pp.newSl < bestSoFar)
-      if (ppImproves && pp.newSl !== null) {
+      const candidate = pp.newSl !== null ? pickMostProtectiveSl(dir, bestSoFar, [pp.newSl]) : bestSoFar
+      const adopted = g.modify && candidate === pp.newSl && candidate !== bestSoFar
+      if (adopted && pp.newSl !== null) {
         newSl = pp.newSl
         log.push(`[tm] ${sym}#${key} ${pp.action}: peak=$${peakProfit.toFixed(2)} now=$${pos.profit.toFixed(2)} retention=${((pos.profit / peakProfit) * 100).toFixed(0)}% stage=${pp.stage} floor=$${pp.floorUsd.toFixed(2)} → SL=${pp.newSl.toFixed(dp)}`)
-      } else if (pp.closeRequested) {
+      } else if (shadowProtection && (pp.newSl !== null || pp.closeRequested)) {
+        // Shadow mode: log what the new rule WOULD have done; do not act.
+        log.push(`[tm][shadow] ${sym}#${key} WOULD ${pp.closeRequested ? 'CLOSE' : `modify_sl to ${(pp.newSl ?? 0).toFixed(dp)}`}: stage=${pp.stage} peak=$${peakProfit.toFixed(2)} now=$${pos.profit.toFixed(2)} floor=$${pp.floorUsd.toFixed(2)}`)
+      }
+      if (g.close && pp.closeRequested) {
         log.push(`[tm] ${sym}#${key} GIVEBACK-COLLAPSE-CLOSE: peak=$${peakProfit.toFixed(2)} now=$${pos.profit.toFixed(2)} stage=${pp.stage} floor=$${pp.floorUsd.toFixed(2)}`)
         commands.push({
           id: crypto.randomUUID(), type: 'close', symbol: sym, ticket: pos.ticket,
@@ -388,7 +408,7 @@ export function manageTrades(
       // Telemetry: every protection decision, plus a ~60s periodic line while a
       // trade is in profit, so giveback is observable even between actions.
       const periodicDue = (now - (state.telemetryAt || 0)) > 60_000
-      if (pp.action !== null || periodicDue) {
+      if (pp.action !== null || pp.closeRequested || periodicDue) {
         state.telemetryAt = now
         telemetry.push({
           ticket: pos.ticket, pair,
@@ -399,9 +419,12 @@ export function manageTrades(
           peakR:         peakProfit / initialRiskUsd,
           protectionStage: pp.stage || state.protectionStage || 'DEVELOP',
           currentSl:     pos.sl,
-          proposedSl:    pp.newSl,
-          action:        pp.action,
+          proposedSl:    adopted ? pp.newSl : (shadowProtection ? pp.newSl : null),
+          action:        adopted ? pp.action : (shadowProtection ? (pp.action || (pp.closeRequested ? 'shadow-close' : null)) : null),
           actionAt:      pp.action ? pp.actionAt : null,
+          shadow:        shadowProtection,
+          floorUsd:      pp.floorUsd,
+          floorPct:      pp.floorPct,
         })
       }
     }

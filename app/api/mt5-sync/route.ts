@@ -395,7 +395,9 @@ export async function POST(req: NextRequest) {
         tradeState,
         // Fix 8 — pass live balance + user's riskPct + hardCapMultiplier so
         // trade-manager enforces the absolute USD cap dynamically per user.
-        { accountBalance: balance, riskPct, hardCapMultiplier },
+        { accountBalance: balance, riskPct, hardCapMultiplier,
+          // Shadow mode: new peak-giveback ratchet logs only — never modifies/close.
+          shadowProtection: process.env.PROFIT_PROTECTION_SHADOW_MODE === 'true' },
       )
       // Monotonic merge — protection markers (BE/partial-lock applied, peak
       // profit, original open time, reversal-alert sent) are sticky across
@@ -405,7 +407,7 @@ export async function POST(req: NextRequest) {
       // Profit-giveback telemetry (audit 2026-09-09): emitted on protection
       // decisions and ~60s periodic while a trade is in profit.
       for (const t of telemetry) {
-        console.log(`[tm-telemetry] ${t.pair}#${t.ticket} stage=${t.protectionStage} profit=$${t.currentProfit.toFixed(2)} peak=$${t.peakProfit.toFixed(2)} retained=${t.retainedPct !== null ? (t.retainedPct * 100).toFixed(1) : '?'}% giveback=${t.givebackPct !== null ? (t.givebackPct * 100).toFixed(1) : '?'}% R=${t.currentR.toFixed(2)} peakR=${t.peakR.toFixed(2)} sl=${t.currentSl} proposedSl=${t.proposedSl ?? '—'} action=${t.action ?? 'none'}`)
+        console.log(`[tm-telemetry] ${t.pair}#${t.ticket} stage=${t.protectionStage} profit=$${t.currentProfit.toFixed(2)} peak=$${t.peakProfit.toFixed(2)} retained=${t.retainedPct !== null ? (t.retainedPct * 100).toFixed(1) : '?'}% giveback=${t.givebackPct !== null ? (t.givebackPct * 100).toFixed(1) : '?'}% R=${t.currentR.toFixed(2)} peakR=${t.peakR.toFixed(2)} sl=${t.currentSl} proposedSl=${t.proposedSl ?? '—'} targetFloor=$${t.floorUsd != null ? t.floorUsd.toFixed(2) : '—'} action=${t.action ?? 'none'} ${t.shadow ? '[SHADOW]' : '[LIVE]'}`)
       }
 
       // Fix 8 — fire Telegram alerts for any hard-cap or emergency-1.5R breach.

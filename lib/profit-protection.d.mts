@@ -37,3 +37,21 @@ export function profitProtection(o: {
   givebackPct: number | null
   retentionPct: number | null
 }
+export function profitFloorToSl(o: {
+  dir: 'BUY' | 'SELL'
+  entry: number
+  floorUsd: number
+  lots: number
+  pipValuePerLot: number
+  pip: number
+}): number
+export function shadowDecision(o: {
+  shadowMode: boolean
+  newSl: number | null
+  closeRequested: boolean
+}): { modify: boolean; close: boolean }
+export function pickMostProtectiveSl(
+  dir: 'BUY' | 'SELL',
+  current: number | null,
+  candidates?: Array<number | null>,
+): number | null
