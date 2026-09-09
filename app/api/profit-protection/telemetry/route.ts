@@ -4,16 +4,29 @@
 //   • per-trade chronological lifecycle rows
 //   • per-trade ACTUAL vs COUNTERFACTUAL/ESTIMATED close summaries
 //   • sample-wide aggregate report (zones, round-trips, capture, strong runners)
-// Read-only. Observability only — no trading impact.
+// Read-only ADMIN endpoint — requires the operator Supabase auth token
+// (same pattern as /api/admin/users). Observability only; no trading impact.
 export const dynamic = 'force-dynamic'
 
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 import { closeSummaryFromRows, aggregateTrades } from '@/lib/profit-telemetry.mjs'
 
-export async function GET(request: Request) {
+const ADMIN_EMAIL = 'sybexdesigns@gmail.com'
+
+async function verifyAdmin(req: NextRequest) {
+  const token = req.headers.get('Authorization')?.replace('Bearer ', '') ?? ''
+  if (!token) return null
+  const { data: { user } } = await getAdminClient().auth.getUser(token)
+  if (user?.email !== ADMIN_EMAIL) return null
+  return user
+}
+
+export async function GET(req: NextRequest) {
+  const admin = await verifyAdmin(req)
+  if (!admin) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   try {
-    const url = new URL(request.url)
+    const url = new URL(req.url)
     const days = Math.max(1, Math.min(90, parseInt(url.searchParams.get('days') || '14', 10)))
     const ticketFilter = url.searchParams.get('ticket')?.trim() || null
     const admin = getAdminClient()

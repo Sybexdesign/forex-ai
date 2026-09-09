@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS public.profit_protection_telemetry (
   created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- Broker identity
   broker_ticket          TEXT,
+  trade_id               TEXT,                 -- DB trade id when linkable (mt5-sync; may be null at write time)
   pair                   TEXT,
   direction              TEXT,                 -- BUY | SELL
   lots                   NUMERIC(14, 4),
@@ -55,3 +56,8 @@ CREATE INDEX IF NOT EXISTS ppt_created_idx
   ON public.profit_protection_telemetry (created_at DESC);
 CREATE INDEX IF NOT EXISTS ppt_ticket_idx
   ON public.profit_protection_telemetry (broker_ticket, created_at);
+
+-- Idempotent repair for tables created before trade_id was included (verified
+-- missing on remote 2026-09-10). Safe to run repeatedly.
+ALTER TABLE public.profit_protection_telemetry
+  ADD COLUMN IF NOT EXISTS trade_id TEXT;
