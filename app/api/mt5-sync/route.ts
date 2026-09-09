@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 import { manageTrades } from '@/lib/trade-manager'
 import { mergeTradeState } from '@/lib/trade-state.mjs'
+import { toRow as pptRow, dedupeRows as pptDedupe, bestEffort as pptBestEffort } from '@/lib/profit-telemetry.mjs'
 import { alertRiskBreach, alertProfitReversal, alertCircuitBreaker } from '@/lib/telegram'
 import { normaliseExecution, EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 
@@ -386,6 +387,10 @@ export async function POST(req: NextRequest) {
     // Monotonic sequence for the persisted state so a stale/cold-start writer can
     // never regress newer management state (see fresh-read merge below).
     let stateSeq = Number(row.config?.stateSeq ?? 0)
+    // Profit-protection telemetry produced this sync (persisted best-effort AFTER
+    // all management decisions + config write — never blocks/delays trading).
+    let lastTelemetry: any[] = []
+    let pptMode: 'shadow' | 'live' = 'shadow'
 
     if (activePositions.length > 0) {
       // Shadow mode: the NEW peak-giveback ratchet logs only — it must never
@@ -395,6 +400,7 @@ export async function POST(req: NextRequest) {
       //   PROFIT_PROTECTION_MODE=live          (explicit enable of the new rule)
       const forceShadow = process.env.PROFIT_PROTECTION_SHADOW_MODE === 'true'
       const shadowProtection = forceShadow || (process.env.PROFIT_PROTECTION_MODE || 'shadow') !== 'live'
+      pptMode = shadowProtection ? 'shadow' : 'live'
       const { tradeState: nextState, commands, log, riskEvents, telemetry } = manageTrades(
         activePositions,
         latestPrices,
@@ -408,6 +414,7 @@ export async function POST(req: NextRequest) {
       // profit, original open time, reversal-alert sent) are sticky across
       // restarts and cannot be regressed by an older or overlapping writer.
       tradeState = mergeTradeState(row.config?.tradeState || {}, nextState)
+      lastTelemetry = telemetry || []
       for (const line of log) console.log(line)
       // Profit-giveback telemetry (audit 2026-09-09): emitted on protection
       // decisions and ~60s periodic while a trade is in profit.
@@ -505,6 +512,29 @@ export async function POST(req: NextRequest) {
     }
 
     console.log('[mt5-sync] DB write OK')
+
+    // ── Durable profit-protection telemetry (observability only) ─────────────
+    // Runs AFTER every management decision AND the broker_configs write above,
+    // wrapped in best-effort so a telemetry-table failure can never block,
+    // delay or alter trade management. Rows are deduplicated (periodic
+    // snapshots collapse; decisions/closes always stored). shadow mode asserts
+    // shadow_command_emitted=false on every row.
+    if (lastTelemetry.length > 0) {
+      try {
+        const rows = pptDedupe(lastTelemetry.map((t: any) => pptRow(t, {
+          protectionMode: pptMode,
+          stateSeq: stateSeq + 1,
+        })))
+        if (rows.length > 0) {
+          const ok = await pptBestEffort(() => Promise.resolve(sb.from('profit_protection_telemetry').insert(rows)))
+          console.log(`[mt5-sync] ppt telemetry persisted ${rows.length} row(s) (ok=${ok}, mode=${pptMode})`)
+        }
+      } catch (e: any) {
+        // Belt-and-braces: persistence must never throw into the trading path.
+        console.error('[mt5-sync] ppt telemetry persist failed (non-blocking):', e?.message)
+      }
+    }
+
     return NextResponse.json({ ok: true, prices: priceSymbols.length, candles: candleSymbols.length })
   } catch (e: any) {
     console.error('[mt5-sync] UNCAUGHT ERROR in POST:', e?.message, e?.stack?.split('\n').slice(0,3).join(' | '))

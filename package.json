@@ -15,6 +15,7 @@
     "test:execution-guards": "node tests/execution-guards.test.mjs",
     "test:trade-state": "node tests/trade-state.test.mjs",
     "test:profit-protection": "node tests/profit-protection.test.mjs",
+    "test:profit-telemetry": "node tests/profit-telemetry.test.mjs",
     "test:phase2": "npm run test:market-health && npm run test:prediction-contract",
     "test:phase3": "npm run test:market-health && npm run test:prediction-contract && npm run test:outcome-reconciliation",
     "test:phase4": "npm run test:market-health && npm run test:prediction-contract && npm run test:outcome-reconciliation && npm run test:execution-truth"
