@@ -31,26 +31,45 @@ t('item1: scalpRowKind maps WOULD_CLOSE to decision (open position)', () => {
   assert.equal(scalpRowKind(SHADOW_DECISIONS.none), 'snapshot')
 })
 
-t('item1: the evaluator emits decision, never close, for WOULD_CLOSE', () => {
+t('item1: WOULD_CLOSE requires ARMED protection; the evaluator never emits row_kind=close', () => {
   const XAU = { pip: 0.1, pipValuePerLot: 10 }
   const trade = { id: 'T-1', pair: 'XAU/USD', direction: 'BUY', lots: 0.14, entryPrice: 2000, currentPrice: 2000, unrealizedPL: 0, stopLossPrice: 1997.5, openTime: at(0) }
-  let seenClose = false
-  for (const peak of [40, 60, 80, 100, 150, 200, 250, 300]) {
-    for (const cur of [300, 200, 150, 120, 100, 80, 60, 50, 40, 30, 25, 20, 15, 12, 10, 8, 6, 5, 4, 3, 2, 1, 0, -5, -10, -20, -35]) {
+  const peaks = [40, 60, 80, 100, 150, 200, 250, 300]
+  const curs  = [300, 200, 150, 120, 100, 80, 60, 50, 40, 30, 25, 20, 15, 12, 10, 8, 6, 5, 4, 3, 2, 1, 0, -5, -10, -20, -35]
+
+  let unarmedCloses = 0
+  let armedCloses = 0
+  for (const peak of peaks) {
+    for (const cur of curs) {
       if (cur > peak) continue
-      const prior    = { peakProfit: peak }
-      const position = normaliseScalpPosition({ ...trade, unrealizedPL: cur }, { priorState: prior, ...XAU })
-      const r = evaluateScalpShadow({ position, priorState: prior, shadowMode: true })
-      if (!r.row) continue
-      assert.notEqual(r.row.row_kind, 'close', 'evaluateScalpShadow must NEVER emit close')
-      if (r.row.shadow_decision === 'WOULD_CLOSE') {
-        seenClose = true
-        assert.equal(r.row.row_kind, 'decision', 'an open position must emit decision')
+      // (a) UNARMED: no persisted stage/floor and the live SL is below entry, so
+      // NO protection has ever been committed. A deep retracement here is a
+      // polling gap, not a failure to protect — it must not close the trade.
+      const unarmed = { peakProfit: peak }
+      const pUn = normaliseScalpPosition({ ...trade, unrealizedPL: cur }, { priorState: unarmed, ...XAU })
+      const rUn = evaluateScalpShadow({ position: pUn, priorState: unarmed, shadowMode: true })
+      if (rUn.row) {
+        assert.notEqual(rUn.row.row_kind, 'close', 'evaluateScalpShadow must NEVER emit close')
+        if (rUn.row.shadow_decision === 'WOULD_CLOSE') unarmedCloses++
+      }
+      // (b) ARMED: a floor was persisted by an earlier cycle, so a breach IS a
+      // genuine failure to protect and may request a close.
+      const armed = { peakProfit: peak, retentionFloorUsd: 1, protectionStage: 'LOCK' }
+      const pAr = normaliseScalpPosition({ ...trade, unrealizedPL: cur }, { priorState: armed, ...XAU })
+      const rAr = evaluateScalpShadow({ position: pAr, priorState: armed, shadowMode: true })
+      if (rAr.row) {
+        assert.notEqual(rAr.row.row_kind, 'close', 'evaluateScalpShadow must NEVER emit close')
+        if (rAr.row.shadow_decision === 'WOULD_CLOSE') {
+          armedCloses++
+          assert.equal(rAr.row.row_kind, 'decision', 'an open position must emit decision')
+        }
       }
     }
   }
-  assert.ok(seenClose, 'expected at least one WOULD_CLOSE scenario at current thresholds')
+  assert.equal(unarmedCloses, 0, 'an unarmed trade must never be closed by the collapse rule (polling-gap fix)')
+  assert.ok(armedCloses > 0, 'an armed trade MUST still be closable when its committed floor is breached')
 })
+
 
 // ── 4. Lifecycle behaviour ───────────────────────────────────────────────────
 t('item4: WOULD_CLOSE while open → decision, lifecycle stays open', () => {
