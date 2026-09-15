@@ -19,6 +19,18 @@ import {
   resolveSampleOutcome, isWithinPredictionWindow,
 } from '../lib/prediction-contract.mjs'
 
+// ── Scalp shadow protection — read-only observation of the profit algorithm ───
+// The capability surface is deliberately tiny: a pure evaluator, a monotonic
+// state merger, and an I/O-free runtime whose every side effect is injected
+// below. Nothing imported here can modify or close a broker position.
+import {
+  evaluateScalpShadow,
+  normaliseScalpPosition,
+  mergeScalpShadowState,
+  assertScalpStateMonotonic,
+} from '../lib/scalp-shadow-protection.mjs'
+import { createScalpShadowRuntime, matchAttribution, createShadowHandoff } from '../lib/scalp-shadow-runtime.mjs'
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const BASE_URL       = process.env.APP_URL || 'https://forex.sybexdesigns.co.uk'
@@ -299,6 +311,10 @@ async function checkForCacheReset() {
       cachedRisk = null
       riskCachedAt = 0
       tradingHalted = false
+      // Shadow observation caches are memory-only, so a reset forces a re-read
+      // of durable state rather than reusing a stale in-memory copy. The durable
+      // snapshot is NOT cleared — it holds monotonic facts about open trades.
+      scalpShadowRuntime.resetMemory()
       haltNotified = false
       lastCbClearedAt = null
       lastCbArmedAt = null
@@ -1311,6 +1327,274 @@ async function loadStrategy() {
   }
 }
 
+// ── Scalp shadow protection (READ-ONLY · OBSERVATION ONLY) ───────────────────
+//
+// WHAT THIS IS
+//
+// A shadow observer for the profit-protection algorithm, run against scalp
+// auto-trade positions. It records what live protection WOULD have done.
+//
+// WHY IT IS SAFE BY CONSTRUCTION, NOT BY DISCIPLINE
+//
+//   * lib/scalp-shadow-protection.mjs imports no broker adapter and exposes no
+//     modify/close function, so no code path leads from here to a broker write.
+//   * lib/scalp-shadow-runtime.mjs performs NO I/O AT ALL. Every side effect is
+//     injected below, and the only things injected are Supabase config and
+//     telemetry reads/writes. No broker adapter is reachable from it.
+//   * shadowMode is passed as the literal `true` in the evaluate adapter.
+//     PROFIT_PROTECTION_MODE is not consulted on this path, so no env change can
+//     turn observation into action.
+//   * Every row written sets trade_source='scalp', protection_mode='shadow' and
+//     shadow_command_emitted=false by construction, not by convention.
+//   * fetchRiskState() never awaits observe(). Observation is strictly
+//     downstream of the risk contract and cannot delay or fail it.
+//
+// WHERE THE DATA COMES FROM
+//
+// fetchRiskState() already calls /api/account every ~30s, which already returns
+// openTrades plus authoritative instrument geometry. That call IS the
+// observation cadence: no second /v1/positions request is added, and the
+// worker's 10s sweep is untouched.
+
+const SHADOW_EVAL_MS       = 60_000   // observe at most once per minute (~2 risk-cache refreshes)
+const SHADOW_IO_TIMEOUT_MS = 10_000
+const SCALP_SHADOW_KEY     = 'scalpShadowState'
+const SCALP_SOURCE         = 'scalp'
+
+const shadowHeaders = () => ({
+  'Content-Type':  'application/json',
+  'apikey':        SUPABASE_KEY,
+  'Authorization': `Bearer ${SUPABASE_KEY}`,
+})
+
+/**
+ * loadState — broker_configs.config.scalpShadowState, or null when unavailable.
+ *
+ * A restart MUST restore this rather than restarting observation from zero:
+ * peakProfit, peakR, protectionStage and retentionFloorUsd are monotonic facts
+ * about a trade that is still open, and losing them silently reclassifies the
+ * trade into a lower protection band.
+ *
+ * Touches ONLY config.scalpShadowState. config.tradeState belongs to the MT5
+ * manager and is never read or written here.
+ */
+async function shadowLoadState() {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return null
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/broker_configs`
+      + `?user_id=eq.${WORKER_USER_ID}&is_active=eq.true&limit=1&select=config`
+    const res = await fetch(url, { headers: shadowHeaders(), signal: AbortSignal.timeout(SHADOW_IO_TIMEOUT_MS) })
+    if (!res.ok) return null
+    const cfg = (await res.json())?.[0]?.config || {}
+    const all = cfg[SCALP_SHADOW_KEY]
+    return all && typeof all === 'object' ? all : {}
+  } catch (e) {
+    console.error('[scalp-shadow] state load failed:', e.message)
+    return null
+  }
+}
+
+/**
+ * saveState — persisted BEFORE telemetry, via a FRESH READ plus a monotonic
+ * merge against what is actually on disk.
+ *
+ * WHY FRESH-READ RATHER THAN TRUSTING OUR IN-MEMORY VIEW
+ *
+ * A read-modify-write on a JSON column is only safe if the "read" half is
+ * current. If an older evaluation (or another process) wrote between our load
+ * and our write, blindly PATCHing our snapshot would roll the peaks, stages and
+ * floors backwards — exactly the regression the whole study depends on not
+ * happening. So we re-read the row and merge ticket-by-ticket through
+ * mergeScalpShadowState (which takes the max of every monotonic field) before
+ * writing. Same discipline the MT5 path uses for config.tradeState.
+ *
+ * The merge runs from `nextAll`, so tickets absent from it are REMOVED — that is
+ * how an archived close propagates. A close whose row failed to persist is
+ * deliberately NOT removed, so its final state survives a restart and can be
+ * retried.
+ *
+ * config.tradeState is never read or written here.
+ */
+async function shadowSaveState(nextAll, meta = {}) {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return false
+  try {
+    // Pre-write guard: a merge bug must not reach the database. Refusing to
+    // store is recoverable; storing a lowered peak is not, because every later R
+    // multiple is derived from it.
+    for (const [ticket, merged] of Object.entries(nextAll)) {
+      const check = assertScalpStateMonotonic(meta.prevAll?.[ticket], merged)
+      if (!check.ok) {
+        console.error(`[scalp-shadow] REFUSING to persist ${ticket} — monotonic regression: ${check.issues.join(', ')}`)
+        return false
+      }
+    }
+
+    const getUrl = `${SUPABASE_URL}/rest/v1/broker_configs`
+      + `?user_id=eq.${WORKER_USER_ID}&is_active=eq.true&limit=1&select=id,config`
+    const cur = await fetch(getUrl, { headers: shadowHeaders(), signal: AbortSignal.timeout(SHADOW_IO_TIMEOUT_MS) })
+    if (!cur.ok) return false
+    const row = (await cur.json())?.[0]
+    if (!row?.id) return false
+
+    const onDisk    = (row.config || {})[SCALP_SHADOW_KEY] || {}
+    const mergedAll = {}
+    for (const [ticket, incoming] of Object.entries(nextAll)) {
+      mergedAll[ticket] = mergeScalpShadowState(onDisk[ticket], incoming)
+    }
+
+    const config = { ...(row.config || {}), [SCALP_SHADOW_KEY]: mergedAll }
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/broker_configs?id=eq.${row.id}`, {
+      method:  'PATCH',
+      headers: shadowHeaders(),
+      body:    JSON.stringify({ config }),
+      signal:  AbortSignal.timeout(SHADOW_IO_TIMEOUT_MS),
+    })
+    if (!res.ok) console.error('[scalp-shadow] state persist failed:', res.status, await res.text())
+    return res.ok
+  } catch (e) {
+    console.error('[scalp-shadow] state persist error:', e.message)
+    return false
+  }
+}
+
+/**
+ * attribute — resolve which open broker positions are genuinely scalp trades.
+ *
+ * The broker returns EVERY open position on the account: manual trades, mirror
+ * trades, anything else the operator holds. Evaluating all of them would
+ * contaminate the sample, so positions are matched back to `trades` rows with
+ * source='scalp' by broker ticket.
+ *
+ * Attribution is OPT-IN. A position is evaluated only if exactly one scalp trade
+ * row matches its ticket. No match or an ambiguous match means the position is
+ * SKIPPED and the reason logged — never guessed at.
+ */
+async function shadowAttribute(trades) {
+  const scalp   = new Map()
+  const skipped = []
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) {
+    return { scalp, skipped, unavailable: true }
+  }
+  const withTicket = trades.filter((t) => t && t.id != null && t.id !== '')
+  for (const t of trades) {
+    if (!t || t.id == null || t.id === '') {
+      skipped.push({ ticket: String(t?.pair ?? 'unknown'), reason: 'no-broker-ticket' })
+    }
+  }
+  if (withTicket.length === 0) return { scalp, skipped }
+
+  const ids = withTicket.map((t) => String(t.id))
+  const url = `${SUPABASE_URL}/rest/v1/trades`
+    + `?user_id=eq.${WORKER_USER_ID}`
+    + `&source=eq.${SCALP_SOURCE}`
+    + `&broker_ticket=in.%28${ids.map(encodeURIComponent).join('%2C')}%29`
+    + `&select=id,broker_ticket,source,pair,direction,created_at,closed_at`
+  const res = await fetch(url, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+    signal:  AbortSignal.timeout(SHADOW_IO_TIMEOUT_MS),
+  })
+  if (!res.ok) {
+    // Throwing makes the runtime abandon the cycle entirely. Fail-closed on
+    // sample integrity: better to observe nothing than to observe positions we
+    // cannot prove are scalp trades.
+    throw new Error(`attribution query failed (HTTP ${res.status})`)
+  }
+  const rows = await res.json()
+  // Matching rules live in the runtime module so they are unit-tested rather
+  // than only observable in production.
+  return matchAttribution(trades, rows)
+}
+
+/** confirmClosed — the trade's OWN record; the only accepted proof of a close. */
+async function shadowConfirmClosed(ticket) {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return null
+  const url = `${SUPABASE_URL}/rest/v1/trades`
+    + `?user_id=eq.${WORKER_USER_ID}`
+    + `&broker_ticket=eq.${encodeURIComponent(ticket)}`
+    + `&source=eq.${SCALP_SOURCE}`
+    + `&closed_at=not.is.null&limit=1`
+    + `&select=id,closed_at,pair,direction`
+  const res = await fetch(url, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+    signal:  AbortSignal.timeout(SHADOW_IO_TIMEOUT_MS),
+  })
+  if (!res.ok) return null
+  return (await res.json())?.[0] || null
+}
+
+/**
+ * insertRow — best-effort telemetry write.
+ *
+ * A 409 means the partial unique index already holds this logical close, i.e.
+ * the row IS persisted. That is SUCCESS, not failure: it is what makes the close
+ * retry path idempotent across restarts, and it is why duplicate close records
+ * cannot be fabricated by a restart or a double retry.
+ */
+async function shadowInsertRow(row) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return false
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/profit_protection_telemetry`, {
+    method:  'POST',
+    headers: { ...shadowHeaders(), 'Prefer': 'return=minimal' },
+    body:    JSON.stringify(row),
+    signal:  AbortSignal.timeout(SHADOW_IO_TIMEOUT_MS),
+  })
+  if (res.ok) return true
+  if (res.status === 409) return true
+  console.error('[scalp-shadow] telemetry insert failed:', res.status, await res.text())
+  return false
+}
+
+/** Logs locally AND to worker_logs. Diagnostics only — no credentials. */
+function shadowLog(message, metadata = {}) {
+  console.log(`[scalp-shadow] ${message}`)
+  Promise.resolve(wlog('info', `scalp-shadow: ${message}`, { metadata: metadata || {} })).catch(() => {})
+}
+
+const scalpShadowRuntime = createScalpShadowRuntime({
+  throttleMs:    SHADOW_EVAL_MS,
+  source:        SCALP_SOURCE,
+  log:           shadowLog,
+  loadState:     shadowLoadState,
+  saveState:     shadowSaveState,
+  attribute:     shadowAttribute,
+  confirmClosed: shadowConfirmClosed,
+  insertRow:     shadowInsertRow,
+  // The entire evaluator surface, and the single place where shadow mode is
+  // pinned ON. `shadowMode: true` is a literal — no env var reaches this line.
+  evaluate: ({ trade, record, geometry, prior }) => {
+    const position = normaliseScalpPosition(trade, { priorState: prior, ...geometry })
+    if (!position) return { reason: 'un-normalisable-position' }
+    return evaluateScalpShadow({ position, priorState: prior, shadowMode: true })
+  },
+})
+
+/**
+ * The handoff used by fetchRiskState(). Extracted so its contract — takes the
+ * already-fetched response, schedules observation, returns nothing, performs no
+ * I/O — is provable by test rather than by inspection.
+ */
+const shadowHandoff = createShadowHandoff(scalpShadowRuntime)
+
+/**
+ * Telemetry health counters (item 10) — so first-lifecycle verification can read
+ * one line instead of grepping logs. Counters only: no credentials, no account
+ * or balance data, nothing sensitive.
+ */
+function shadowStatsLine() {
+  const s = scalpShadowRuntime.getStats()
+  return `evaluated=${s.evaluated} rows=${s.rowsPersisted} decision/snapshot=${s.evaluations} `
+    + `attrSkips=${s.attributionSkips} geomSkips=${s.geometrySkips} badRisk=${s.invalidRiskSkips} `
+    + `rowFails=${s.rowWriteFailures} stateFails=${s.stateWriteFailures} evalErrors=${s.evaluatorExceptions} `
+    + `closes=${s.closeRowsPersisted} closeRetries=${s.closeRetries} closeGaveUp=${s.closeGaveUp} `
+    + `dupes=${s.duplicateSnapshots} coalesced=${s.snapshotsCoalesced} throttle=${s.throttled}`
+}
+function shadowLogStats(context = 'periodic') {
+  try {
+    console.log(`[scalp-shadow] ${context} stats — ${shadowStatsLine()}`)
+  } catch { /* diagnostics must never break trading */ }
+}
+
+
 async function fetchRiskState() {
   // Serve cache unless TTL expired OR broker identity changed (account switch).
   if (cachedRisk && Date.now() - riskCachedAt < RISK_CACHE_MS) return cachedRisk
@@ -1318,6 +1602,14 @@ async function fetchRiskState() {
   const balance   = acct.balance   || 0
   const realizedPL = acct.realizedPL || 0  // negative = loss today
   const openCount = (acct.openTrades || []).length
+
+  // ── Scalp shadow observation handoff ───────────────────────────────────────
+  // Reached ONLY on a genuine fresh fetch (a warm cache returned above), so this
+  // is exactly the once-per-RISK_CACHE_MS cadence the observer wants. The helper
+  // takes the response we already hold, schedules observation, and returns
+  // nothing — it cannot enter the value computed below, and it makes no broker
+  // request. Everything after this line is the original logic, unchanged.
+  shadowHandoff(acct)
   const dailyLossPct = (balance > 0 && realizedPL < 0)
     ? Math.abs(realizedPL) / balance
     : 0
@@ -2208,6 +2500,10 @@ async function runSweep() {
 
 async function sendHeartbeat() {
   const uptimeH = ((Date.now() - stats.startTime) / 3_600_000).toFixed(1)
+  // Scalp shadow health counters ride the existing heartbeat (item 10) so the
+  // first-lifecycle check can read them without adding a new timer or a new
+  // request. Diagnostics only — this cannot affect trading.
+  shadowLogStats('heartbeat')
   const lines = [
     `💓 <b>SybexForexAI Worker — Heartbeat</b>`,
     ``,

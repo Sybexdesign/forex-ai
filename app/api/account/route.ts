@@ -1,7 +1,26 @@
 // app/api/account/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 import { getBroker } from '@/lib/brokers'
+import { getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { getAdminClient } from '@/lib/supabase'
+
+/**
+ * Instruments the shadow study has ACTUAL pip geometry for.
+ *
+ * WHY AN EXPLICIT LIST AND NOT getPipValuePerLot() ALONE
+ *
+ * That helper returns a plausible default (10 / 0.0001) for any pair it does not
+ * recognise, so a caller cannot tell a modelled instrument from a guessed one by
+ * looking at the numbers. The shadow observer derives 1R — and therefore every R
+ * multiple in the study — from this geometry, so it must skip an instrument
+ * rather than divide by a fallback. This list is the authority for `known`.
+ *
+ * XAU/USD and XAG/USD are the only instruments the scalper trades; they are also
+ * the only pairs modelled both by getPipValue (0.1 / 0.01) and getPipValuePerLot
+ * (10 / 50). Adding a pair here is a deliberate act, not an accident of a
+ * default branch. Nothing outside this route is affected.
+ */
+const SHADOW_MODELLED_PAIRS = new Set(['XAU/USD', 'XAG/USD'])
 
 export async function GET(req: NextRequest) {
   try {
@@ -67,10 +86,35 @@ export async function GET(req: NextRequest) {
       } catch { /* metadata fetch is best-effort */ }
     }
 
+    // Authoritative instrument geometry for the OPEN positions, so the scalper
+    // worker can compute runtime 1R without duplicating pip tables it cannot
+    // import (it is a plain .mjs process; these helpers live in TypeScript).
+    // Without this the worker would have to hardcode a second copy of the pip
+    // tables, and the two would silently drift — misstating the very number the
+    // shadow study divides every R multiple by.
+    // Additive only: no existing field changes, no new broker request.
+    //
+    // `known` flags whether the pair was actually MODELLED. getPipValue() falls
+    // back to 0.0001 and getPipValuePerLot() to 10 for ANY unrecognised pair, so
+    // a defaulted value is otherwise indistinguishable from a real one. An
+    // R-based study must not divide by a guess, so the observer skips
+    // `known: false` rather than deriving 1R from a fallback.
+    const instrumentGeometry: Record<string, { pip: number; pipValuePerLot: number; known: boolean }> = {}
+    for (const t of openTrades as Array<{ pair?: string }>) {
+      if (t?.pair && !instrumentGeometry[t.pair]) {
+        instrumentGeometry[t.pair] = {
+          pip:             getPipValue(t.pair),
+          pipValuePerLot:  getPipValuePerLot(t.pair),
+          known:           SHADOW_MODELLED_PAIRS.has(t.pair),
+        }
+      }
+    }
+
     return NextResponse.json({
       ...summary, broker: broker.name, openTrades, lastSwitchedAt,
       circuitBreakerUntil, lastCbArmedAt, lastCbArmedPair, lastCbArmedPl, lastCbArmedOneR,
       profitFixedUsd, profitTargetPct,
+      instrumentGeometry,
     })
   } catch (error: any) {
     console.error('[account]', error)
