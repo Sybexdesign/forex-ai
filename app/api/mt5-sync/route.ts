@@ -7,6 +7,7 @@ import { getAdminClient } from '@/lib/supabase'
 import { manageTrades } from '@/lib/trade-manager'
 import { mergeTradeState } from '@/lib/trade-state.mjs'
 import { toRow as pptRow, dedupeRows as pptDedupe, bestEffort as pptBestEffort } from '@/lib/profit-telemetry.mjs'
+import { detectProtectionGap } from '@/lib/trade-manager'
 import { alertRiskBreach, alertProfitReversal, alertCircuitBreaker } from '@/lib/telegram'
 import { normaliseExecution, EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 
@@ -401,7 +402,7 @@ export async function POST(req: NextRequest) {
       const forceShadow = process.env.PROFIT_PROTECTION_SHADOW_MODE === 'true'
       const shadowProtection = forceShadow || (process.env.PROFIT_PROTECTION_MODE || 'shadow') !== 'live'
       pptMode = shadowProtection ? 'shadow' : 'live'
-      const { tradeState: nextState, commands, log, riskEvents, telemetry } = manageTrades(
+      const { tradeState: nextState, commands, log, riskEvents, telemetry, shadowObservations } = manageTrades(
         activePositions,
         latestPrices,
         candleCache,
@@ -423,6 +424,28 @@ export async function POST(req: NextRequest) {
       }
       if (telemetry.length > 0 && shadowProtection) {
         console.log('[mt5-sync] PROFIT PROTECTION = SHADOW — new giveback ratchet computes/logs only; SL/close NOT modified by it (existing BE/trail/decay untouched)')
+      }
+
+      // ── SHADOW adaptive-protection observations (OBSERVABILITY ONLY) ────────
+      // One structured event per managed position per cycle, plus a concise
+      // `profit_protection_gap_detected` event when ATR is missing AND the
+      // independent R/MFE system would have protected materially more. This is
+      // the evidence surface for deciding whether ATR loss is the real cause of
+      // poor retention — it changes nothing about execution.
+      //
+      // Structured logs are used because the profit_protection_telemetry
+      // migrations are not yet applied; the object shape is the one that will be
+      // written to that table later without redesign.
+      //
+      // Wrapped in try/catch: logging must NEVER interrupt trade management.
+      try {
+        for (const o of (shadowObservations || [])) {
+          console.log(`[tm-shadow] ${JSON.stringify(o)}`)
+          const gap = detectProtectionGap(o)
+          if (gap) console.log(`[tm-shadow-gap] ${JSON.stringify(gap)}`)
+        }
+      } catch (e: any) {
+        console.error('[mt5-sync] shadow observation logging failed (non-blocking):', e?.message)
       }
 
       // Fix 8 — fire Telegram alerts for any hard-cap or emergency-1.5R breach.

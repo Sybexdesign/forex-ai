@@ -14,6 +14,230 @@
 
 import { getPipValue, getPipValuePerLot } from './brokers/interface'
 import { profitProtection, profitFloorToSl, shadowDecision, pickMostProtectiveSl } from './profit-protection.mjs'
+import { composeProtection } from './protection-candidates.mjs'
+
+/**
+ * Does this observation represent a MATERIAL protection gap worth surfacing?
+ *
+ * PURE and telemetry-only. It classifies; it never acts. Called after the full
+ * observation is built, it decides whether to additionally emit the concise
+ * `profit_protection_gap_detected` event so abnormal degradation is easy to spot
+ * without reading the full event stream.
+ *
+ * "Materially more" is BOTH an absolute and a proportional bar so it is neither
+ * noise on a small trade nor trivially satisfied on a large one. Thresholds are
+ * parameters, not constants, so they stay configurable.
+ */
+export const GAP_MIN_DELTA_R = 0.5          // shadow must protect >= 0.5R more
+export const GAP_MIN_PROFIT_R = 1.0         // only for meaningfully profitable trades
+
+export function detectProtectionGap(obs: Record<string, any> | null | undefined, cfg: { minDeltaR?: number; minProfitR?: number } = {}) {
+  if (!obs) return null
+  const minDeltaR  = Number.isFinite(cfg.minDeltaR)  ? Number(cfg.minDeltaR)  : GAP_MIN_DELTA_R
+  const minProfitR = Number.isFinite(cfg.minProfitR) ? Number(cfg.minProfitR) : GAP_MIN_PROFIT_R
+
+  const currentR       = obs.currentR
+  const peakR          = obs.peakR
+  const liveFinalR     = obs.liveFinalR
+  const shadowFinalR   = obs.shadowFinalR
+  const delta          = obs.protectionDeltaR
+  // `typeof NaN === 'number'` is TRUE, so every numeric guard must use
+  // Number.isFinite — otherwise a NaN reaches the comparison and the event fires
+  // on garbage. (Caught by the unit tests.)
+  const atrUnavailable = obs.liveAtrReason !== 'live-atr-active'
+
+  if (!(Number.isFinite(currentR) && currentR >= minProfitR)) return null
+  if (!atrUnavailable) return null
+  if (!Number.isFinite(shadowFinalR)) return null
+  if (!(Number.isFinite(delta) && delta >= minDeltaR)) return null
+
+  return {
+    event: 'profit_protection_gap_detected',
+    timestamp: obs.timestamp,
+    tradeId: obs.tradeId,
+    symbol: obs.symbolRaw,
+    symbolNormalized: obs.symbolNormalized,
+    peakR,
+    currentR,
+    liveFinalR,
+    shadowFinalR,
+    protectionDeltaR: delta,
+    liveAtrReason: obs.liveAtrReason,
+    atrRefinedReason: obs.atrRefinedReason,
+    protectionHealth: obs.protectionHealth,
+    keyDiagnosis: obs.keyDiagnosis,
+    priceKeyFound: obs.priceKeyFound,
+    candleKeyFound: obs.candleKeyFound,
+    candleCount: obs.candleCount,
+    processUptimeSec: obs.processUptimeSec,
+    candleAgeSec: obs.candleAgeSec,
+    // Explicitly observational. Nothing in the pipeline acts on this.
+    severity: 'COUNTERFACTUAL_ONLY',
+  }
+}
+
+/** A candle older than this is considered stale for a 10s-sweep scalper. */
+export const CANDLE_STALE_SEC = 600
+/** Within this many seconds of process start, a thin cache is "warming", not broken. */
+export const ATR_WARMUP_SEC = 300
+
+/**
+ * Refine WHY ATR is unavailable, so `missing-candles` never collapses four very
+ * different operational causes into one string.
+ *
+ * PURE. OBSERVATION ONLY — this never fabricates an ATR and never influences
+ * execution. `processUptimeSec` and `candleAgeSec` are inputs so the function
+ * stays deterministic and testable.
+ */
+export function refineAtrReason(o: {
+  liveAtrReason?: string
+  candleKeyFound?: boolean
+  priceKeyFound?: boolean
+  candleCount?: number
+  requiredCandles?: number
+  candleAgeSec?: number | null
+  keyDiagnosis?: string
+  processUptimeSec?: number | null
+}) {
+  // calcATR() needs ATR_PERIOD + 1 candles for a FULL window — it returns a
+  // degenerate value from as few as 2, so "2" would be a technically-true but
+  // useless bar. Stating ATR_PERIOD + 1 keeps the implementation, the
+  // diagnostics, the tests and the operator checklist in agreement.
+  const required = Number.isFinite(o.requiredCandles as number) ? Number(o.requiredCandles) : ATR_PERIOD + 1
+  const count    = Number.isFinite(o.candleCount as number) ? Number(o.candleCount) : 0
+
+  if (o.liveAtrReason === 'live-atr-active' || o.liveAtrReason === 'atr-available') return 'atr-available'
+  if (o.liveAtrReason === 'live-atr-below-profit-gate') return 'atr-available-below-progress-gate'
+
+  // A key present under an ALTERNATE representation is the strongest signal, and
+  // must be checked first — otherwise "no data at all" gets mislabelled as a
+  // mismatch (which the restart tests caught).
+  if (o.keyDiagnosis === 'key-mismatch-suspected') {
+    return !o.priceKeyFound ? 'atr-price-key-mismatch' : 'atr-symbol-key-mismatch'
+  }
+
+  const uptime = Number(o.processUptimeSec)
+  const warming = Number.isFinite(uptime) && uptime < ATR_WARMUP_SEC
+
+  if (!o.candleKeyFound) {
+    // No alternate key exists anywhere, so this is genuinely absent data —
+    // either a fresh process that has not seen candles yet, or a dead feed.
+    return warming ? 'atr-cache-warming' : 'atr-cache-missing-no-alternate'
+  }
+  if (!o.priceKeyFound) {
+    return warming ? 'atr-cache-warming' : 'atr-price-key-mismatch'
+  }
+
+  if (count < required) return warming ? 'atr-cache-warming' : 'atr-insufficient-candles'
+  const age = Number(o.candleAgeSec)
+  if (Number.isFinite(age) && age > CANDLE_STALE_SEC) return 'atr-stale-candles'
+  return 'atr-unavailable-other'
+}
+
+/**
+ * Aggregate protection health for one observation. PURE, observation-only, so
+ * real trades can be grouped later without reading the whole event stream.
+ */
+export function classifyProtectionHealth(obs: Record<string, any> | null | undefined) {
+  if (!obs) return 'NO_OBSERVATION'
+  const atrHealthy = obs.liveAtrReason === 'live-atr-active'
+  const existingR  = Number(obs.existingR ?? obs.liveFinalR)
+  const delta      = Number(obs.protectionDeltaR)
+  const hasGap     = Number.isFinite(delta) && delta >= GAP_MIN_DELTA_R
+                       && Number.isFinite(Number(obs.currentR)) && Number(obs.currentR) >= GAP_MIN_PROFIT_R
+
+  if (hasGap && !atrHealthy) return 'PROTECTION_GAP'
+  if (atrHealthy) return 'HEALTHY_ATR'
+  if (Number.isFinite(existingR) && existingR > 0.5) return 'HEALTHY_EXISTING_SL'
+  if (obs.atrRefinedReason === 'atr-cache-warming') return 'ATR_WARMING'
+  if (obs.atrRefinedReason === 'atr-symbol-key-mismatch' || obs.atrRefinedReason === 'atr-price-key-mismatch') {
+    return 'ATR_KEY_MISMATCH_SUSPECTED'
+  }
+  if (obs.atrRefinedReason === 'atr-stale-candles') return 'ATR_STALE'
+  if (obs.atrRefinedReason === 'atr-insufficient-candles') return 'ATR_WARMING'
+  return 'ATR_UNAVAILABLE_OTHER'
+}
+
+/**
+ * Build the structured shadow event. ONE canonical object shape, so it can later
+ * be written to profit_protection_telemetry without redesign. Contains no
+ * credentials, tokens or account-identifying data beyond the ticket.
+ */
+function buildShadowObservation(d: any): Record<string, unknown> {
+  const balanced = (a: number | null, b: number | null) =>
+    (a != null && b != null) ? Math.round((a - b) * 10000) / 10000 : null
+  // Refined ATR cause + aggregate health, computed AFTER the core fields exist so
+  // the classifier sees them. Both are observation-only.
+  const atrRefinedReason = refineAtrReason({
+    liveAtrReason: d.liveAtrReason,
+    candleKeyFound: d.candleKeyFound,
+    priceKeyFound: d.priceKeyFound,
+    candleCount: d.candleCount,
+    requiredCandles: ATR_PERIOD + 1,
+    candleAgeSec: d.candleAgeSec,
+    keyDiagnosis: d.keyDiagnosis,
+    processUptimeSec: d.processUptimeSec,
+  })
+  const core: Record<string, any> = {
+    event: 'profit_protection_shadow_decision',
+    timestamp: new Date(d.now).toISOString(),
+    tradeId: d.key,
+    // ── symbol / lookup keys (the mismatch hypothesis, made observable) ──
+    symbolRaw: d.sym,
+    symbolNormalized: d.pair,
+    priceLookupKey: d.sym,
+    priceKeyFound: d.priceKeyFound,
+    candleLookupKey: d.candleKey,
+    candleKeyFound: d.candleKeyFound,
+    candleCount: d.candleCount,
+    // Alternate-representation diagnosis (observation only).
+    altCandleKeysFound: d.altKeys,
+    altPriceKeysFound: d.altPriceKeys,
+    keyDiagnosis: d.keyDiagnosis,
+    // ── startup / staleness evidence (cache warming vs genuinely broken) ──
+    processUptimeSec: d.processUptimeSec,
+    candleAgeSec: d.candleAgeSec,
+    requiredCandles: ATR_PERIOD + 1,
+    // ── market / position ──
+    entry: d.entry,
+    currentPrice: d.midPx > 0 ? d.midPx : null,
+    currentProfit: d.pos.profit,
+    // ── planned risk provenance ──
+    plannedRisk: d.riskValid ? d.initialRiskUsd : null,
+    plannedRiskSource: d.plannedRiskSource,
+    currentR: d.riskValid ? d.currentR : null,
+    // ── peak provenance ──
+    previousPeakProfit: d.previousPeakProfit,
+    peakProfit: d.peakProfit,
+    establishedNewPeak: d.establishedNewPeak,
+    peakR: d.riskValid ? d.peakProfit / d.initialRiskUsd : null,
+    // ── LIVE chain (unchanged behaviour, now explained) ──
+    liveSl: d.pos.sl,
+    liveAtr: d.atr > 0 ? d.atr : null,
+    liveAtrReason: d.liveAtrReason,
+    liveAtrCandidate: d.liveAtrCandidate,
+    liveFinalCandidate: d.newSl ?? d.pos.sl,
+    liveModify: d.newSl !== null,
+    liveFinalR: d.liveFinalR,
+    // ── SHADOW (advisory only) ──
+    shadowAtrReason: d.shadow.diagnostics.atrReason,
+    shadowAtrCandidate: d.shadow.diagnostics.atrCandidateR,
+    shadowMfeCandidate: d.shadow.diagnostics.mfeCandidateR,
+    shadowMfeReason: d.shadow.diagnostics.mfeReason ?? null,
+    shadowSelectedRule: d.shadow.selectedRule,
+    shadowFinalCandidate: d.shadow.finalSl,
+    shadowWouldModify: d.shadow.wouldModify,
+    shadowFinalR: d.shadowFinalR,
+    protectionDeltaR: balanced(d.shadowFinalR, d.liveFinalR),
+    retentionTargetPct: d.shadow.diagnostics.peakR > 0 && d.shadowFinalR != null
+      ? Math.round((d.shadowFinalR / d.shadow.diagnostics.peakR) * 1000) / 1000
+      : null,
+    mode: d.shadowProtection ? 'shadow' : 'live',
+  }
+  core.atrRefinedReason = atrRefinedReason
+  core.protectionHealth = classifyProtectionHealth(core)
+  return core
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -58,6 +282,14 @@ export interface ManagementCommand {
 }
 
 export interface ManageResult {
+  /**
+   * SHADOW-ONLY adaptive-protection observations (one per managed profitable
+   * position per cycle). Purely advisory: nothing in this array can influence
+   * `commands`. Built inside a try/catch so a shadow failure can never suppress
+   * existing live protection. Structured so it can later be written to the
+   * profit_protection_telemetry table without redesign.
+   */
+  shadowObservations?: Record<string, unknown>[]
   tradeState: Record<string, TradeState>
   commands:   ManagementCommand[]
   log:        string[]
@@ -204,15 +436,38 @@ function mt5Pair(sym: string): string {
 
 // ─── Core ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Narrow dependency seam for the SHADOW OBSERVER ONLY.
+ *
+ * WHY: the observer reads exactly the same inputs the live rules use, so a test
+ * cannot vary shadow behaviour without also varying live behaviour — which makes
+ * a command-invariance assertion impossible to construct honestly.
+ *
+ * This seam injects ONLY the pure composition function. The injected value can
+ * influence nothing but observation data: it cannot reach `newSl`, `commands`,
+ * trade state or close decisions, because the observer block is the sole caller
+ * and it only writes to `shadowObservations`.
+ *
+ * PRODUCTION CALLERS PASS NOTHING — the default is always the real function.
+ */
+export interface ManageTradesDeps {
+  composeProtection?: typeof composeProtection
+}
+
 export function manageTrades(
   openPositions: EAPosition[],
   latestPrices:  Record<string, { bid: number; ask: number }>,
   candleCache:   Record<string, { candles: EACandle[]; updatedAt: string }>,
   prevState:     Record<string, TradeState>,
   riskCtx?:      RiskContext,
+  deps?:         ManageTradesDeps,
 ): ManageResult {
   const now      = Date.now()
   const nowSec   = Math.floor(now / 1000)
+  // Shadow observer ONLY. Defaults to the real implementation in production.
+  const composeShadow = deps && typeof deps.composeProtection === 'function'
+    ? deps.composeProtection
+    : composeProtection
   const commands: ManagementCommand[] = []
   const log:      string[] = []
   const riskEvents: ManageResult['riskEvents'] = []
@@ -236,6 +491,11 @@ export function manageTrades(
   // rules (BE / partial-lock / ATR trail / decay / time / peak-BE) continue
   // exactly as before. See RiskContext.shadowProtection.
   const shadowProtection = !!(riskCtx && riskCtx.shadowProtection)
+
+  // SHADOW OBSERVATION COLLECTOR — declared OUTSIDE the loop so it accumulates
+  // across positions. It is written to by an isolated try/catch and read only at
+  // the return; `commands` is never derived from it.
+  const shadowObservations: Record<string, unknown>[] = []
 
   for (const pos of openPositions) {
     const key   = String(pos.ticket)
@@ -415,6 +675,7 @@ export function manageTrades(
       }
     }
 
+
     // ── 3b. Peak-giveback protection (retention ratchet) ─────────────────────
     // lib/profit-protection.mjs — progressive protection of accumulated profit.
     // Evaluated AFTER BE/partial-lock/trail so each management cycle still yields
@@ -442,6 +703,142 @@ export function manageTrades(
         // Shadow mode: log what the new rule WOULD have done; do not act.
         log.push(`[tm][shadow] ${sym}#${key} WOULD ${pp.closeRequested ? 'CLOSE' : `modify_sl to ${(pp.newSl ?? 0).toFixed(dp)}`}: stage=${pp.stage} peak=$${peakProfit.toFixed(2)} now=$${pos.profit.toFixed(2)} floor=$${pp.floorUsd.toFixed(2)}`)
       }
+    // ── 3a-SHADOW. Adaptive protection OBSERVER (no execution authority) ─────
+    //
+    // WHY HERE: this is the first point in the cycle where the authoritative
+    // values exist — `atr`/`midPx` from the live branch above, `initialRiskUsd`
+    // (planned risk), the persisted `peakProfit`/stage/floor, and the live `newSl`
+    // selection. Everything below is READ-ONLY with respect to trading: it pushes
+    // one structured object into `shadowObservations` and touches no other
+    // variable that feeds `commands`.
+    //
+    // Wrapped in try/catch: a shadow failure must never suppress live protection.
+    try {
+      const priceKeyFound  = Object.prototype.hasOwnProperty.call(latestPrices || {}, sym)
+      const candleKey      = `${sym}_M5`
+      const candleKeyFound = Object.prototype.hasOwnProperty.call(candleCache || {}, candleKey)
+
+      /**
+       * MALFORMED-KEY DIAGNOSIS (observation only).
+       *
+       * A symbol-key mismatch currently surfaces as `live-atr-missing-candles`,
+       * which is true but useless for telling "this cache is genuinely empty"
+       * apart from "the cache holds this instrument under a different string".
+       * We probe the canonical alternatives WITHOUT changing which key the live
+       * strategy uses — this is diagnosis, not correction.
+       */
+      const altKeys = []
+      const canonical = String(pair)                        // 'XAU/USD'
+      const deslashed = canonical.replace(/[^A-Za-z0-9]/g, '')  // 'XAUUSD'
+      for (const k of [`${canonical}_M5`, `${deslashed}_M5`]) {
+        if (k !== candleKey && Object.prototype.hasOwnProperty.call(candleCache || {}, k)) altKeys.push(k)
+      }
+      const altPriceKeys = []
+      for (const k of [canonical, deslashed]) {
+        if (k !== sym && Object.prototype.hasOwnProperty.call(latestPrices || {}, k)) altPriceKeys.push(k)
+      }
+      // The most likely explanation, stated plainly for the log reader.
+      const keyDiagnosis =
+        candleKeyFound && priceKeyFound ? 'keys-ok'
+        : (altKeys.length || altPriceKeys.length) ? 'key-mismatch-suspected'
+        : !candleKeyFound && !priceKeyFound ? 'both-keys-missing-no-alternate'
+        : !candleKeyFound ? 'candle-cache-empty-no-alternate'
+        : 'price-key-missing-no-alternate'
+
+      // ── STARTUP / STALENESS EVIDENCE ─────────────────────────────────────
+      // `candleCache` is NOT persisted (it is rebuilt from each EA sync), so a
+      // worker/EA restart re-opens a window where ATR is legitimately absent.
+      // Recording uptime and candle age is what lets a real trade distinguish
+      // "still warming" from "genuinely broken".
+      const processUptimeSec = (() => {
+        try { return typeof process !== 'undefined' && typeof process.uptime === 'function' ? process.uptime() : null }
+        catch { return null }
+      })()
+      const latestCandleTs = (() => {
+        if (!candleKeyFound) return null
+        const entry = (candleCache as any)[candleKey]
+        const cs = Array.isArray(entry?.candles) ? entry.candles : []
+        const last = cs[cs.length - 1]
+        if (last && Number.isFinite(Number(last.t))) {
+          const t = Number(last.t)
+          return t > 1e12 ? t / 1000 : t            // tolerate ms or s epochs
+        }
+        if (entry?.updatedAt) {
+          const p = new Date(entry.updatedAt).getTime()
+          return Number.isFinite(p) ? p / 1000 : null
+        }
+        return null
+      })()
+      const candleAgeSec = latestCandleTs == null ? null : Math.max(0, Math.round(now / 1000 - latestCandleTs))
+      const candleCount    = candleKeyFound && Array.isArray((candleCache as any)[candleKey]?.candles)
+        ? (candleCache as any)[candleKey].candles.length
+        : 0
+
+      // Why the LIVE ATR branch did or did not participate. Mirrors its condition
+      // in the same order, so a future trade answers "why did the live ATR trail
+      // not protect this?" with no silent conjunction.
+      const liveAtrReason =
+        !candleKeyFound            ? 'live-atr-missing-candles'
+        : !(atr > 0)               ? 'live-atr-invalid'
+        : !(midPx > 0)             ? 'live-atr-missing-price'
+        : !(pos.profit > TRAIL_MIN_PROFIT_USD) ? 'live-atr-below-profit-gate'
+        : existingManagerAction === 'ATR_TRAIL' ? 'live-atr-active'
+        : 'live-atr-not-better-than-live'
+
+      // The candidate the live branch actually computed (recomputed from the same
+      // inputs — the branch may decline it, so it is not always `newSl`).
+      const liveAtrMult = pos.profit > PROFIT_TIGHTEN_USD ? TRAIL_ATR_MULT_TIGHT : TRAIL_ATR_MULT_LOOSE
+      const liveAtrCandidate = (atr > 0 && midPx > 0)
+        ? (dir === 'BUY' ? midPx - atr * liveAtrMult : midPx + atr * liveAtrMult)
+        : null
+
+      // PLANNED-RISK PROVENANCE: `initialRiskUsd` is RECONSTRUCTED from the
+      // original entry/SL and instrument geometry — never assumed. If that
+      // reconstruction is not finite and positive, R is unavailable and the
+      // shadow must not invent one.
+      const riskValid = Number.isFinite(initialRiskUsd) && initialRiskUsd > 0
+      const plannedRiskSource = riskValid ? 'reconstructed-from-initial-sl' : 'unavailable'
+
+      // PEAK PROVENANCE: persisted running max carried in state, updated by this
+      // cycle. Recorded so peakR is trusted as lifecycle-wide, not a snapshot.
+      const previousPeakProfit = Number(state.peakProfit) || 0
+      const establishedNewPeak = pos.profit > previousPeakProfit
+
+      const shadow = composeShadow({
+        dir, entry: originalEntry, currentSl: newSl ?? pos.sl,
+        lots: pos.lots, pip, pipValuePerLot: pvpl,
+        plannedRiskUsd: riskValid ? initialRiskUsd : null,
+        currentProfit: pos.profit, peakProfit,
+        stage: state.protectionStage || '', retentionFloorUsd: state.retentionFloorUsd || 0,
+        riskPrice: Number.isFinite(initialRiskPips) ? initialRiskPips * pip : null,
+        lockR: 0.5,
+        atr: atr > 0 ? atr : null, atrCandles: candleCount,
+        midPx, atrMult: liveAtrMult,
+        // Candidate-only R gate for EVALUATION; deliberately NOT applied to the
+        // live $15 gate — we want telemetry comparing the two.
+        trailMinProfitR: null,
+        mode: shadowProtection ? 'shadow' : 'live',
+      })
+
+      const rOfSl = (sl: number | null) => (sl == null || !riskValid || !(pip > 0))
+        ? null
+        : ((dir === 'BUY' ? sl - originalEntry : originalEntry - sl) / pip) * pvpl * pos.lots / initialRiskUsd
+      const shadowFinalR = rOfSl(shadow.finalSl)
+      const liveFinalR   = rOfSl(newSl ?? pos.sl)
+      shadowObservations.push(buildShadowObservation({
+        key, sym, pair, entry: originalEntry, midPx, pos, initialRiskUsd, plannedRiskSource,
+        currentR, riskValid, previousPeakProfit, peakProfit, establishedNewPeak,
+        priceKeyFound, candleKey, candleKeyFound, candleCount,
+        altKeys, altPriceKeys, keyDiagnosis,
+        processUptimeSec, candleAgeSec,
+        liveAtrReason, liveAtrCandidate, atr, newSl, shadow, shadowFinalR, liveFinalR,
+        shadowProtection, now,
+      }))
+    } catch (e: any) {
+      // Best-effort and fail-safe: record, then continue existing live management.
+      log.push(`[tm][shadow] observation failed for ${sym}#${key} (ignored): ${e?.message}`)
+    }
+
       if (g.close && pp.closeRequested) {
         log.push(`[tm] ${sym}#${key} GIVEBACK-COLLAPSE-CLOSE: peak=$${peakProfit.toFixed(2)} now=$${pos.profit.toFixed(2)} stage=${pp.stage} floor=$${pp.floorUsd.toFixed(2)}`)
         emitCloseTelemetry('GIVEBACK_COLLAPSE')
@@ -579,5 +976,5 @@ export function manageTrades(
     }
   }
 
-  return { tradeState: nextState, commands, log, riskEvents, telemetry }
+  return { tradeState: nextState, commands, log, riskEvents, telemetry, shadowObservations }
 }
