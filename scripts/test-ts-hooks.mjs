@@ -17,8 +17,10 @@
 //   node --import ./scripts/test-ts-register.mjs tests/trade-manager-shadow.test.mjs
 
 import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import ts from 'typescript'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -51,4 +53,33 @@ export async function resolve(specifier, context, next) {
   }
 
   return next(specifier, context)
+}
+
+// ── load: `.tsx` → JS ───────────────────────────────────────────────────────
+//
+// Node 24 strips TypeScript TYPES natively but does NOT transform JSX, so a
+// `.tsx` component cannot be imported by Node at all (`ERR_UNKNOWN_FILE_EXTENSION`).
+// That made the app's React components — the one layer that decides what a user
+// actually sees — the only thing unloadable in tests.
+//
+// JSX is therefore transpiled with the project's own `typescript`, using the
+// automatic runtime (`react-jsx`) that Next.js already compiles with, so the
+// component under test is the real production source and not a copy. Only `.tsx`
+// is touched; every other load falls through to Node's default handling, and no
+// module is rewritten or shadowed.
+export async function load(url, context, next) {
+  if (url.endsWith('.tsx')) {
+    const file = fileURLToPath(url)
+    const { outputText } = ts.transpileModule(await readFile(file, 'utf8'), {
+      compilerOptions: {
+        jsx: ts.JsxEmit.ReactJSX,
+        module: ts.ModuleKind.ESNext,
+        target: ts.ScriptTarget.ESNext,
+        esModuleInterop: true,
+      },
+      fileName: file,
+    })
+    return { format: 'module', source: outputText, shortCircuit: true }
+  }
+  return next(url, context)
 }

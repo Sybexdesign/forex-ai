@@ -1,6 +1,7 @@
 // app/api/strategy/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient, DEFAULT_STRATEGY } from '@/lib/supabase'
+import { normaliseSizingSettings } from '@/lib/strategy-validation.mjs'
 
 // Default auto-trade gate — safe-off so the worker never executes until the
 // user explicitly flips auto_trade_enabled=TRUE in their strategies row.
@@ -59,21 +60,21 @@ export async function POST(req: NextRequest) {
       updated_at: new Date().toISOString(),
     }
     if (settings && typeof settings === 'object') {
-      // Validate manualLots if present: must be a number in [0, 0.50]; 0 → null (auto).
-      if (settings.manualLots !== undefined && settings.manualLots !== null) {
-        const lots = parseFloat(settings.manualLots)
-        if (!isFinite(lots) || lots < 0 || lots > 0.50) {
-          return NextResponse.json({ error: 'manualLots must be a number between 0 and 0.50' }, { status: 400 })
-        }
-        settings.manualLots = lots > 0 ? lots : null
+      // Validate the sizing fields via the SHARED production module so the route,
+      // the UI and the tests cannot disagree (a stale literal here previously
+      // rejected every 1..10 lot save the UI accepted).
+      const sizing = normaliseSizingSettings(settings)
+      if (!sizing.ok) {
+        return NextResponse.json({ error: sizing.error }, { status: 400 })
       }
-      payload.settings = settings
+      const normalisedSettings = sizing.normalised as typeof settings
+      payload.settings = normalisedSettings
       // Mirror manualLots into the dedicated column so it can be queried/indexed
       // without parsing JSONB. settings.manualLots remains the source of truth at runtime.
-      if (settings.manualLots === null || settings.manualLots === undefined) {
+      if (normalisedSettings.manualLots === null || normalisedSettings.manualLots === undefined) {
         payload.manual_lots = null
       } else {
-        payload.manual_lots = settings.manualLots
+        payload.manual_lots = normalisedSettings.manualLots
       }
     }
     if (autoTrade && typeof autoTrade === 'object') {

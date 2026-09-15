@@ -84,8 +84,21 @@ export interface StrategySettings {
   hardNews: boolean
   demoLock: boolean
   // Optional fixed-lot override. null/undefined = auto-size (balance × riskPct ÷ slPips).
-  // When > 0, the orders route uses this lot size; hard cap still enforced.
+  // When > 0 the orders route uses this lot size and NEVER rewrites it; the STOP
+  // DISTANCE is derived from manualRiskPct instead (see lib/manual-sizing.mjs).
   manualLots?: number | null
+  /**
+   * MANUAL-MODE RISK BUDGET — percentage of account value.
+   *
+   * This is a BUDGET, not a promise: the strategy SL cap can bind tighter than the
+   * budget allows, in which case ACTUAL risk is lower than the budget. Both are
+   * surfaced separately by the sizing policy.
+   *
+   * ONLY consulted when manualLots > 0. It must never influence AUTO sizing.
+   * The canonical default lives in DEFAULT_STRATEGY below — the sizing policy
+   * deliberately carries no default of its own, so UI / API / policy cannot drift.
+   */
+  manualRiskPct?: number | null
   // Optional override for the 1R hard-cap multiplier in mt5-sync trade manager.
   // Defaults to 1.25 if unset. Surfaced here so the orders route can read the
   // user's preferred cap when reducing manual-lots that would exceed it.
@@ -106,4 +119,14 @@ export const DEFAULT_STRATEGY: StrategySettings = {
   hardDailyStop: true,
   hardNews: true,
   demoLock: false,
+  // MANUAL-MODE RISK BUDGET — the ONE canonical default. Nothing else invents a
+  // value: the sizing policy carries no fallback, and the API validates against
+  // the ceiling below rather than substituting a number.
+  //
+  // ⚠️ FLAGGED FOR PRODUCT REVIEW: 25% was carried over from the interim backend
+  // default and no repository requirement establishes it. It is 25x the AUTO
+  // riskPct (1%), and with manualLots=10 on XAU it permits ~$3,500 of stop risk on
+  // a $10,000 account (35% of the account — the SL cap binds before the 50%
+  // ceiling would). Kept as-is for compatibility, explicitly not chosen here.
+  manualRiskPct: 25,
 }

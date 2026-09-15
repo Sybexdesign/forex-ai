@@ -7,8 +7,9 @@ import { getBroker } from '@/lib/brokers'
 import { runRiskGuards, isTradeAllowed, getBlockReasons } from '@/lib/risk'
 import { calcPropFirmStatus, applyPropFirmGuards, DEFAULT_PROP_FIRM } from '@/lib/propfirm'
 import type { PropFirmSettings } from '@/lib/propfirm'
-import { getAdminClient } from '@/lib/supabase'
-import { minStopPips, MAX_LOTS } from '@/lib/trade-levels'
+import { getAdminClient, DEFAULT_STRATEGY } from '@/lib/supabase'
+import { minStopPips } from '@/lib/trade-levels'
+import { planOrder } from '@/lib/order-planner.mjs'
 import { EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 import { evaluateExecutionGuards } from '@/lib/execution-guards.mjs'
 
@@ -298,58 +299,44 @@ export async function POST(req: NextRequest) {
     }
 
     // ─── Calculate position size and place order ──────────────────────────
-    // Manual-lots override: when strategy.manualLots is a positive number, use it
-    // directly. Otherwise auto-size via balance × riskPct ÷ safeSlPips. The hard-cap
-    // reduction below clamps manual-lots so a misconfigured user can't exceed their
-    // configured 1R cap × hardCapMultiplier on a single trade.
-    let lots: number
-    let lotSource: 'manual' | 'auto'
-    if (typeof strategy.manualLots === 'number' && strategy.manualLots > 0) {
-      lots = strategy.manualLots
-      lotSource = 'manual'
-      console.log(`[orders] ${pair} using manual lots: ${lots} (override active)`)
-    } else {
-      lots = broker.calcPositionSize(balance, strategy.riskPct, safeSlPips, pair)
-      lotSource = 'auto'
-      console.log(`[orders] ${pair} using auto lots: ${lots} (${strategy.riskPct}% of $${balance} ÷ ${safeSlPips}p)`)
-    }
-    if (!lots || lots <= 0) {
-      return NextResponse.json({ success: false, blocked: true, reasons: ['Position size calculated as 0 — check balance, risk % and SL pips in Strategy settings'] }, { status: 422 })
+    // ─── Position sizing: MANUAL request is authoritative, AUTO unchanged ──
+    // Delegated to the shared planner (lib/order-planner.mjs) so the exact code
+    // that runs here can be executed against a MOCKED BROKER in tests, instead of
+    // being verified by regex against this file. The logic is byte-for-byte the
+    // same policy it replaced — see that module for the AI-original rationale on
+    // why MANUAL lots are never rewritten to satisfy an AUTO sizing assumption.
+    //
+    // `calcPositionSize` is injected: it is the broker's AUTO sizing function and
+    // the single dependency the tests mock.
+    const plan = planOrder({
+      strategy, pair, balance,
+      calcPositionSize: (b: number, r: number, s: number, p: string) => broker.calcPositionSize(b, r, s, p),
+      defaultManualRiskPct: DEFAULT_STRATEGY.manualRiskPct,
+    })
+
+    if (!plan.ok) {
+      // Explicit, actionable rejection. We do NOT quietly trade a different size.
+      console.warn(`[orders] ${pair} order plan rejected (${plan.reason}): ${plan.message}`)
+      await alertOrderBlocked({ pair, direction, reason: plan.message })
+      return NextResponse.json({
+        success: false, blocked: true, reasons: [plan.message], reason: plan.reason,
+      }, { status: 422 })
     }
 
-    // ─── Hard-cap reduction (manual lots only) ────────────────────────────
-    // Auto-sized lots are already bounded by riskPct so they can't exceed the
-    // user's per-trade risk. Manual lots can be set arbitrarily and need a
-    // safety net. Cap = 1R × hardCapMultiplier (default 1.25; see mt5-sync route).
-    // Pip value per lot is ≈$10 for XAU/USD and most major FX (USD-quote);
-    // approximated here so a misconfig can't bypass the cap. JPY pairs are
-    // slightly different ($6.8/pip-per-lot) but the over-estimate errs safe.
+    // `lots` is the planner's authoritative size. In MANUAL mode it is the user's
+    // request, echoed unchanged; in AUTO mode it is calcPositionSize()'s output.
+    // No code below this line may rewrite it.
+    const lots      = plan.lots
+    const lotSource = plan.lotSource
+    safeSlPips      = plan.slPips
+    safeTpPips      = plan.tpPips
+    const manualRisk = plan.manualRisk
+
     if (lotSource === 'manual') {
-      const pipValuePerLot      = pair.includes('XAU') ? 10 : pair.includes('JPY') ? 6.8 : 10
-      const hardCapMult         = (typeof strategy.hardCapMultiplier === 'number' && strategy.hardCapMultiplier >= 1.0 && strategy.hardCapMultiplier <= 3.0)
-        ? strategy.hardCapMultiplier
-        : 1.25
-      const hardCapUsd          = balance * (strategy.riskPct / 100) * hardCapMult
-      const maxLossAtManualLots = lots * pipValuePerLot * safeSlPips
-      if (hardCapUsd > 0 && maxLossAtManualLots > hardCapUsd) {
-        const safeLots = hardCapUsd / (pipValuePerLot * safeSlPips)
-        console.warn(`[orders] ${pair} manual lots ${lots} would risk $${maxLossAtManualLots.toFixed(2)} > hard cap $${hardCapUsd.toFixed(2)} (1R×${hardCapMult}) — reduced to ${safeLots.toFixed(2)}`)
-        lots = Math.max(0.01, parseFloat(safeLots.toFixed(2)))
-      }
-    }
-
-    // ─── Hard lot ceiling (all sources) ───────────────────────────────────
-    // Belt-and-braces backstop AFTER the manual-lots reduction so no code path
-    // (auto, manual, or a buggy frontend) can place a position above MAX_LOTS.
-    // The MT5 Direct adapter and the MT5 EA enforce the same ceiling, so this
-    // is the third independent layer. Auto-sizing can only exceed it on very
-    // large balances at high risk % — the UI slider caps risk at MAX_RISK_PCT,
-    // but this guard is source-agnostic.
-    if (lots > MAX_LOTS) {
-      const reason = `Position size ${lots} lots exceeds the ${MAX_LOTS}-lot ceiling — rejected. Reduce risk % or balance exposure.`
-      console.warn(`[orders] BLOCKED ${pair} ${direction} — ${reason}`)
-      await alertOrderBlocked({ pair, direction, reason })
-      return NextResponse.json({ success: false, blocked: true, reasons: [reason] }, { status: 422 })
+      console.log(`[orders] ${pair} using manual lots: ${lots} (override active)`)
+      console.log(`[orders] ${pair} MANUAL ${lots} lots → SL ${safeSlPips}p TP ${safeTpPips}p · risk $${manualRisk?.riskUsd} (${manualRisk?.accountRiskPct}% of $${balance}, budget ${manualRisk?.riskPct}%)${plan.slClampedToCap ? ' [SL clamped to strategy cap]' : ''}`)
+    } else {
+      console.log(`[orders] ${pair} using auto lots: ${lots} (${strategy.riskPct}% of $${balance} ÷ ${safeSlPips}p)`)
     }
 
     // ─── Profit-target safety check ───────────────────────────────────────

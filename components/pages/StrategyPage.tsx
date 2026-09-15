@@ -7,10 +7,25 @@ import type { StrategySettings } from '@/lib/supabase'
 import { PAIR_GROUPS, PAIR_LABELS, HIGH_VOLATILITY_PAIRS, getIndexSession } from '@/lib/instruments'
 import { MAX_RISK_PCT, MAX_LOTS } from '@/lib/trade-levels'
 import { validateLotSize, lotSizeToText, isPartialLotInput } from '@/lib/lot-size.mjs'
+import { buildStrategySizingView, validateManualRiskPct, isPartialRiskInput, geometryForPair } from '@/lib/strategy-sizing-view.mjs'
+import { DEFAULT_STRATEGY } from '@/lib/supabase'
 import { currencySymbol } from '@/lib/currency'
 const STYLES = ['Scalper', 'Day Trader', 'Swing', 'Position'] as const
 
 
+
+// Status → colour. Deliberately descriptive: a large Manual exposure is shown
+// plainly (red above the AUTO risk level) and never labelled "safe".
+function statusColor(status: string): string {
+  return status === 'EXECUTABLE' ? '#00ff87'
+       : status === 'CANNOT_EXECUTE' ? '#ff3056'
+       : '#ffb800'
+}
+// Exposure colour by actual account risk %. Purely descriptive emphasis.
+function exposureColor(pct: number | null): string {
+  if (pct == null) return 'var(--text-dim)'
+  return pct >= 20 ? '#ff3056' : pct >= 10 ? '#ffb800' : '#00ff87'
+}
 
 const STYLE_DESCRIPTIONS: Record<string, string> = {
   Scalper: 'Very short trades, 5–15 min. High frequency, tight stops. Reduced TP/SL defaults.',
@@ -154,6 +169,21 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
   const [lotsText, setLotsText] = useState<string>(() => lotSizeToText(strategy.manualLots))
   const [lotsError, setLotsError] = useState<string | null>(null)
 
+  // ── Manual Risk %: the SAME draft/commit contract as Manual Lots ───────────
+  // A string draft, committed on blur. Empty must stay empty (never `0`), and the
+  // two fields are strictly independent — editing one never rewrites the other.
+  // The allowed range is the canonical one from lib/manual-sizing.mjs, not a new
+  // frontend range.
+  //
+  // Unlike Manual Lots, the draft is held as `null` = "no active edit", so the field
+  // DISPLAYS the committed value by DERIVATION rather than by copying it into state
+  // from an effect. When the committed value changes from outside (strategy reload,
+  // reset), the displayed text simply follows it — no sync step, and therefore no
+  // stale-draft bug and no state update inside an effect.
+  const [riskDraft, setRiskDraft] = useState<string | null>(null)
+  const [riskError, setRiskError] = useState<string | null>(null)
+  const riskText = riskDraft ?? (local.manualRiskPct == null ? '' : String(local.manualRiskPct))
+
   // Re-sync the draft when the COMMITTED value changes from outside (initial
   // load, strategy refresh, reset). Guarded so it never clobbers in-progress
   // typing: if the draft already parses to the incoming value, it is left alone.
@@ -201,8 +231,30 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
   // prop (useAccount → /api/account, refreshed every 3s). Falls back to a $10k
   // reference only when the broker isn't synced yet.
   const liveBalance      = typeof account?.balance === 'number' && account.balance > 0 ? account.balance : 0
+  // Falls back to a $10k reference only when the broker isn't synced yet — the AUTO
+  // position-size table below uses this. The MANUAL preview deliberately does NOT:
+  // it reports AWAITING_DATA rather than pre-filling a preview from a fake balance.
   const refBalance       = liveBalance > 0 ? liveBalance : 10000
-  const usingLiveBalance = liveBalance > 0
+
+  // ── The ONE sizing view-model for this page ─────────────────────────────────
+  // Built from the same policy /api/orders executes. The page renders this and
+  // performs no sizing arithmetic of its own. `defaultManualRiskPct` is the
+  // canonical DEFAULT_STRATEGY value — the policy deliberately carries no default.
+  const previewPair = 'XAU/USD'
+  const sizingView = buildStrategySizingView({
+    manualLots:           local.manualLots,
+    manualRiskPct:        local.manualRiskPct,
+    defaultManualRiskPct: DEFAULT_STRATEGY.manualRiskPct,
+    autoRiskPct:          local.riskPct,          // context only — never a Manual input
+    // A zero balance means "not synced yet" — the view model reports
+    // AWAITING_DATA rather than inventing a number.
+    balance:              liveBalance,
+    pair:                 previewPair,
+    currency:             account?.currency,
+    strategySlPips:       local.slPips,
+    strategyTpPips:       local.tpPips,
+    ...geometryForPair(previewPair),
+  })
 
   return (
 
@@ -392,88 +444,152 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
                 </div>
               )}
 
-              {/* Risk preview — only when override is active.
-                  Reads live balance + profitFixedUsd + profitTargetPct from /api/account
-                  via the `account` prop (set on AutoTrade page). Falls back to $10k
-                  reference balance if account isn't synced; profit-target shows
-                  "not configured" if profitFixedUsd hasn't been set. */}
-              {typeof local.manualLots === 'number' && local.manualLots > 0 && (() => {
-                const liveBalance      = typeof account?.balance === 'number' && account.balance > 0 ? account.balance : 0
-                const refBalance       = liveBalance > 0 ? liveBalance : 10000
-                const usingLiveBalance = liveBalance > 0
-                const pipPerLotXau     = 10
-                const slCap            = 25      // MIRROR_SL_CAP
-                const fixedUsd         = typeof account?.profitFixedUsd  === 'number' ? account.profitFixedUsd  : 0
-                const targetPct        = typeof account?.profitTargetPct === 'number' ? account.profitTargetPct : 75
-                const profitExit       = fixedUsd > 0 ? fixedUsd * (targetPct / 100) : 0
-                const hardCapMult      = local.hardCapMultiplier ?? 1.25
-                const maxWin           = local.manualLots * pipPerLotXau * local.tpPips
-                const maxLoss          = local.manualLots * pipPerLotXau * slCap
-                const hardCapUsd       = refBalance * (local.riskPct / 100) * hardCapMult
-                const overCap          = maxLoss > hardCapUsd
-                // Auto-lots that the orders route would compute for this balance/risk/SL.
-                // Used to scale the profit target proportionally: manualLots:autoLots
-                // should equal idealFixedUsd:currentFixedUsd. Suggestion only shown
-                // when a target is actually configured (fixedUsd > 0).
-                const autoLotsRaw      = (refBalance * (local.riskPct / 100)) / (slCap * pipPerLotXau)
-                const autoLots         = Math.max(0.01, Math.min(MAX_LOTS, autoLotsRaw))
 
-                const idealFixedUsd    = autoLots > 0 ? fixedUsd * (local.manualLots / autoLots) : fixedUsd
-                const targetConfigured = fixedUsd > 0
-                const isAligned        = targetConfigured && Math.abs(fixedUsd - idealFixedUsd) < 5
-                return (
-                  <div style={{
-                    background: 'rgba(0,0,0,0.2)', borderRadius: 3, padding: '10px 14px',
-                    fontSize: 11, lineHeight: 1.7,
-                  }}>
-                    <div style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 6 }}>
-                      AT {local.manualLots} LOTS ON XAU/USD ({usingLiveBalance ? `LIVE ${currencySymbol(account?.currency)}${refBalance.toLocaleString()} BAL` : `REF ${currencySymbol(account?.currency)}10K BAL — connect broker for live`})
+              {/* ── MANUAL RISK % ─────────────────────────────────────────────
+                  The manual-mode risk BUDGET. Independent of Manual Lots: the
+                  two are separate inputs and editing one never rewrites the
+                  other. Same draft/commit architecture as Manual Lots — the
+                  draft is a raw string so it can be empty mid-edit, and it is
+                  committed on blur. Empty commits to null and never to 0. */}
+              <div style={{ marginTop: 14 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 13, color: 'var(--text-secondary)', fontWeight: 600 }}>
+                      Manual risk %
                     </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span style={{ color: 'var(--text-muted)' }}>Max win ({local.tpPips}p TP)</span>
-                      <span className="mono" style={{ color: '#00ff87' }}>+{currencySymbol(account?.currency)}{maxWin.toFixed(2)}</span>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                      Risk budget used to DERIVE the stop loss in manual mode · 0–50%
                     </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span style={{ color: 'var(--text-muted)' }}>
-                        Profit-target exit{targetConfigured ? ` (${targetPct}% of ${currencySymbol(account?.currency)}${fixedUsd.toFixed(2)})` : ''}
-                      </span>
-                      <span className="mono" style={{ color: targetConfigured ? '#ffb800' : 'var(--text-dim)' }}>
-                        {targetConfigured ? `+${currencySymbol(account?.currency)}${profitExit.toFixed(2)}` : 'not configured'}
-                      </span>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span style={{ color: 'var(--text-muted)' }}>Max loss ({slCap}p SL)</span>
-                      <span className="mono" style={{ color: '#ff3056' }}>−{currencySymbol(account?.currency)}{maxLoss.toFixed(2)}</span>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span style={{ color: 'var(--text-muted)' }}>Hard cap (1R × {hardCapMult})</span>
-                      <span className="mono" style={{ color: '#ff8800' }}>{currencySymbol(account?.currency)}{hardCapUsd.toFixed(2)}</span>
-                    </div>
-
-                    {overCap && (
-                      <div style={{
-                        marginTop: 8, padding: '6px 8px',
-                        background: 'rgba(255,184,0,0.08)', border: '1px solid rgba(255,184,0,0.25)',
-                        borderRadius: 3, color: '#ffb800', fontSize: 11, fontWeight: 600,
-                      }}>
-                        ⚠ Manual lots exceed hard cap — orders route will reduce to ~{(hardCapUsd / (pipPerLotXau * slCap)).toFixed(2)} lots
-                      </div>
-                    )}
-                    {targetConfigured && !isAligned && (
-                      <div style={{
-                        marginTop: 8, padding: '6px 8px',
-                        background: 'rgba(0,229,180,0.06)', border: '1px solid rgba(0,229,180,0.25)',
-                        borderRadius: 3, color: '#00e5b4', fontSize: 11,
-                      }}>
-                        ℹ Profit target {currencySymbol(account?.currency)}{fixedUsd.toFixed(2)} is sized for ~{autoLots.toFixed(2)} auto-lots.
-                        For {local.manualLots} lots, suggested target ≈ <b>{currencySymbol(account?.currency)}{idealFixedUsd.toFixed(2)}</b>
-
-                        {' '}— update on AutoTrade page.
-                      </div>
-                    )}
                   </div>
-                )
-              })()}
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      // No min/max/step attributes: browser-level clamping mid-typing
+                      // is what made values like 1.25 unenterable. Validated on blur.
+                      value={riskText}
+                      onChange={e => {
+                        // Raw text into the DRAFT — no parseFloat, no clamp, no `|| 0`.
+                        const next = e.target.value
+                        setRiskDraft(next)
+                        if (riskError && isPartialRiskInput(next)) setRiskError(null)
+                      }}
+                      onBlur={() => {
+                        const res = validateManualRiskPct(riskText)
+                        if (!res.ok) {
+                          // Keep the draft so the user can see and correct what they typed.
+                          setRiskError(res.error)
+                          return
+                        }
+                        setRiskError(null)
+                        // Drop the draft: the field falls back to the committed value,
+                        // so an empty commit renders empty — never `0`. The canonical
+                        // DEFAULT_STRATEGY value is applied at read time, not persisted.
+                        setRiskDraft(null)
+                        set('manualRiskPct', res.value)
+                      }}
+                      aria-label="Manual risk percent"
+                      aria-invalid={riskError ? true : undefined}
+                      className="mono"
+                      placeholder="default"
+                      style={{ width: 80, textAlign: 'right', fontSize: 14, padding: '4px 8px' }}
+                    />
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>%</span>
+                  </div>
+                </div>
+                {riskError && (
+                  <div style={{ fontSize: 11, color: 'var(--danger, #e5484d)', marginTop: 4, textAlign: 'right' }}>
+                    {riskError}
+                  </div>
+                )}
+              </div>
+
+              {/* ── POSITION SIZING MODE + PREVIEW ──────────────────────────
+                  Every number below comes from the SHARED view model
+                  (lib/strategy-sizing-view.mjs → buildManualSizingPreview), the
+                  same policy /api/orders executes. No sizing arithmetic happens
+                  in this component, so the page cannot advertise something the
+                  planner will not do. A `null` row value means "not available"
+                  and renders as an explicit awaiting state — never a fake zero. */}
+              {sizingView.mode === 'AUTO' && (
+                <div style={{
+                  marginTop: 14, background: 'rgba(0,128,255,0.06)',
+                  border: '1px solid rgba(0,128,255,0.15)', borderRadius: 3, padding: '10px 14px',
+                }}>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 4 }}>
+                    POSITION SIZING
+                  </div>
+                  <div style={{ fontSize: 13, color: '#60c0ff', fontWeight: 700, marginBottom: 4 }}>
+                    Automatic
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+                    Lots are derived from balance × {local.riskPct}% risk ÷ {local.slPips}p SL.
+                    Enter a Manual lot size to take control; clearing it returns you here.
+                  </div>
+                </div>
+              )}
+
+
+              {sizingView.mode === 'MANUAL' && (
+                <div style={{
+                  marginTop: 14, background: 'rgba(0,0,0,0.2)', borderRadius: 3,
+                  padding: '12px 14px', fontSize: 12,
+                }}>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 8 }}>
+                    MANUAL POSITION SIZING
+                  </div>
+
+                  {sizingView.rows.map(row => (
+                    <div key={row.key} style={{
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'baseline',
+                      padding: '3px 0', borderBottom: '1px solid rgba(255,255,255,0.04)',
+                    }}>
+                      <span style={{ color: 'var(--text-muted)' }}>{row.label}</span>
+                      <span className="mono" style={{
+                        color: row.value === null ? 'var(--text-dim)'
+                             : row.key === 'status' ? statusColor(sizingView.preview.status)
+                             : row.key === 'loss'   ? '#ff3056'
+                             : row.key === 'arpct'  ? exposureColor(sizingView.preview.actualRiskPct)
+                             : row.key === 'tp'     ? '#00ff87'
+                             : 'var(--text-secondary)',
+                        fontWeight: row.key === 'status' ? 700 : 500,
+                      }}>
+                        {row.value === null ? 'Awaiting account data' : row.value}
+                      </span>
+                    </div>
+                  ))}
+
+                  {sizingView.constraint && (
+                    <div style={{
+                      marginTop: 10, padding: '6px 8px', borderRadius: 3, fontSize: 11, fontWeight: 600,
+                      background: sizingView.preview.status === 'CANNOT_EXECUTE' ? 'rgba(255,48,86,0.08)' : 'rgba(255,184,0,0.08)',
+                      border: `1px solid ${sizingView.preview.status === 'CANNOT_EXECUTE' ? 'rgba(255,48,86,0.3)' : 'rgba(255,184,0,0.25)'}`,
+                      color: sizingView.preview.status === 'CANNOT_EXECUTE' ? '#ff3056' : '#ffb800',
+                    }}>
+                      {sizingView.preview.status === 'CANNOT_EXECUTE' ? '✗ ' : '⚠ '}{sizingView.constraint}
+                    </div>
+                  )}
+
+                  {/* The requested lots are AUTHORITATIVE. When the request cannot be
+                      satisfied we say so, and never imply the system will quietly
+                      resize the position to make it fit. */}
+                  {sizingView.preview.requestedLots != null && sizingView.preview.status !== 'EXECUTABLE' && (
+                    <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+                      Requested lot size stays <b className="mono">{sizingView.preview.requestedLots.toFixed(2)}</b> lots —
+                      adjust Manual Risk % or the lot size to satisfy the constraint. The position is not resized automatically.
+                    </div>
+                  )}
+
+                  {sizingView.notices.map((n, i) => (
+                    <div key={i} style={{
+                      marginTop: 8, padding: '6px 8px', borderRadius: 3, fontSize: 11, lineHeight: 1.6,
+                      background: n.tone === 'warn' ? 'rgba(255,184,0,0.06)' : 'rgba(0,128,255,0.06)',
+                      border: `1px solid ${n.tone === 'warn' ? 'rgba(255,184,0,0.25)' : 'rgba(0,128,255,0.18)'}`,
+                      color: n.tone === 'warn' ? '#ffb800' : 'var(--text-secondary)',
+                    }}>{n.text}</div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </Panel>
