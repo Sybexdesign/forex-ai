@@ -1368,30 +1368,66 @@ const shadowHeaders = () => ({
 })
 
 /**
- * loadState — broker_configs.config.scalpShadowState, or null when unavailable.
+ * shadowLoadState — broker_configs.config.scalpShadowState.
  *
- * A restart MUST restore this rather than restarting observation from zero:
- * peakProfit, peakR, protectionStage and retentionFloorUsd are monotonic facts
- * about a trade that is still open, and losing them silently reclassifies the
- * trade into a lower protection band.
+ * Returns a STRUCTURED result. `null` used to mean BOTH "no state saved yet" and
+ * "the store is unreachable" — i.e. a legitimate first run was indistinguishable
+ * from an infrastructure failure. The runtime aborted silently on both, which is
+ * why production showed zero state, zero telemetry and zero logs; there was no way
+ * to tell "nothing to store yet" from "storage is broken".
+ *
+ *   OK_EXISTING       config found, scalpShadowState present
+ *   OK_EMPTY          config found, no scalpShadowState yet  → FIRST RUN, proceed
+ *   CONFIG_NOT_FOUND  no active broker_config row for this user
+ *   HTTP_FAILURE      non-2xx response
+ *   TIMEOUT           the request aborted on the IO timeout
+ *   NETWORK_FAILURE   fetch threw for any other reason
+ *   MALFORMED_RESPONSE body was not the expected JSON array
+ *
+ * A genuine failure must remain fail-closed; an expected first-run empty state
+ * must allow the observer to initialise. They are NOT the same thing.
  *
  * Touches ONLY config.scalpShadowState. config.tradeState belongs to the MT5
  * manager and is never read or written here.
  */
 async function shadowLoadState() {
-  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) return null
+  if (!SUPABASE_URL || !SUPABASE_KEY || !WORKER_USER_ID) {
+    return { status: 'NETWORK_FAILURE', detail: 'worker supabase env incomplete' }
+  }
+  let res
   try {
     const url = `${SUPABASE_URL}/rest/v1/broker_configs`
       + `?user_id=eq.${WORKER_USER_ID}&is_active=eq.true&limit=1&select=config`
-    const res = await fetch(url, { headers: shadowHeaders(), signal: AbortSignal.timeout(SHADOW_IO_TIMEOUT_MS) })
-    if (!res.ok) return null
-    const cfg = (await res.json())?.[0]?.config || {}
-    const all = cfg[SCALP_SHADOW_KEY]
-    return all && typeof all === 'object' ? all : {}
+    res = await fetch(url, { headers: shadowHeaders(), signal: AbortSignal.timeout(SHADOW_IO_TIMEOUT_MS) })
   } catch (e) {
-    console.error('[scalp-shadow] state load failed:', e.message)
-    return null
+    const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError'
+    const status = timedOut ? 'TIMEOUT' : 'NETWORK_FAILURE'
+    console.error(`[scalp-shadow] state load ${status}:`, e?.message)
+    return { status, detail: e?.message ?? String(e) }
   }
+  if (!res.ok) {
+    console.error('[scalp-shadow] state load HTTP_FAILURE:', res.status)
+    return { status: 'HTTP_FAILURE', detail: `HTTP ${res.status}` }
+  }
+  let body
+  try {
+    body = await res.json()
+  } catch (e) {
+    console.error('[scalp-shadow] state load MALFORMED_RESPONSE:', e?.message)
+    return { status: 'MALFORMED_RESPONSE', detail: e?.message ?? 'invalid JSON' }
+  }
+  if (!Array.isArray(body)) {
+    return { status: 'MALFORMED_RESPONSE', detail: 'response was not an array' }
+  }
+  const row = body[0]
+  if (!row || typeof row.config !== 'object' || row.config === null) {
+    return { status: 'CONFIG_NOT_FOUND', detail: 'no active broker_config row' }
+  }
+  const all = row.config[SCALP_SHADOW_KEY]
+  if (all && typeof all === 'object') return { status: 'OK_EXISTING', state: all }
+  // Config exists and is well-formed, there is simply no state yet. This is the
+  // FIRST RUN case and must NOT be reported as a failure.
+  return { status: 'OK_EMPTY', state: {} }
 }
 
 /**
@@ -1582,9 +1618,15 @@ const shadowHandoff = createShadowHandoff(scalpShadowRuntime)
  */
 function shadowStatsLine() {
   const s = scalpShadowRuntime.getStats()
+  const h = scalpShadowRuntime.getHealth ? scalpShadowRuntime.getHealth() : { status: null, counts: {} }
   return `evaluated=${s.evaluated} rows=${s.rowsPersisted} decision/snapshot=${s.evaluations} `
     + `attrSkips=${s.attributionSkips} geomSkips=${s.geometrySkips} badRisk=${s.invalidRiskSkips} `
-    + `rowFails=${s.rowWriteFailures} stateFails=${s.stateWriteFailures} evalErrors=${s.evaluatorExceptions} `
+    + `rowFails=${s.rowWriteFailures} stateFails=${s.stateWriteFailures} `
+    // stateLoadFails is the counter that used to be incremented and never read:
+    // a persistently failing state load produced zero state, zero telemetry and
+    // zero logs. health=null means runOnce() has never run at all.
+    + `stateLoadFails=${s.stateLoadFailures} health=${h.status ?? 'NEVER_RAN'} `
+    + `evalErrors=${s.evaluatorExceptions} `
     + `closes=${s.closeRowsPersisted} closeRetries=${s.closeRetries} closeGaveUp=${s.closeGaveUp} `
     + `dupes=${s.duplicateSnapshots} coalesced=${s.snapshotsCoalesced} throttle=${s.throttled}`
 }
