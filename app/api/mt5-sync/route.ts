@@ -8,6 +8,7 @@ import { manageTrades } from '@/lib/trade-manager'
 import { mergeTradeState } from '@/lib/trade-state.mjs'
 import { toRow as pptRow, dedupeRows as pptDedupe, bestEffort as pptBestEffort } from '@/lib/profit-telemetry.mjs'
 import { detectProtectionGap } from '@/lib/trade-manager'
+import { resolveProfitProtectionMode, describeProfitProtectionMode } from '@/lib/profit-protection-mode.mjs'
 import { alertRiskBreach, alertProfitReversal, alertCircuitBreaker } from '@/lib/telegram'
 import { normaliseExecution, EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 
@@ -399,9 +400,33 @@ export async function POST(req: NextRequest) {
       // unaffected. SAFE DEFAULT = shadow; live requires explicit opt-in:
       //   PROFIT_PROTECTION_SHADOW_MODE=true  (forces shadow, observation)
       //   PROFIT_PROTECTION_MODE=live          (explicit enable of the new rule)
-      const forceShadow = process.env.PROFIT_PROTECTION_SHADOW_MODE === 'true'
-      const shadowProtection = forceShadow || (process.env.PROFIT_PROTECTION_MODE || 'shadow') !== 'live'
-      pptMode = shadowProtection ? 'shadow' : 'live'
+      //
+      // ── Activation is resolved by the ONE canonical resolver ──────────────
+      // This used to AND two flags together right here, duplicating logic that
+      // lib/profit-protection-mode.mjs already owns. The duplication is what made
+      // a misconfiguration silent: `PROFIT_PROTECTION_MODE=liv` (or a case /
+      // whitespace difference) fell back to shadow with no diagnostic, and the
+      // legacy boolean beat the authoritative flag without saying so.
+      //
+      // The resolver validates the vocabulary, makes precedence explicit, and
+      // returns a `notes` entry for every non-obvious decision so the operator is
+      // told WHY their setting had no effect. Its `shadowProtection` field is
+      // `mode !== 'live'` — the same boolean this call site computed before — so
+      // manageTrades() receives identical input and no threshold, band or
+      // stop-placement behaviour is touched here.
+      //
+      // SAFE BEHAVIOUR IS UNCHANGED: nothing configured, or any unrecognised
+      // value, resolves to SHADOW. Live requires an explicit
+      // PROFIT_PROTECTION_MODE=live.
+      const ppMode = resolveProfitProtectionMode(process.env)
+      const shadowProtection = ppMode.shadowProtection
+      // Telemetry vocabulary is unchanged — supabase/migrations/20260916… documents
+      // protection_mode as `shadow | live`, so `off` records as `shadow` exactly as
+      // it did before (it is reported through the diagnostic below instead).
+      pptMode = ppMode.mode === 'live' ? 'live' : 'shadow'
+      if (ppMode.notes.length > 0) {
+        console.warn(`[mt5-sync] ${describeProfitProtectionMode(ppMode)}`)
+      }
       const { tradeState: nextState, commands, log, riskEvents, telemetry, shadowObservations } = manageTrades(
         activePositions,
         latestPrices,
@@ -433,9 +458,12 @@ export async function POST(req: NextRequest) {
       // the evidence surface for deciding whether ATR loss is the real cause of
       // poor retention — it changes nothing about execution.
       //
-      // Structured logs are used because the profit_protection_telemetry
-      // migrations are not yet applied; the object shape is the one that will be
-      // written to that table later without redesign.
+      // These are ALSO written as structured logs, in addition to the
+      // profit_protection_telemetry rows persisted further below. The log trail is
+      // what keeps the evidence available when the table is unreachable or not yet
+      // migrated (supabase/migrations/20260916_profit_protection_telemetry.sql);
+      // the observation shape is identical on both paths, so no redesign is needed
+      // to promote one to the other.
       //
       // Wrapped in try/catch: logging must NEVER interrupt trade management.
       try {

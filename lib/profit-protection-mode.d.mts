@@ -4,7 +4,8 @@ export const PP_MODE_DEFAULT: 'shadow'
 
 export interface ResolvedMode {
   mode: 'off' | 'shadow' | 'live'
-  source: 'env' | 'default' | 'invalid' | 'legacy-override'
+  /** `inexact` = a near-miss spelling of `live`; `invalid` = not a known mode. */
+  source: 'env' | 'default' | 'invalid' | 'inexact' | 'legacy-override'
   notes: string[]
   shadow: boolean
   live: boolean
