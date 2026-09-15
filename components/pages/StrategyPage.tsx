@@ -6,6 +6,7 @@ import { Panel, LoadingDots } from '../ui'
 import type { StrategySettings } from '@/lib/supabase'
 import { PAIR_GROUPS, PAIR_LABELS, HIGH_VOLATILITY_PAIRS, getIndexSession } from '@/lib/instruments'
 import { MAX_RISK_PCT, MAX_LOTS } from '@/lib/trade-levels'
+import { validateLotSize, lotSizeToText, isPartialLotInput } from '@/lib/lot-size.mjs'
 import { currencySymbol } from '@/lib/currency'
 const STYLES = ['Scalper', 'Day Trader', 'Swing', 'Position'] as const
 
@@ -143,6 +144,25 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
   const [local, setLocal] = useState<StrategySettings>({ ...strategy })
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+
+  // ── Manual lot size: a STRING DRAFT, separate from the committed number ─────
+  // The committed value is a number|null (null = auto-size). The draft is what
+  // the user is typing. Keeping them apart is what allows the field to be
+  // cleared , to hold "0." mid-edit, and to hold an invalid value long enough for
+  // the user to see why it was rejected — none of which a number-bound input can
+  // express. Committed only on blur via validateLotSize().
+  const [lotsText, setLotsText] = useState<string>(() => lotSizeToText(strategy.manualLots))
+  const [lotsError, setLotsError] = useState<string | null>(null)
+
+  // Re-sync the draft when the COMMITTED value changes from outside (initial
+  // load, strategy refresh, reset). Guarded so it never clobbers in-progress
+  // typing: if the draft already parses to the incoming value, it is left alone.
+  useEffect(() => {
+    const committed = validateLotSize(local.manualLots, { max: MAX_LOTS })
+    const next = committed.ok && !committed.empty && committed.value != null ? String(committed.value) : ''
+    setLotsText(prev => (prev.trim() === next ? prev : next))
+    setLotsError(null)
+  }, [local.manualLots])
   const hasEdited = useRef(false)
 
   // Sync when the parent loads DB data after this component has already mounted.
@@ -330,22 +350,47 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
                 </div>
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
                   <input
-                    type="number"
-                    min={0}
-                    max={0.50}
-                    step={0.01}
-                    value={local.manualLots ?? 0}
+                    type="text"
+                    inputMode="decimal"
+                    // No `max`/`min`/`step` attributes on purpose: browser-level
+                    // clamping mid-typing is what made 1 and 1.25 unenterable.
+                    // Range is validated on commit against MAX_LOTS.
+                    value={lotsText}
                     onChange={e => {
-                      const v = parseFloat(e.target.value)
-                      const clean = isFinite(v) && v > 0 ? Math.min(0.50, v) : null
-                      set('manualLots', clean)
+                      // STORE THE RAW TEXT. No parseFloat, no clamp, no `|| 0` —
+                      // normalizing here is what reset the field to 0 on every
+                      // keystroke and made a partial value like "0." untypable.
+                      const next = e.target.value
+                      setLotsText(next)
+                      // Clear a stale error as soon as the text could be valid.
+                      if (lotsError && isPartialLotInput(next)) setLotsError(null)
                     }}
+                    onBlur={() => {
+                      // The COMMIT BOUNDARY. This is the only place validation
+                      // and normalization happen.
+                      const res = validateLotSize(lotsText, { max: MAX_LOTS })
+                      if (!res.ok) {
+                        setLotsError(res.error)
+                        return
+                      }
+                      setLotsError(null)
+                      setLotsText(res.empty ? '' : String(res.value))
+                      set('manualLots', res.value)
+                    }}
+                    aria-label="Manual lot size"
+                    aria-invalid={lotsError ? true : undefined}
                     className="mono"
+                    placeholder="auto"
                     style={{ width: 80, textAlign: 'right', fontSize: 14, padding: '4px 8px' }}
                   />
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>lots</span>
                 </div>
               </div>
+              {lotsError && (
+                <div style={{ fontSize: 11, color: 'var(--danger, #e5484d)', marginTop: 4, textAlign: 'right' }}>
+                  {lotsError}
+                </div>
+              )}
 
               {/* Risk preview — only when override is active.
                   Reads live balance + profitFixedUsd + profitTargetPct from /api/account
