@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "build:market-health-test": "tsc lib/market-health.ts --outDir .testbuild --module commonjs --target es2020 --esModuleInterop --skipLibCheck",
-    "test:market-health": "npm run build:market-health-test && node tests/closed-candle.test.mjs",
+    "test:market-health": "npm run build:market-health-test && node tests/closed-candle.test.mjs; rm -rf .testbuild",
     "test:prediction-contract": "node tests/prediction-contract.test.mjs",
     "test:outcome-reconciliation": "node tests/outcome-reconciliation.test.mjs",
     "test:execution-truth": "node tests/execution-truth.test.mjs",
