@@ -140,7 +140,10 @@ export function selectLatestClosedCandle(
   const closedCount = none ? 0 : closedIdx + 1
   const closed = none ? null : entries[closedIdx]
 
-  const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString())
+  // Defensive parity with the lastCandleTime fix above: `t` is already
+  // filtered to finite values by the caller, but a future caller must not be
+  // able to turn a bad timestamp into a RangeError.
+  const iso = (t: number | null) => (t === null || !Number.isFinite(t) ? null : new Date(t).toISOString())
   return {
     none,
     formingPresent: entries.length > 0 && newestIsForming,
@@ -168,7 +171,12 @@ export function evaluateMarketHealth(
     ? inferBrokerOffsetMs(candles, spanMs, now, `${opts.pair}:${opts.timeframe}`)
     : 0
   const brokerOffsetSec = Math.round(offsetMs / 1000)
-  const lastCandleTime = lastTime ? lastTime.toISOString() : null
+  // Derive the ISO string from the ALREADY-VALIDATED millisecond value, never
+  // from the Date object's truthiness: an Invalid Date is still truthy, so
+  // `lastTime ? lastTime.toISOString() : null` threw RangeError("Invalid time
+  // value") and crashed the caller — defeating the TIME_ERROR handling below,
+  // which exists precisely for this condition.
+  const lastCandleTime = Number.isFinite(lastOpenMs) ? new Date(lastOpenMs).toISOString() : null
   const candleClosed = Number.isFinite(lastOpenMs)
     ? now >= lastOpenMs - offsetMs + spanMs
     : false

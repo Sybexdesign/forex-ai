@@ -21,6 +21,35 @@ const TF_MAP: Record<string, string> = {
   '1H': 'H1', '4H': 'H4', 'Daily': 'D', 'Weekly': 'W',
 }
 
+/**
+ * Normalise an OANDA candle time to an ISO-8601 UTC string.
+ *
+ * The adapter requests `Accept-Datetime-Format: UNIX`, so OANDA returns the bar
+ * time as a NUMERIC STRING of SECONDS, e.g. "1789556700.000000000". `new Date()`
+ * on that string is an Invalid Date — no JS Date parser accepts fractional
+ * Unix seconds — so any downstream `.toISOString()` threw RangeError("Invalid
+ * time value") and candle-time consumers silently saw untimed bars.
+ *
+ * Handles every shape defensively: an ISO string passes through, a number is
+ * treated as seconds when it looks like one and as milliseconds otherwise, and
+ * anything unparseable becomes null (which the closed-candle selector treats as
+ * "no timestamp" — a skip, never a crash).
+ */
+export function toIsoUtc(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null
+  const s = String(raw).trim()
+  if (s === '') return null
+  // Already ISO-8601 (or any string Date can parse) — use it as-is.
+  const direct = new Date(s)
+  if (Number.isFinite(direct.getTime())) return direct.toISOString()
+  // Numeric Unix seconds (integer or fractional).
+  const n = Number(s)
+  if (!Number.isFinite(n)) return null
+  const ms = n < 1e11 ? n * 1000 : n   // < ~1973 in seconds ⇒ seconds, else already ms
+  const d = new Date(ms)
+  return Number.isFinite(d.getTime()) ? d.toISOString() : null
+}
+
 export class OandaBroker implements IBroker {
   name = 'OANDA'
   supportedPairs = Object.keys(INSTRUMENT_MAP)
@@ -68,7 +97,14 @@ export class OandaBroker implements IBroker {
     const granularity = TF_MAP[timeframe] || 'H1'
     const data = await this.fetch_(`/v3/instruments/${instrument}/candles?count=${count}&granularity=${granularity}&price=M`)
     return (data.candles || []).filter((c: any) => c.complete).map((c: any) => ({
-      time: c.time,
+      // `Accept-Datetime-Format: UNIX` makes OANDA return the bar time as a
+      // NUMERIC STRING of seconds (e.g. "1789556700.000000000"), which
+      // `new Date(...)` cannot parse — an Invalid Date. Passing it through raw
+      // meant every consumer of candle TIME (closed-candle selection, the
+      // broker-clock watchdog) silently saw untimed bars, and any
+      // `.toISOString()` downstream threw RangeError("Invalid time value").
+      // Normalise to an ISO-8601 UTC string here, at the boundary.
+      time: toIsoUtc(c.time),
       open: parseFloat(c.mid.o), high: parseFloat(c.mid.h),
       low: parseFloat(c.mid.l),  close: parseFloat(c.mid.c),
       volume: c.volume,
