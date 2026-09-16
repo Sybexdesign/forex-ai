@@ -30,6 +30,9 @@ import {
   assertScalpStateMonotonic,
 } from '../lib/scalp-shadow-protection.mjs'
 import { createScalpShadowRuntime, matchAttribution, createShadowHandoff } from '../lib/scalp-shadow-runtime.mjs'
+import {
+  evaluateConfirmationGate, confirmationRequestKey, shouldRequestConfirmation,
+} from '../lib/direction-validation.mjs'
 import { createShadowObserver } from '../lib/scalp-shadow-cadence.mjs'
 import { resolveProfitProtectionMode, describeProfitProtectionMode } from '../lib/profit-protection-mode.mjs'
 
@@ -54,6 +57,17 @@ const ACCOUNT_TYPE = (process.env.ACCOUNT_TYPE || 'demo').toLowerCase()
 // lib/brokers/index.ts. Without it, those routes fall back to the env-default
 // broker singleton, which has no per-user balance and effectively blocks live orders.
 const WORKER_SERVICE_JWT = process.env.WORKER_SERVICE_JWT
+
+// ── Automated direction confirmation ─────────────────────────────────────────
+// When a qualifying signal reaches the confirmation gate and no usable permit
+// exists, the worker asks /api/scalper/direction-confirm to independently
+// validate the CURRENT market (closed candles only) and persist a short-lived
+// permit. Set DIRECTION_CONFIRMATION_AUTO=false to restore the manual-only
+// deadman switch. Either way the gate itself is unchanged and fail-closed.
+const AUTOMATED_CONFIRMATION = (process.env.DIRECTION_CONFIRMATION_AUTO || 'true').toLowerCase() !== 'false'
+// One request per (pair, closed candle) per process. Prevents several worker
+// loops reacting to one signal from each requesting a permit.
+const attemptedConfirmations = new Set()
 
 const POLL_MS          = 10_000       // 10 s per sweep
 const SIG_COOLDOWN_MS  = 60_000       // 1 min between Claude calls per pair
@@ -489,6 +503,47 @@ async function fetchLatestDirectionConfirmation(pair) {
     console.error('[sb/direction_confirmations]', e.message)
     return null
   }
+}
+
+/**
+ * requestAutomatedDirectionConfirmation — the AUTOMATED TRIGGER for the shared
+ * validation engine.
+ *
+ * Returns the PERSISTED permit, re-read from the database, never the HTTP body —
+ * so the gate judges the same row regardless of which trigger produced it.
+ *
+ * Every failure path returns null, and a null permit can only ever deny:
+ * timeout, non-CONFIRMED verdict, malformed response, or a persist failure all
+ * end here. There is no path through this function that yields permission on
+ * error.
+ */
+async function requestAutomatedDirectionConfirmation(pair, direction, candleCloseTime) {
+  if (!AUTOMATED_CONFIRMATION || !WORKER_USER_ID) return null
+  const attemptKey = confirmationRequestKey(pair, candleCloseTime)
+  if (!shouldRequestConfirmation({ attemptKey, attemptedKeys: attemptedConfirmations, hasUsablePermit: false })) {
+    return null
+  }
+  // Marked BEFORE the await so a second loop cannot start a duplicate request.
+  if (attemptedConfirmations.size > 500) attemptedConfirmations.clear()
+  attemptedConfirmations.add(attemptKey)
+
+  try {
+    const res = await apiFetch('/api/scalper/direction-confirm', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ pair, candidateDirection: direction }),
+    })
+    console.log(
+      `[direction-confirmation] pair=${pair} signal=${direction} source=automated ` +
+      `status=${res?.status} derived=${res?.direction} votes=${res?.bull}/${(res?.votes || []).length} ` +
+      `closedCandle=${res?.closedCandleTime} persisted=${res?.persisted} result=${res?.status === 'CONFIRMED' ? 'PASS' : 'REJECT'}`
+    )
+    if (res?.status !== 'CONFIRMED' || res?.persisted !== true) return null
+  } catch (e) {
+    console.warn(`[direction-confirmation] pair=${pair} source=automated result=UNAVAILABLE (${e?.message}) — no permit`)
+    return null
+  }
+  return await fetchLatestDirectionConfirmation(pair)
 }
 
 async function sbUpdate(table, id, data) {
@@ -2226,13 +2281,18 @@ async function processSignal(pair, tick, strategy, session, direction) {
   // paper/blocked/halt paths.
   let lastPlacement = null
 
-  // Direction-confirmation deadman-switch — auto-trade only runs when the
-  // operator has clicked TEST/CHECK MARKET DIRECTION in the last 5 minutes
-  // (= the 5m candle window the confirmation is bound to) AND the confirmed
-  // direction matches the current signal direction. Per operator brief:
-  // "Auto Trade may only execute when Signal Status = ACTIVE". Fetched only
-  // when the cheap upstream gates would otherwise have passed, so we don't
-  // waste DB round-trips during disabled / paper-mode / pair-filtered states.
+  // Direction-confirmation deadman-switch — auto-trade only runs when an
+  // unexpired, correctly-scoped confirmation exists for this pair whose
+  // direction matches the current signal. Per operator brief: "Auto Trade may
+  // only execute when Signal Status = ACTIVE".
+  //
+  // TWO TRIGGERS, ONE ENGINE, ONE PERMIT SHAPE:
+  //   * manual    — the operator clicks TEST/CHECK MARKET DIRECTION (unchanged)
+  //   * automated — this worker asks the validator to evaluate the CURRENT
+  //                 market, then RE-READS the persisted permit from the DB, so
+  //                 the gate below always judges the same row either way.
+  // Only fetched when the cheap upstream gates would otherwise have passed, so
+  // we don't waste DB round-trips during disabled / paper-mode / pair states.
   let directionConfirmation = null
   if (
     WORKER_MODE === 'live' &&
@@ -2240,20 +2300,28 @@ async function processSignal(pair, tick, strategy, session, direction) {
     liveStrategy.autoTradePairs.includes(pair)
   ) {
     directionConfirmation = await fetchLatestDirectionConfirmation(pair)
+    if (!directionConfirmation && AUTOMATED_CONFIRMATION) {
+      directionConfirmation = await requestAutomatedDirectionConfirmation(pair, dir, tick?.candleCloseTime)
+    }
   }
 
-  // The confirmation row stores the WINNING group's direction — already
-  // inverted when recommended='mirror' (direction-check API persists the
-  // majority of the INVERTED results in that case). Translate back to
-  // scalp-signal space before comparing against the worker's signal `dir`,
-  // otherwise a mirror-recommended confirmation can never match and the gate
-  // silently blocks every trade it was meant to allow.
-  const invertDir = (d) => (d === 'BUY' ? 'SELL' : d === 'SELL' ? 'BUY' : 'HOLD')
-  const confirmationExpectedDir = directionConfirmation
-    ? (directionConfirmation.recommended === 'mirror'
-        ? invertDir(directionConfirmation.direction)
-        : directionConfirmation.direction)
-    : null
+  // Single authoritative gate (lib/direction-validation.mjs). Every unresolved
+  // condition — missing/expired/mismatched/permit-for-another-account or pair,
+  // stale or suspended market data, unbound automated permit — denies here.
+  const confirmationGate = evaluateConfirmationGate({
+    permit:          directionConfirmation,
+    signalDirection: dir,
+    userId:          WORKER_USER_ID || null,
+    pair,
+    now:             new Date().toISOString(),
+    market: {
+      simulated:          tick?.simulated === true,
+      dataSuspended:      tick?.dataSuspended === true,
+      closedCandleAgeSec: typeof tick?.closedCandleAgeSec === 'number' ? tick.closedCandleAgeSec : null,
+      maxAgeSec:          SIGNAL_MAX_AGE_SECONDS,
+      candleCloseTime:    tick?.candleCloseTime ?? null,
+    },
+  })
 
   if (WORKER_MODE !== 'live') {
     logAutoTradeDecision('skipped-paper-mode', pair, dir, signal)
@@ -2261,26 +2329,19 @@ async function processSignal(pair, tick, strategy, session, direction) {
     logAutoTradeDecision('skipped-disabled', pair, dir, signal)
   } else if (!liveStrategy.autoTradePairs.includes(pair)) {
     logAutoTradeDecision('skipped-pair-filter', pair, dir, signal, { allowedPairs: liveStrategy.autoTradePairs })
-  } else if (!directionConfirmation) {
-    // No unexpired confirmation row for this pair — operator hasn't clicked
-    // TEST/CHECK MARKET DIRECTION in the last 5 min (or WORKER_USER_ID is
-    // unset, or the DB query failed transiently — all surface here).
-    logAutoTradeDecision('skipped-no-confirmation', pair, dir, signal, {
+  } else if (!confirmationGate.pass) {
+    // Every confirmation failure lands here with a structured reason
+    // (confirmation-unavailable / -hold / -stale / -account-mismatch /
+    // -pair-mismatch / -candle-mismatch / -market-data-invalid /
+    // -direction-mismatch). There is deliberately no default-allow branch.
+    // `legacyReason` keeps continuity with the previous log vocabulary.
+    logAutoTradeDecision(confirmationGate.reason, pair, dir, signal, {
+      ...confirmationGate.detail,
+      expectedDirection: confirmationGate.expectedDirection,
+      legacyReason: 'skipped-no-confirmation',
       hint: WORKER_USER_ID
-        ? 'No active 5m direction confirmation. Click TEST/CHECK MARKET DIRECTION to enable auto-trade for the next 5 min.'
+        ? 'No usable direction confirmation for this candle. Automated validation runs when DIRECTION_CONFIRMATION_AUTO is on; the operator can still confirm manually.'
         : 'WORKER_USER_ID not configured — worker cannot associate confirmations',
-    })
-  } else if (confirmationExpectedDir !== dir) {
-    // Confirmation exists but disagrees with the worker's current signal —
-    // operator confirmed BUY, worker is now seeing SELL (or vice versa).
-    // Also covers HOLD confirmations (HOLD never matches BUY/SELL).
-    // Conservative: skip and wait for the operator to re-confirm.
-    logAutoTradeDecision('skipped-confirmation-direction-mismatch', pair, dir, signal, {
-      confirmedDirection: directionConfirmation.direction,
-      recommended:        directionConfirmation.recommended,
-      expectedDir:        confirmationExpectedDir,
-      confirmedAt:        directionConfirmation.analyzed_at,
-      confirmedExpires:   directionConfirmation.expires_at,
     })
   } else if (tradingHalted) {
     logAutoTradeDecision('skipped-daily-loss-halted', pair, dir, signal)
@@ -2826,6 +2887,7 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   console.log(`[worker] Target : ${BASE_URL}`)
   console.log(`[worker] Pairs  : ${PAIRS.join(' | ')}`)
   console.log(`[worker] Auth   : ${WORKER_SERVICE_JWT ? `JWT (${WORKER_SERVICE_JWT.length} chars) — per-user broker_configs` : 'NONE — env-default broker (multi-account disabled)'}`)
+  console.log(`[worker] DirCfm : ${AUTOMATED_CONFIRMATION ? 'AUTOMATED validation enabled (set DIRECTION_CONFIRMATION_AUTO=false for manual-only)' : 'MANUAL only — operator must click TEST/CHECK MARKET DIRECTION'}`)
   if (WORKER_MODE === 'live' && !WORKER_SERVICE_JWT) {
     console.warn('[worker] ⚠ WORKER_SERVICE_JWT not set — live orders will use env-default broker, not the per-user MT5/OANDA account. Set WORKER_SERVICE_JWT to enable per-user routing.')
   }
