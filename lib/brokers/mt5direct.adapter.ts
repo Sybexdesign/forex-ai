@@ -17,7 +17,7 @@ interface CandleCacheEntry {
   updatedAt: string   // ISO timestamp of when the EA last pushed this set
 }
 
-interface Mt5DirectConfig {
+export interface Mt5DirectConfig {
   webhookToken?:  string
   balance?:       string
   equity?:        string

@@ -9,6 +9,7 @@
 //   4. Simulation (absolute last resort)
 
 import type { Price, Candle } from './brokers/interface'
+import type { Mt5DirectConfig } from './brokers/mt5direct.adapter'
 
 const WEBHOOK_ONLY = new Set(['Simulation'])
 
@@ -27,37 +28,95 @@ export function resetCapitalCircuit() {
   console.log('[marketdata] Capital.com circuit breaker reset')
 }
 
-async function tryMt5ServerCandles(pair: string, timeframe: string, count: number): Promise<Candle[] | null> {
+// ─── Server-level MT5 fallback: DETERMINISTIC ACCOUNT IDENTITY ───────────────
+//
+// These two helpers serve callers that present NO user token. They used to pick
+// the broker_configs row with the most recent `updated_at`:
+//
+//     .in('broker_type', ['mt5direct','exness']).order('updated_at', {ascending:false}).limit(1)
+//
+// That is ownership by timestamp: with more than one EA pushing, the account
+// that happened to sync last supplied ANOTHER user's prices and candles. It was
+// demonstrated live — an unauthenticated /api/scalper/tick call returned the
+// FusionMarkets account's bar close while the funded Exness account was the one
+// under test. "Most recently updated" is not an identity, so it is gone.
+//
+// The fallback now requires an EXPLICIT, configured account identity and fails
+// CLOSED when none is configured or when the identity is ambiguous:
+//
+//   * MT5_SERVER_USER_ID — purpose-built for this path (preferred)
+//   * WORKER_USER_ID     — honoured as the existing deployment convention
+//   * neither set        → null, so the caller falls through to OANDA →
+//                          Capital.com → simulation (account-neutral sources)
+//   * two active rows    → null (ambiguous, never guessed)
+//
+// Authenticated callers never reach this code: getMarketCandles/getMarketPrices
+// resolve the caller's own broker_config via getBroker(authToken) first. This is
+// the ladder of last resort, and it must not be able to pick the wrong account.
+
+/** The explicit account this server-level fallback is allowed to read, if any. */
+export function resolveServerMt5UserId(env: Record<string, string | undefined> = process.env): string | null {
+  const id = (env.MT5_SERVER_USER_ID || env.WORKER_USER_ID || '').trim()
+  return id || null
+}
+
+/**
+ * Choose the single active config owned by `userId`.
+ * Returns null when there is no explicit owner or when ownership is ambiguous —
+ * never falls back to another row.
+ */
+export function pickServerConfig(
+  rows: Array<{ user_id?: string | null; config?: Mt5DirectConfig | null }> | null | undefined,
+  userId: string | null,
+): Mt5DirectConfig | null {
+  if (!userId) return null
+  const owned = (rows || []).filter((r) => r?.user_id === userId && r?.config)
+  // Exactly one active row per user is guaranteed by
+  // broker_configs_one_active_per_user (migration 20260606); anything else is an
+  // unexpected state and must not be resolved by guessing.
+  if (owned.length !== 1) return null
+  return owned[0].config ?? null
+}
+
+/** Load the explicitly-owned active config, or null. Fail closed, never timestamp-ordered. */
+async function loadServerMt5Config(): Promise<Mt5DirectConfig | null> {
+  const userId = resolveServerMt5UserId()
+  if (!userId) {
+    console.warn('[marketdata] server MT5 fallback disabled — MT5_SERVER_USER_ID/WORKER_USER_ID not set (failing closed to account-neutral feeds)')
+    return null
+  }
   try {
     const { getAdminClient } = await import('./supabase')
     const sb = getAdminClient()
     const { data: rows } = await sb
       .from('broker_configs')
-      .select('config')
+      .select('user_id, config')
+      .eq('user_id', userId)
+      .eq('is_active', true)
       .in('broker_type', ['mt5direct', 'exness'])
-      .order('updated_at', { ascending: false })
-      .limit(1)
-    if (!rows?.[0]?.config) return null
+      .limit(2)          // 2 so an ambiguity is DETECTABLE rather than silently truncated
+    return pickServerConfig(rows, userId)
+  } catch { /* fall through */ }
+  return null
+}
+
+async function tryMt5ServerCandles(pair: string, timeframe: string, count: number): Promise<Candle[] | null> {
+  const config = await loadServerMt5Config()
+  if (!config) return null
+  try {
     const { Mt5DirectBroker } = await import('./brokers/mt5direct.adapter')
-    const candles = await new Mt5DirectBroker(rows[0].config).getCandles(pair, timeframe, count)
+    const candles = await new Mt5DirectBroker(config).getCandles(pair, timeframe, count)
     if (candles && candles.length >= 50) return candles
   } catch { /* fall through */ }
   return null
 }
 
 async function tryMt5ServerPrices(pairs: string[]): Promise<Price[] | null> {
+  const config = await loadServerMt5Config()
+  if (!config) return null
   try {
-    const { getAdminClient } = await import('./supabase')
-    const sb = getAdminClient()
-    const { data: rows } = await sb
-      .from('broker_configs')
-      .select('config')
-      .in('broker_type', ['mt5direct', 'exness'])
-      .order('updated_at', { ascending: false })
-      .limit(1)
-    if (!rows?.[0]?.config) return null
     const { Mt5DirectBroker } = await import('./brokers/mt5direct.adapter')
-    const prices = await new Mt5DirectBroker(rows[0].config).getPrices(pairs)
+    const prices = await new Mt5DirectBroker(config).getPrices(pairs)
     if (prices && prices.length > 0) return prices
   } catch { /* fall through */ }
   return null

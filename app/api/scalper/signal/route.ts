@@ -151,12 +151,21 @@ const HTF_SPAN_MS: Record<string, number> = {
 }
 const htfCache = new Map<string, { at: number; bias: 'BUY' | 'SELL' | null; simulated: boolean }>()
 
-async function fetchHtfBias(pair: string, timeframe: string): Promise<'BUY' | 'SELL' | null> {
-  const key = `${pair}:${timeframe}`
+async function fetchHtfBias(pair: string, timeframe: string, authToken?: string): Promise<'BUY' | 'SELL' | null> {
+  // Cache key MUST include the calling identity: the HTF bias is derived from
+  // market data that is account-specific, so a shared `${pair}:${timeframe}` key
+  // could serve one account's bias to another.
+  const who = authToken ? authToken.slice(-12) : 'anon'
+  const key = `${who}:${pair}:${timeframe}`
   const hit = htfCache.get(key)
   if (hit && Date.now() - hit.at < HTF_CACHE_MS) return hit.simulated ? null : hit.bias
   try {
-    const { candles, simulated } = await getMarketCandles(undefined, pair, timeframe, 200)
+    // The caller's token is FORWARDED, never dropped. Passing `undefined` here
+    // was a real cross-account defect: the HTF bias for the funded worker was
+    // computed from whichever broker_configs row had the newest `updated_at`,
+    // i.e. potentially another account's symbols entirely. An account-specific
+    // trading input must resolve the caller's own account or nothing at all.
+    const { candles, simulated } = await getMarketCandles(authToken, pair, timeframe, 200)
     // Closed-candle audit 2026-09-04: never let a forming 15M/1H bar leak into
     // the HTF confirmation — restrict indicators to fully closed candles.
     const span = HTF_SPAN_MS[timeframe] || 15 * 60_000
@@ -463,6 +472,11 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
     const { pair, strategy, userId } = body as { pair: string; strategy: Strategy; userId?: string }
+    // Caller identity for account-specific market data (HTF bias). Forwarded to
+    // getMarketCandles so the bias is computed from THIS caller's account; when
+    // absent the HTF read falls back to account-neutral feeds rather than to
+    // whichever broker_configs row happened to sync last.
+    const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
 
     // Hard block: never generate a tradable signal from simulated market data
     if (body.simulated === true) {
@@ -784,8 +798,8 @@ Return JSON only:
     let htfBias1h:  Direction | null = null
     if (strategy === 'Scalp' && result.direction !== 'HOLD') {
       const [b15, b1h] = await Promise.all([
-        fetchHtfBias(pair, '15m'),
-        fetchHtfBias(pair, '1H'),
+        fetchHtfBias(pair, '15m', authToken),
+        fetchHtfBias(pair, '1H', authToken),
       ])
       htfBias15m = b15
       htfBias1h  = b1h
