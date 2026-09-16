@@ -187,9 +187,20 @@ export async function getMarketCandles(
   if (capitalCandles) return { candles: capitalCandles, source: 'Capital.com', simulated: false }
 
   // 4. Simulation — only when no real data source is reachable
-  const { SimulationBroker } = await import('./brokers/simulation.adapter')
-  const simCandles = await new SimulationBroker().getCandles(pair, timeframe, count)
-  return { candles: simCandles, source: 'Simulation', simulated: true }
+  // 4. Simulation — only when no real data source is reachable.
+  // GUARDED: this is the end of the ladder, so a failure here must degrade to an
+  // explicit empty result rather than throwing out of getMarketCandles(). An
+  // unhandled throw here previously propagated to /api/scalper/tick, which had
+  // no try/catch, and surfaced to the operator as a bare 500.
+  try {
+    const { SimulationBroker } = await import('./brokers/simulation.adapter')
+    const simCandles = await new SimulationBroker().getCandles(pair, timeframe, count)
+    return { candles: simCandles, source: 'Simulation', simulated: true }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    console.error(`[marketdata] simulation candles unavailable for ${pair}/${timeframe}: ${msg}`)
+    return { candles: [], source: 'Unavailable', simulated: true }
+  }
 }
 
 export async function getMarketPrices(
@@ -246,7 +257,16 @@ export async function getMarketPrices(
   }
 
   // 4. Simulation
-  const { SimulationBroker } = await import('./brokers/simulation.adapter')
-  const prices = await new SimulationBroker().getPrices(pairs)
-  return { prices, source: 'Simulation', simulated: true }
+  // 4. Simulation — only when no real data source is reachable. GUARDED for the
+  // same reason as the candle ladder: it is the end of the chain and must not be
+  // able to throw out of getMarketPrices().
+  try {
+    const { SimulationBroker } = await import('./brokers/simulation.adapter')
+    const simPrices = await new SimulationBroker().getPrices(pairs)
+    return { prices: simPrices, source: 'Simulation', simulated: true }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    console.error(`[marketdata] simulation prices unavailable: ${msg}`)
+    return { prices: [], source: 'Unavailable', simulated: true }
+  }
 }

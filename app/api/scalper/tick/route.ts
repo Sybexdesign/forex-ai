@@ -29,7 +29,27 @@ function defaultSpread(pair: string): number {
   return 0.00012
 }
 
+// lib/indicators.ts throws below this many bars. Guard BEFORE calling it — an
+// unguarded throw here used to surface to the operator as a bare "tick 500".
+const MIN_INDICATOR_BARS = 60
+
+// Every failure must be diagnosable. The worker's apiFetch() throws on any
+// non-OK status, so this stays fail-closed for trading; the difference is that
+// the operator gets a JSON reason instead of an empty 500.
 export async function GET(req: NextRequest) {
+  try {
+    return await handleTick(req)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    console.error('[scalper/tick] unhandled error:', msg)
+    return NextResponse.json(
+      { error: 'tick-failed', detail: msg, dataSuspended: true },
+      { status: 500 },
+    )
+  }
+}
+
+async function handleTick(req: NextRequest) {
   const { searchParams } = new URL(req.url)
   const pair      = searchParams.get('pair')      || 'XAU/USD'
   const timeframe = searchParams.get('timeframe') || '5m'
@@ -61,6 +81,40 @@ export async function GET(req: NextRequest) {
   let data: any[] = candles
   if (!sel.none && sel.closedCount > 1 && sel.closedCount <= candles.length) {
     data = candles.slice(0, sel.closedCount)
+  }
+
+  // ── FAIL CLOSED on too little CLOSED history ──────────────────────────────
+  // calculateIndicators() throws below MIN_INDICATOR_BARS. Padding `data` with
+  // the FORMING bar to reach the minimum is not an option — that would introduce
+  // lookahead into the very feature set the signal engine consumes. A short feed
+  // must therefore produce an explicit, diagnosable refusal (with
+  // dataSuspended=true, which makes /api/scalper/signal refuse to generate),
+  // never a crash and never a signal built on a partially-formed bar.
+  if (data.length < MIN_INDICATOR_BARS) {
+    console.error(
+      `[scalper/tick] insufficient closed candles for ${pair} ${timeframe}: ` +
+      `closed=${data.length} < ${MIN_INDICATOR_BARS} (rawCandles=${candles.length}, ` +
+      `closedCount=${sel.closedCount}, source=${brokerName}, simulated=${simulated})`
+    )
+    return NextResponse.json({
+      error: 'insufficient-closed-candles',
+      pair,
+      timeframe,
+      closedBars:     data.length,
+      minBars:        MIN_INDICATOR_BARS,
+      closedCount:    sel.closedCount,
+      rawCandles:     candles.length,
+      source:         brokerName,
+      simulated,
+      closedCandleTime: sel.closedCloseTime ?? null,
+      dataSuspended:  true,
+      marketHealth: {
+        status: 'INSUFFICIENT_CLOSED_CANDLES',
+        healthy: false,
+        dataSuspended: true,
+        reason: `only ${data.length} closed bars for ${pair} ${timeframe} (need ${MIN_INDICATOR_BARS})`,
+      },
+    }, { status: 503 })
   }
 
   // Standard indicators (EMA20/50, RSI14, MACD, Bollinger, ADX) — closed candles only
