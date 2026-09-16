@@ -1528,6 +1528,13 @@ async function shadowAttribute(trades) {
   const url = `${SUPABASE_URL}/rest/v1/trades`
     + `?user_id=eq.${WORKER_USER_ID}`
     + `&source=eq.${SCALP_SOURCE}`
+    // Phase 3.3.1 (§7-I) — only rows that still represent an OPEN trade may be
+    // attributed to a currently open broker position. Without this a CLOSED scalp
+    // row whose ticket collides with a live position (stale row, or a position
+    // the close-reconciliation path has not caught up with yet) would be adopted
+    // as an eligible open lifecycle, letting an already-finished trade be
+    // re-observed. Absence of a match fails closed as `no-scalp-trade-row`.
+    + `&result=eq.OPEN`
     + `&broker_ticket=in.%28${ids.map(encodeURIComponent).join('%2C')}%29`
     + `&select=id,broker_ticket,source,pair,direction,created_at,closed_at`
   const res = await fetch(url, {

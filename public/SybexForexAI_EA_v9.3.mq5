@@ -898,7 +898,7 @@ string BuildOpenPositionsJSON()
 //+------------------------------------------------------------------+
 bool PlaceOrder(string symbol, string direction, double lots,
                 double slPrice, double tpPrice,
-                double &filledPrice, int &retcode)
+                double &filledPrice, int &retcode, ulong &posTicket)
 {
    string fullSym = symbol + SymbolSuffix;
    ENUM_ORDER_TYPE_FILLING modes[3];
@@ -932,6 +932,51 @@ bool PlaceOrder(string symbol, string direction, double lots,
       if(ok && res.retcode == 10009)
       {
          filledPrice = res.price;
+
+         // ── v9.3.1 — resolve the NATIVE POSITION ticket ──────────────────
+         // The app must persist the SAME identity that BuildOpenPositionsJSON()
+         // reports, i.e. POSITION_TICKET from PositionGetTicket(i). That is NOT
+         // interchangeable with res.order: per MT5 semantics a position's ticket
+         // is the ticket of the order that OPENED it, so on a netting account an
+         // order that ADDS to an existing position leaves the position holding
+         // its ORIGINAL ticket while res.order is a new, different ticket. Using
+         // res.order blindly would persist an identifier in the wrong identity
+         // space and attribution would silently never match.
+         //
+         // 1) PositionSelectByTicket(res.order) — exact for hedging and for any
+         //    order that opened a new position; reads the real POSITION_TICKET.
+         // 2) Otherwise the order added to an existing position (netting): find
+         //    the symbol's position for our magic and read its ticket. This is
+         //    EA-side resolution of which position our own order affected — not
+         //    an attribution heuristic.
+         // 3) If neither resolves, leave posTicket 0 and report nothing: the app
+         //    fails closed (attribution stays unavailable) rather than recording
+         //    a fabricated identifier.
+         posTicket = 0;
+         if(PositionSelectByTicket(res.order))
+            posTicket = (ulong)PositionGetInteger(POSITION_TICKET);
+
+         if(posTicket == 0)
+         {
+            for(int i = PositionsTotal() - 1; i >= 0; i--)
+            {
+               ulong t = PositionGetTicket(i);
+               if(t == 0) continue;
+               if(PositionGetString(POSITION_SYMBOL) != fullSym) continue;
+               if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+               if(PositionGetInteger(POSITION_TYPE)
+                  != ((direction == "BUY") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL)) continue;
+               posTicket = t;
+               break;
+            }
+            if(posTicket != 0)
+               Print("SybexForexAI v9.3.1: position ticket resolved via symbol scan=", posTicket);
+         }
+
+         if(posTicket == 0)
+            Print("SybexForexAI v9.3.1: WARNING fill OK but native position ticket UNRESOLVED for ",
+                  fullSym, " order=", res.order, " — attribution will remain unavailable");
+
          if(f > 0) Print("SybexForexAI v9.0: used fallback fill mode ", EnumToString(modes[f]));
          return true;
       }
@@ -1149,15 +1194,28 @@ string ExecuteOrders(string response)
          double tpPrice   = JsonNum(obj, "tpPrice");
          double filledPrice = 0;
          int    retcode     = 0;
-         bool   ok = PlaceOrder(symbol, direction, lots, slPrice, tpPrice, filledPrice, retcode);
+         ulong  posTicket   = 0;
+         bool   ok = PlaceOrder(symbol, direction, lots, slPrice, tpPrice, filledPrice, retcode, posTicket);
 
 
          if(ok)
          {
+            // v9.3.1 — both identities are reported. `id` stays the APPLICATION
+            // correlation id (the server matches it against trades.oanda_trade_id,
+            // which is never overwritten). `ticket` is the NATIVE MT5 position
+            // ticket — the same identity space as openPositions[].ticket — which
+            // the server persists into trades.broker_ticket on confirmed fill.
+            // Emitted as a bare number to match BuildOpenPositionsJSON()'s
+            // "ticket":<n> style; OMITTED entirely when unresolved so the server
+            // fails closed instead of storing something wrong.
             completed += "{\"id\":\"" + orderId + "\",\"success\":true"
-                       + ",\"filledPrice\":" + DoubleToString(filledPrice,5) + "}";
+                       + ",\"filledPrice\":" + DoubleToString(filledPrice,5);
+            if(posTicket != 0)
+               completed += ",\"ticket\":" + IntegerToString((long)posTicket);
+            completed += "}";
             Print("SybexForexAI v9.0: FILLED ", symbol, " ", direction,
-                  " lots=", lots, " @ ", filledPrice);
+                  " lots=", lots, " @ ", filledPrice,
+                  (posTicket != 0 ? " position=" + IntegerToString((long)posTicket) : " position=UNRESOLVED"));
          }
          else
          {

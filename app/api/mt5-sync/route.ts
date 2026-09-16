@@ -11,6 +11,7 @@ import { detectProtectionGap } from '@/lib/trade-manager'
 import { resolveProfitProtectionMode, describeProfitProtectionMode } from '@/lib/profit-protection-mode.mjs'
 import { alertRiskBreach, alertProfitReversal, alertCircuitBreaker } from '@/lib/telegram'
 import { normaliseExecution, EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
+import { completionToTradeUpdate, completionDiagnosticLine } from '@/lib/mt5-fill-attribution.mjs'
 
 export const dynamic = 'force-dynamic'
 
@@ -102,12 +103,22 @@ export async function POST(req: NextRequest) {
       for (const completed of completedOrders) {
         if (!completed.success) continue
         try {
+          // Phase 3.3.1 — identity transition. The trade is still located by the
+          // APPLICATION correlation id (`oanda_trade_id`), which is never
+          // overwritten. `broker_ticket` is replaced with the NATIVE MT5 position
+          // ticket the EA reported, so it finally shares an identity space with
+          // /api/account openTrades[].id and the shadow observer's attribution
+          // join can match. A missing/invalid ticket leaves broker_ticket
+          // untouched — attribution stays UNAVAILABLE rather than AMBIGUOUS.
+          const { update, nativeTicket } = completionToTradeUpdate(completed)
+          // Phase 3.3.1 — sanitised EA-side evidence. Emitted BEFORE the row
+          // update so the EA → sync leg is provable even if the DB write fails.
+          // Only redacted identifiers are retained (see summariseCompletionDiagnostics).
+          const line = completionDiagnosticLine(completed)
+          if (nativeTicket) console.log(`[mt5-sync] ${line}`)
+          else console.warn(`[mt5-sync] ${line}`)
           await sb.from('trades')
-            .update({
-              entry_price: completed.filledPrice ?? null,
-              result: 'OPEN',
-              opened_at: new Date().toISOString(),
-            })
+            .update(update)
             .eq('user_id', userId)
             .eq('oanda_trade_id', completed.id)
             .eq('result', 'OPEN') // don't overwrite if already closed
