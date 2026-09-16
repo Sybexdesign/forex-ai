@@ -387,7 +387,7 @@ const PROFIT_TIGHTEN_USD   = 15      // $-threshold to switch to tight trail
 // +$9.63/100s exit on 2026-06-16 12:02 confirmed the bypass. Trail now waits
 // for the trade to clear $15 unrealised so the fixed-target ladder has a
 // chance to bind on shallow wins. Mirror EA gate: input TrailMinUsd in
-// SybexForexAI_EA_v9.3.mq5 — both layers must agree or whichever fires first
+// SybexForexAI_EA_v9.3.1.mq5 — both layers must agree or whichever fires first
 // wins the per-tick SL race.
 const TRAIL_MIN_PROFIT_USD = 15
 // PEAK_BE_THRESHOLD_USD added 2026-06-16. The $15 trail floor (above) closed a

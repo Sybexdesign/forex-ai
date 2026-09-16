@@ -354,7 +354,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                   {/* Setup instructions */}
                   <div style={{ padding: '12px 14px', background: 'rgba(0,255,135,0.04)', border: '1px solid rgba(0,255,135,0.2)', borderRadius: 3, fontSize: 12, color: '#80d0a0', marginBottom: 12 }}>
                     <div style={{ fontWeight: 700, marginBottom: 8, color: '#00ff87' }}>EA v9.3.1 setup — native ticket propagation + MFE/MAE tracking + closed position recording + fast order polling (2s), direct Supabase sync:</div>
-                    <div style={{ marginBottom: 5 }}>1. Save this broker config, then download <strong>SybexForexAI_EA_v9.3.mq5</strong> (build v9.3.1) below</div>
+                    <div style={{ marginBottom: 5 }}>1. Save this broker config, then download <strong>SybexForexAI_EA_v9.3.1.mq5</strong> below</div>
                     <div style={{ marginBottom: 5 }}>2. In MT5: <strong>Tools → Options → Expert Advisors → Allow WebRequest</strong> → add the Supabase URL below</div>
                     <div style={{ marginBottom: 5 }}>3. Compile the EA in MetaEditor (F7) and attach to your chart. The Experts tab must show <strong>&quot;SybexForexAI EA v9.3.1 started&quot;</strong> — if it shows v9.3 you are running a stale compile.</div>
                     <div>4. In EA Inputs, paste your <strong>Webhook Token</strong> — copy it below</div>
@@ -380,10 +380,10 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                     >Copy</button>
                   </div>
 
-                  {/* Download EA v9 */}
+                  {/* Download EA v9.3.1 */}
                   <a
-                    href="/SybexForexAI_EA_v9.3.mq5"
-                    download="SybexForexAI_EA_v9.3.mq5"
+                    href="/SybexForexAI_EA_v9.3.1.mq5"
+                    download="SybexForexAI_EA_v9.3.1.mq5"
                     style={{
                       display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
                       background: 'rgba(0,229,180,0.12)', color: '#00e5b4',
@@ -392,7 +392,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                       textDecoration: 'none', letterSpacing: 0.3, width: '100%', boxSizing: 'border-box',
                     }}
                   >
-                    ↓ Download SybexForexAI_EA_v9.3.mq5 (build v9.3.1 — native ticket)
+                    ↓ Download SybexForexAI_EA_v9.3.1.mq5
                   </a>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
                     v9.3.1 — native MT5 position-ticket propagation (deterministic scalp attribution) plus MFE/MAE excursion tracking, closed position recording, and the per-symbol price-skip log (Experts tab shows which symbols were dropped from the price push and why). Peak and trough profit captured per trade for SL-distance optimisation.
