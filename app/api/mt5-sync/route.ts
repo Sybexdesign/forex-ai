@@ -586,6 +586,11 @@ export async function POST(req: NextRequest) {
         const rows = pptDedupe(lastTelemetry.map((t: any) => pptRow(t, {
           protectionMode: pptMode,
           stateSeq: stateSeq + 1,
+          // Ownership comes from the token->broker_configs lookup at the top of
+          // this handler (a server-side identity), never from the request body.
+          // A telemetry row that cannot be attributed to an account must not be
+          // written at all.
+          userId,
         })))
         if (rows.length > 0) {
           const ok = await pptBestEffort(() => Promise.resolve(sb.from('profit_protection_telemetry').insert(rows)))

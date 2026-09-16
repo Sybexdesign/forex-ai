@@ -38,32 +38,58 @@ export async function GET(req: NextRequest) {
       .order('created_at', { ascending: true })
       .limit(10_000)
     if (ticketFilter) q = q.eq('broker_ticket', ticketFilter)
+    // Optional account scope. Without it an operator sees every account, which is
+    // intended for this ADMIN endpoint — but a broker ticket is only unique WITHIN
+    // an account, so lifecycles are still grouped by owner below.
+    const userFilter = url.searchParams.get('user')?.trim() || null
+    if (userFilter) q = q.eq('user_id', userFilter)
     const { data } = await q
     const rows: any[] = data || []
 
-    // Group chronological lifecycles by broker ticket.
+    // Group chronological lifecycles by OWNER + ticket. Keying on the ticket alone
+    // would merge two accounts that happen to share a ticket number into one
+    // bogus lifecycle — the exact collision this table's user_id exists to
+    // prevent.
+    type OwnerKeyRow = {
+      id?: string | number | null
+      user_id?: string | null
+      broker_ticket?: string | number | null
+    }
+    const skillKey = (r: OwnerKeyRow): string =>
+      r.broker_ticket != null ? `${r.user_id ?? '∅'}::${String(r.broker_ticket)}` : `row:${String(r.id)}`
     const groups = new Map<string, any[]>()
     for (const r of rows) {
-      const key = r.broker_ticket != null ? String(r.broker_ticket) : `row:${r.id}`
+      const key = skillKey(r)
       if (!groups.has(key)) groups.set(key, [])
       groups.get(key)!.push(r)
     }
 
-    // Overlay broker-realised ACTUAL values from trades where available.
-    const tickets = Array.from(groups.keys()).filter((k) => !k.startsWith('row:'))
+    // Overlay broker-realised ACTUAL values from trades — matched on owner AND
+    // ticket, never on the ticket alone.
     const overrides = new Map<string, { actualRealisedPnlUsd: number | null; actualMfeUsd: number | null }>()
-    for (let i = 0; i < tickets.length; i += 50) {
-      const batch = tickets.slice(i, i + 50)
-      const tr = await admin.from('trades')
-        .select('broker_ticket,pl_usd,mfe_usd')
-        .in('broker_ticket', batch)
-        .limit(50)
-      for (const t of (tr.data || [])) {
-        const k = String(t.broker_ticket)
-        const prev = overrides.get(k)
-        const pl = t.pl_usd != null ? Number(t.pl_usd) : prev?.actualRealisedPnlUsd ?? null
-        const mfe = t.mfe_usd != null ? Number(t.mfe_usd) : prev?.actualMfeUsd ?? null
-        overrides.set(k, { actualRealisedPnlUsd: pl, actualMfeUsd: mfe })
+    const byUser = new Map<string, Set<string>>()
+    for (const r of rows) {
+      if (r.broker_ticket == null) continue
+      if (!byUser.has(r.user_id)) byUser.set(r.user_id, new Set())
+      byUser.get(r.user_id)!.add(String(r.broker_ticket))
+    }
+    for (const [uid, ticketSet] of byUser) {
+      const tickets = Array.from(ticketSet)
+      for (let i = 0; i < tickets.length; i += 50) {
+        const batch = tickets.slice(i, i + 50)
+        let tr = admin.from('trades')
+          .select('broker_ticket,pl_usd,mfe_usd')
+          .in('broker_ticket', batch)
+          .limit(50)
+        if (uid) tr = tr.eq('user_id', uid)
+        const { data: tradeRows } = await tr
+        for (const t of (tradeRows || [])) {
+          const k = `${uid ?? '∅'}::${String(t.broker_ticket)}`
+          const prev = overrides.get(k)
+          const pl = t.pl_usd != null ? Number(t.pl_usd) : prev?.actualRealisedPnlUsd ?? null
+          const mfe = t.mfe_usd != null ? Number(t.mfe_usd) : prev?.actualMfeUsd ?? null
+          overrides.set(k, { actualRealisedPnlUsd: pl, actualMfeUsd: mfe })
+        }
       }
     }
 

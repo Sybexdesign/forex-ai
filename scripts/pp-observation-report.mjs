@@ -44,6 +44,15 @@ const { url, key } = creds()
 const H = { apikey: key, Authorization: `Bearer ${key}` }
 const since = new Date(Date.now() - DAYS * 864e5).toISOString()
 
+// ── ACCOUNT SCOPE ───────────────────────────────────────────────────────────
+// A native MT5 ticket is unique WITHIN an account, not across accounts. Every
+// per-trade query below is therefore scoped to the account under observation
+// when one is configured, so a second terminal (or another broker's ticket
+// numbering) cannot enter this report. Unscoped only when no identity is
+// configured — and that is stated in the output rather than assumed.
+const SCOPE_USER = (process.env.MT5_SERVER_USER_ID || process.env.WORKER_USER_ID || '').trim() || null
+const scope = SCOPE_USER ? `&user_id=eq.${SCOPE_USER}` : ''
+
 const get = async (path) => {
   const r = await fetch(`${url}/rest/v1/${path}`, { headers: H })
   let body = null
@@ -56,9 +65,10 @@ const count = async (path) => {
 }
 
 console.log(`PROFIT PROTECTION — SHADOW OBSERVATION REPORT (last ${DAYS} days, read-only)\n`)
+console.log(`account scope        : ${SCOPE_USER ? SCOPE_USER : 'ALL ACCOUNTS (no MT5_SERVER_USER_ID/WORKER_USER_ID set — ticket collisions across accounts are possible)'}\n`)
 
 // ── Telemetry ──────────────────────────────────────────────────────────────
-const rows = (await get(`profit_protection_telemetry?select=*&created_at=gte.${since}&order=created_at.asc&limit=10000`)).body || []
+const rows = (await get(`profit_protection_telemetry?select=*&created_at=gte.${since}${scope}&order=created_at.asc&limit=10000`)).body || []
 console.log(`telemetry rows in window : ${rows.length}`)
 if (rows.length) {
   const byMode = {}, byKind = {}
@@ -79,7 +89,7 @@ for (const term of ['OBSERVER_RUNNING', 'TRADE_FIRST_SEEN', 'AWAITING_CLOSE_CONF
 
 // ── Is observation running, and is it order-bound? ─────────────────────────
 const orderRows = await count(`worker_logs?select=id&created_at=gte.${since}&message=ilike.*auto-trade*`)
-const trades = await get(`trades?select=id,created_at,source&created_at=gte.${since}&order=created_at.asc&limit=500`)
+const trades = await get(`trades?select=id,created_at,source&created_at=gte.${since}${scope}&order=created_at.asc&limit=500`)
 const tradeRows = Array.isArray(trades.body) ? trades.body : []
 console.log(`  order/exec rows             : ${orderRows}`)
 console.log(`  trades opened in window     : ${tradeRows.length}  (scalp: ${tradeRows.filter((t) => t.source === 'scalp').length})`)
@@ -134,7 +144,7 @@ console.log(`  shadow_command_emitted=true (must be 0)    : ${rows.filter((r) =>
 const NATIVE_RE = /^\d+$/
 
 const scalpRows = (await get(`trades?select=id,oanda_trade_id,broker_ticket,source,result,created_at`
-  + `&source=eq.scalp&created_at=gte.${since}&order=created_at.asc&limit=500`)).body || []
+  + `&source=eq.scalp&created_at=gte.${since}${scope}&order=created_at.asc&limit=500`)).body || []
 const nativeFills = scalpRows.filter((t) => NATIVE_RE.test(String(t.broker_ticket ?? '')))
 const ambiguous   = scalpRows.filter((t) => !NATIVE_RE.test(String(t.broker_ticket ?? '')))
 

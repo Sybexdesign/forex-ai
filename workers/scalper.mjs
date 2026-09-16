@@ -1580,10 +1580,22 @@ async function shadowConfirmClosed(ticket) {
  */
 async function shadowInsertRow(row) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return false
+  // FAIL CLOSED on ownership. Telemetry without a user_id cannot be attributed
+  // to an account, and the study must never guess. WORKER_USER_ID is this
+  // process's own server-side identity — it is stamped here rather than trusted
+  // from anywhere upstream, so no code path can write another account's row.
+  if (!WORKER_USER_ID) {
+    console.error('[scalp-shadow] REFUSING telemetry write — WORKER_USER_ID is not set (unattributable row)')
+    return false
+  }
+  // Spread first, then stamp: WORKER_USER_ID always wins over any user_id that
+  // may already be present on the row, so this process cannot emit a row it does
+  // not own.
+  const owned = { ...row, user_id: WORKER_USER_ID }
   const res = await fetch(`${SUPABASE_URL}/rest/v1/profit_protection_telemetry`, {
     method:  'POST',
     headers: { ...shadowHeaders(), 'Prefer': 'return=minimal' },
-    body:    JSON.stringify(row),
+    body:    JSON.stringify(owned),
     signal:  AbortSignal.timeout(SHADOW_IO_TIMEOUT_MS),
   })
   if (res.ok) return true

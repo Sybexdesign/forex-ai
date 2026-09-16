@@ -2,7 +2,14 @@
 export function rowKind(item: any): 'snapshot' | 'decision' | 'close'
 export function toRow(
   item: any,
-  ctx?: { protectionMode?: 'shadow' | 'live'; stateSeq?: number | null; marketRegime?: string | null; session?: string | null },
+  ctx?: {
+    protectionMode?: 'shadow' | 'live'
+    stateSeq?: number | null
+    marketRegime?: string | null
+    session?: string | null
+    /** Owning account. Server-supplied trusted identity — never a client field. */
+    userId?: string | null
+  },
 ): Record<string, any>
 export function snapshotSignature(row: Record<string, any>): string
 export function dedupeRows(rows: Array<Record<string, any>>): Array<Record<string, any>>
