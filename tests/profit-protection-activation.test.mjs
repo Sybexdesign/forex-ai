@@ -453,6 +453,56 @@ t('5. nothing forbidden by scope changed: no thresholds, bands or broker interfa
     'exactly the two pre-existing env vars may be read')
 })
 
+// ── §3.2.1 BOTH production consumers use the ONE canonical resolver ───────
+t('the scalp worker and the MT5 route resolve activation from the SAME resolver', () => {
+  const worker = readFileSync(new URL('../workers/scalper.mjs', import.meta.url), 'utf8')
+  const route  = readFileSync(new URL('../app/api/mt5-sync/route.ts', import.meta.url), 'utf8')
+
+  for (const [name, src] of [['workers/scalper.mjs', worker], ['app/api/mt5-sync/route.ts', route]]) {
+    assert.match(src, /resolveProfitProtectionMode\(process\.env\)/,
+      `${name} must resolve the mode via the canonical resolver`)
+    assert.match(src, /from '[^']*profit-protection-mode\.mjs'/,
+      `${name} must import the canonical resolver module`)
+  }
+})
+
+t('the scalp worker no longer re-interprets the activation env inline', () => {
+  const worker = readFileSync(new URL('../workers/scalper.mjs', import.meta.url), 'utf8')
+  // The duplicated expression this pass removed.
+  assert.equal(/const forceShadow = process\.env\.PROFIT_PROTECTION_SHADOW_MODE === 'true'/.test(worker), false,
+    'the inline legacy-boolean comparison must be gone from the worker')
+  assert.equal(/\(process\.env\.PROFIT_PROTECTION_MODE \|\| 'shadow'\) !== 'live'/.test(worker), false,
+    'the inline `!== \'live\'` comparison must be gone from the worker')
+  // No module may implement a second resolver.
+  assert.equal(/function\s+\w*[Rr]esolveProfitProtectionMode/.test(worker), false,
+    'the worker must not define its own resolver')
+})
+
+t('startup reporting is a pure projection of the resolved object', () => {
+  const worker = readFileSync(new URL('../workers/scalper.mjs', import.meta.url), 'utf8')
+  // The reported mode and its description must come from the resolved object, so
+  // "execution mode = X, startup log = Y" is structurally impossible.
+  assert.match(worker, /const ppResolved = resolveProfitProtectionMode\(process\.env\)/)
+  assert.match(worker, /describeProfitProtectionMode\(ppResolved\)/)
+  assert.match(worker, /ppResolved\.mode === 'shadow'/)
+  assert.match(worker, /ppResolved\.mode === 'live'/)
+  // The wlog metadata must carry the resolved mode + source, not a re-derivation.
+  assert.match(worker, /profitProtectionMode: ppResolved\.mode/)
+  assert.match(worker, /metadata: \{ profitProtectionMode: ppResolved\.mode, source: ppResolved\.source/)
+})
+
+t('the worker-reported mode equals the resolver result for every matrix input', () => {
+  // The startup log is a projection, so for each env the logged mode string must
+  // be exactly the resolver's mode — no independent reinterpretation is possible.
+  for (const [m, l] of MATRIX) {
+    const r = resolveProfitProtectionMode(env(m, l))
+    const logged = `Profit protection ${r.mode} mode`
+    assert.ok(['Profit protection shadow mode', 'Profit protection live mode', 'Profit protection off mode'].includes(logged),
+      `unexpected startup log for MODE=${m}: ${logged}`)
+  }
+  assert.equal(`Profit protection ${resolveProfitProtectionMode({}).mode} mode`, 'Profit protection shadow mode')
+})
+
 if (failed) { console.error(`\n${failed} failed`); process.exit(1) }
 console.log('profit-protection activation: all tests passed')
 

@@ -30,6 +30,8 @@ import {
   assertScalpStateMonotonic,
 } from '../lib/scalp-shadow-protection.mjs'
 import { createScalpShadowRuntime, matchAttribution, createShadowHandoff } from '../lib/scalp-shadow-runtime.mjs'
+import { createShadowObserver } from '../lib/scalp-shadow-cadence.mjs'
+import { resolveProfitProtectionMode, describeProfitProtectionMode } from '../lib/profit-protection-mode.mjs'
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -315,6 +317,9 @@ async function checkForCacheReset() {
       // of durable state rather than reusing a stale in-memory copy. The durable
       // snapshot is NOT cleared — it holds monotonic facts about open trades.
       scalpShadowRuntime.resetMemory()
+      // Also drop the observation-cadence snapshot cache so the next sweep takes a
+      // fresh authoritative snapshot rather than reusing a pre-reset one.
+      shadowObserver.resetMemory()
       haltNotified = false
       lastCbClearedAt = null
       lastCbArmedAt = null
@@ -1611,6 +1616,34 @@ const scalpShadowRuntime = createScalpShadowRuntime({
  */
 const shadowHandoff = createShadowHandoff(scalpShadowRuntime)
 
+// ── §3.2 CANONICAL SHADOW OBSERVATION CADENCE ─────────────────────────────────
+// Observation used to be reachable ONLY through fetchRiskState(), whose only
+// caller is the auto-trade order path (after the signal/confidence/cooldown/hold
+// gates). No order attempt -> no handoff -> the observer never ran, which is why
+// a flat market produced no evidence at all.
+//
+// It is now SWEEP-driven and independent of signal and order flow. The
+// orchestration lives in lib/scalp-shadow-cadence.mjs so it is provable with
+// fakes — this worker is a script with top-level side effects and cannot be
+// imported by a test.
+//
+// ONE canonical entry point, idempotent per account snapshot, so the sweep tick
+// and an order attempt cannot double-observe the same snapshot.
+const shadowObserver = createShadowObserver({
+  shadowHandoff,
+  fetchAccount:    () => apiFetch('/api/account'),
+  getTrackedCount: () => Object.keys(scalpShadowRuntime.getState() || {}).length,
+  ttlMs:           RISK_CACHE_MS,   // reuse the cadence the risk cache already uses
+  log: (msg, meta) => {
+    console.error(msg)
+    Promise.resolve(wlog('error', msg, { metadata: meta || {} })).catch(() => {})
+  },
+})
+
+/** THE single production call site for handing a snapshot to the observer. */
+const observeShadowOnce = (acct) => shadowObserver.observeOnce(acct)
+
+
 /**
  * Telemetry health counters (item 10) — so first-lifecycle verification can read
  * one line instead of grepping logs. Counters only: no credentials, no account
@@ -1651,7 +1684,12 @@ async function fetchRiskState() {
   // takes the response we already hold, schedules observation, and returns
   // nothing — it cannot enter the value computed below, and it makes no broker
   // request. Everything after this line is the original logic, unchanged.
-  shadowHandoff(acct)
+  //
+  // §3.2: this now goes through the SAME canonical entry point the sweep uses, so
+  // an order attempt cannot raise a second observation path. The snapshot is
+  // published for reuse so the sweep tick need not re-fetch it.
+  shadowObserver.publishSnapshot(acct)
+  observeShadowOnce(acct)
   const dailyLossPct = (balance > 0 && realizedPL < 0)
     ? Math.abs(realizedPL) / balance
     : 0
@@ -2384,6 +2422,17 @@ async function runSweep() {
   const marketOpen = isMarketOpen(sweepAt)
   const session    = marketOpen ? getSession(sweepAt) : 'CLOSED'
 
+  // ── §3.2 SHADOW OBSERVATION CADENCE ────────────────────────────────────────
+  // Deliberately OUTSIDE every signal/confidence/cooldown/hold/order gate: a flat
+  // market with no signals must still let the observer run, report its health and
+  // inspect already-open eligible positions. Positioned after `marketOpen` is
+  // known so a closed market with nothing tracked makes no request.
+  //
+  // Awaited so ordering is deterministic, but it is incapable of throwing
+  // (the cadence catches everything) and incapable of affecting the trading
+  // path — it returns nothing.
+  await shadowObserver.tick(marketOpen)
+
   // Ping Supabase every 6 sweeps (~1 min) regardless of market state
   // so the Worker Logs page shows the worker is alive during weekends too
   if (stats.sweeps % 6 === 0) {
@@ -2780,14 +2829,27 @@ process.on('unhandledRejection', e => console.error('[unhandled]', e))
   console.log(`[worker] Poll   : ${POLL_MS / 1000}s | Alert threshold: ≥${liveStrategy.minStrength}%`)
   console.log(`[worker] Window : London-NY Overlap 12:00-13:59 UTC weekdays only`)
   console.log(`[worker] Status : ${isLondonNYOverlap() ? '🟢 OVERLAP ACTIVE' : '⚪ closed — next: ' + nextOverlapInfo()}`)
-  // Profit-giveback protection shadow mode (audit 2026-09-09): report the
-  // effective configuration at startup. SAFE DEFAULT = SHADOW (the new ratchet
-  // computes/logs only — SL/close are never modified by it; existing BE/trail/
-  // decay operate normally). Live requires PROFIT_PROTECTION_MODE=live.
-  const forceShadow = process.env.PROFIT_PROTECTION_SHADOW_MODE === 'true'
-  const ppMode = forceShadow || (process.env.PROFIT_PROTECTION_MODE || 'shadow') !== 'live' ? 'shadow' : 'live'
-  console.log(`[worker] PROFIT PROTECTION = ${ppMode === 'shadow' ? 'SHADOW (new giveback ratchet logs only — SL/close NOT modified)' : 'LIVE (new giveback ratchet active)'}`)
-  wlog('info', ppMode === 'shadow' ? 'Profit protection shadow mode' : 'Profit protection live mode', { metadata: { profitProtectionMode: ppMode } })
+  // Profit-giveback protection mode (audit 2026-09-09): report the EFFECTIVE
+  // configuration at startup — derived from the SAME canonical resolver the MT5
+  // route uses, so the worker and the route can never disagree about activation.
+  //
+  // This used to re-interpret the environment inline:
+  //     forceShadow || (MODE || 'shadow') !== 'live'
+  // which is a second, unhardened copy of the activation rule: it silently
+  // demoted a near-miss spelling (`LIVE`, ` live `) to shadow with no diagnostic,
+  // and could therefore report a mode that did not reflect the resolver's actual
+  // decision. Reporting is now a pure projection of the resolved object.
+  //
+  // NOTE: the SCALP observer is shadow BY CONSTRUCTION (shadowMode: true is a
+  // literal in the observer wiring above), so this resolves for operator
+  // visibility and misconfiguration diagnostics — never to gate execution.
+  const ppResolved = resolveProfitProtectionMode(process.env)
+  const ppNotes = ppResolved.notes.length ? ` — ${ppResolved.notes.join(' | ')}` : ''
+  console.log(`[worker] PROFIT PROTECTION = ${ppResolved.mode.toUpperCase()} (${describeProfitProtectionMode(ppResolved)})`)
+  console.log(`[worker] PROFIT PROTECTION = ${ppResolved.mode === 'shadow' ? 'SHADOW (new giveback ratchet logs only — SL/close NOT modified)' : ppResolved.mode === 'live' ? 'LIVE (new giveback ratchet active)' : 'OFF (protection disabled)'}${ppNotes}`)
+  wlog('info', `Profit protection ${ppResolved.mode} mode`, {
+    metadata: { profitProtectionMode: ppResolved.mode, source: ppResolved.source, notes: ppResolved.notes },
+  })
   // Profit-target safety check — surface a warning if profitFixedUsd is 0 or
   // null so the operator notices before trades start firing without a TP.
   try {
