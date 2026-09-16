@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| SybexForexAI Balance Sync EA v9.2                                |
+//| SybexForexAI Balance Sync EA v9.3.1                              |
 //| Posts DIRECTLY to Supabase RPC -- bypasses Vercel entirely.      |
 //| v5 fix: ORDER_FILLING_RETURN (IOC caused all orders to reject).  |
 //| v6 fix: split fast order-poll (2s) from heavy data sync (10s)    |
@@ -20,9 +20,19 @@
 //|   Formula: profitCloseAmount = ProfitFixedUsd × (ProfitTargetPct / 100)
 //|   EA now receives both components from PULL and computes the      |
 //|   close threshold itself — identical to app-side calculation.    |
+//| v9.3.1 change: native MT5 position-ticket propagation            |
+//|   completedOrders now also reports the native POSITION_TICKET so  |
+//|   the server can persist the SAME identity the account snapshot   |
+//|   exposes (openPositions[].ticket). Order logic, lot sizing,      |
+//|   SL/TP, signals and magic-number behaviour are UNCHANGED.        |
 //+------------------------------------------------------------------+
 #property strict
-#property description "SybexForexAI v9.3 -- MFE/MAE + PartialLock=1.5R + price-skip log"
+// Positive build identification. MetaTrader shows this under EA
+// Properties -> Version, and it is how an operator proves the attached
+// EX5 is the ticket-propagating build rather than a stale compile.
+#property version   "9.31"
+// Cosmetic version label only — no behaviour is attached to this string.
+#property description "SybexForexAI EA v9.3.1 -- native position-ticket propagation (MFE/MAE + PartialLock=1.5R + price-skip log)"
 
 //--- Inputs -----------------------------------------------------------
 input string WebhookToken        = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
@@ -564,7 +574,7 @@ int OnInit()
    g_profitTargetPct = ProfitTargetPct;
 
    EventSetTimer(1);  // 1s tick — profit target checks every second, not every 2s
-   Print("SybexForexAI v9.3 started | FillMode=", EnumToString(FillMode),
+   Print("SybexForexAI EA v9.3.1 started | FillMode=", EnumToString(FillMode),
          " | OrderPoll=", OrderPollSeconds, "s | DataSync=", DataSyncSeconds, "s",
          " | Suffix='", SymbolSuffix, "'",
          " | MinHold=", MinHoldSeconds, "s",
