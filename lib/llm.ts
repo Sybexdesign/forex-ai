@@ -11,10 +11,62 @@ export interface LlmCompleteArgs {
   system: string
   user: string
   maxTokens: number
+  /**
+   * Hard wall-clock bound on the provider call, in ms. On expiry the request is
+   * ABORTED and this function THROWS, so the caller's deterministic rules engine
+   * takes over instead of the request hanging.
+   *
+   * WHY THIS EXISTS (option C — bounded provider latency)
+   *
+   * Neither provider had any timeout at all: the Anthropic SDK defaults to ~10
+   * minutes, and the DeepSeek `fetch` had no signal. A slow or black-holed
+   * provider therefore stalled the entire signal request until the CALLER's own
+   * client timeout fired (the scalper worker aborts at 45s), turning a slow model
+   * into a LOST signal rather than a degraded-but-usable one. Bounding it here
+   * means a slow provider costs `timeoutMs` and then yields a real rule-based
+   * signal — never a stall.
+   *
+   * Default: `LLM_TIMEOUT_MS` env, else 15s. Clamped to [1s, 120s].
+   * This adds NO latency to the happy path.
+   */
+  timeoutMs?: number
 }
 
 export interface LlmCompleteResult {
   text: string
+}
+
+/** Bound on the provider call when neither the argument nor the env sets one. */
+export const DEFAULT_LLM_TIMEOUT_MS = 15_000
+/** Floor — below this a healthy provider would be aborted mid-flight. */
+export const MIN_LLM_TIMEOUT_MS = 1_000
+/** Ceiling — beyond this the caller's own client timeout would fire first anyway. */
+export const MAX_LLM_TIMEOUT_MS = 120_000
+
+/**
+ * Resolve the effective provider timeout. Never throws: a nonsense env value
+ * falls back to the default rather than disabling the bound, because "no timeout"
+ * is the failure mode this exists to remove.
+ */
+export function resolveLlmTimeoutMs(explicit?: number): number {
+  const raw = Number(explicit ?? process.env.LLM_TIMEOUT_MS ?? DEFAULT_LLM_TIMEOUT_MS)
+  if (!Number.isFinite(raw)) return DEFAULT_LLM_TIMEOUT_MS
+  return Math.min(MAX_LLM_TIMEOUT_MS, Math.max(MIN_LLM_TIMEOUT_MS, Math.trunc(raw)))
+}
+
+/**
+ * One legible, typed error for an aborted call, so the caller's catch block
+ * (which falls back to the rules engine) reports a cause rather than a raw
+ * DOMException, and so quota/credit heuristics downstream cannot misread it.
+ */
+function llmTimeoutError(provider: LlmProvider, ms: number, cause: unknown): Error {
+  const err: any = new Error(
+    `LLM timeout after ${ms}ms (provider=${provider}) — aborting and falling back to the rules engine`,
+  )
+  err.name = 'LlmTimeoutError'
+  err.status = 408
+  err.cause = cause
+  return err
 }
 
 function isPlaceholder(v: string | undefined): boolean {
@@ -50,12 +102,27 @@ const DEEPSEEK_MODEL  = process.env.DEEPSEEK_MODEL  || 'deepseek-chat'
 const DEEPSEEK_BASE   = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1'
 
 async function completeAnthropic(args: LlmCompleteArgs): Promise<LlmCompleteResult> {
-  const message = await getAnthropic().messages.create({
-    model:      ANTHROPIC_MODEL,
-    max_tokens: args.maxTokens,
-    system:     args.system,
-    messages:   [{ role: 'user', content: args.user }],
-  })
+  const timeoutMs = resolveLlmTimeoutMs(args.timeoutMs)
+  // Hard abort as well as the SDK's own `timeout`, so the bound holds even if a
+  // future SDK build changes how it applies the option.
+  const signal = AbortSignal.timeout(timeoutMs)
+  let message: Awaited<ReturnType<Anthropic['messages']['create']>>
+  try {
+    message = await getAnthropic().messages.create(
+      {
+        model:      ANTHROPIC_MODEL,
+        max_tokens: args.maxTokens,
+        system:     args.system,
+        messages:   [{ role: 'user', content: args.user }],
+      },
+      { signal, timeout: timeoutMs },
+    )
+  } catch (e) {
+    // Only the abort is re-labelled; a genuine API error (401/429/…) must keep its
+    // own identity so the existing quota/credit heuristics still recognise it.
+    if (signal.aborted) throw llmTimeoutError('anthropic', timeoutMs, e)
+    throw e
+  }
   const text = message.content.find(b => b.type === 'text')?.text || ''
   return { text }
 }
@@ -67,28 +134,40 @@ async function completeDeepseek(args: LlmCompleteArgs): Promise<LlmCompleteResul
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) throw new Error('DEEPSEEK_API_KEY not configured')
 
-  const res = await fetch(`${DEEPSEEK_BASE}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'authorization': `Bearer ${apiKey}`,
-      'content-type':  'application/json',
-    },
-    body: JSON.stringify({
-      model:       DEEPSEEK_MODEL,
-      max_tokens:  args.maxTokens,
-      // 0.35 not 0.1 — direction is enforced deterministically by the prompt
-      // rules; the entropy budget is spent on confidence-score calibration.
-      // Observed: temp 0.1 pinned every signal at confidence=72 across 33
-      // consecutive calls while the rules engine varied 64–95 on the same
-      // ticks. Higher temp restores variance without destabilising direction.
-      temperature: 0.35,
-      messages: [
-        { role: 'system', content: args.system },
-        { role: 'user',   content: args.user },
-      ],
-      response_format: { type: 'json_object' },
-    }),
-  })
+  const timeoutMs = resolveLlmTimeoutMs(args.timeoutMs)
+  const signal = AbortSignal.timeout(timeoutMs)
+
+  let res: Response
+  try {
+    res = await fetch(`${DEEPSEEK_BASE}/chat/completions`, {
+      method: 'POST',
+      signal,
+      headers: {
+        'authorization': `Bearer ${apiKey}`,
+        'content-type':  'application/json',
+      },
+      body: JSON.stringify({
+        model:       DEEPSEEK_MODEL,
+        max_tokens:  args.maxTokens,
+        // 0.35 not 0.1 — direction is enforced deterministically by the prompt
+        // rules; the entropy budget is spent on confidence-score calibration.
+        // Observed: temp 0.1 pinned every signal at confidence=72 across 33
+        // consecutive calls while the rules engine varied 64–95 on the same
+        // ticks. Higher temp restores variance without destabilising direction.
+        temperature: 0.35,
+        messages: [
+          { role: 'system', content: args.system },
+          { role: 'user',   content: args.user },
+        ],
+        response_format: { type: 'json_object' },
+      }),
+    })
+  } catch (e) {
+    // A black-holed provider used to hang here indefinitely; bound it and hand the
+    // caller a typed reason so its rules-engine fallback engages promptly.
+    if (signal.aborted) throw llmTimeoutError('deepseek', timeoutMs, e)
+    throw e
+  }
 
   if (!res.ok) {
     const body = await res.text().catch(() => '')
