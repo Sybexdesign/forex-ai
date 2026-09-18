@@ -107,6 +107,10 @@ export class MetaApiBroker implements IBroker {
       lots: p.volume,
       entryPrice: p.openPrice,
       currentPrice: p.currentPrice ?? p.openPrice,
+      // MetaAPI supplies a genuine current price when it has one. It must NOT
+      // fall back to entry here — `null` means "no authoritative mark", and the
+      // shadow evaluator fails closed on that rather than measuring a flat line.
+      markPrice: p.currentPrice ?? null,
       unrealizedPL: p.unrealizedProfit ?? 0,
       takeProfitPrice: p.takeProfit,
       stopLossPrice: p.stopLoss,

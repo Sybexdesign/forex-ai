@@ -7,7 +7,7 @@ import { evaluateScalpShadow, normaliseScalpPosition, mergeScalpShadowState } fr
 const XAU = { pip: 0.1, pipValuePerLot: 10, known: true }
 const trade = (o = {}) => ({
   id: 'T-1', pair: 'XAU/USD', direction: 'BUY', lots: 0.14,
-  entryPrice: 2000, currentPrice: 2000, unrealizedPL: 0,
+  entryPrice: 2000, currentPrice: 2000, markPrice: 2000, unrealizedPL: 0,
   stopLossPrice: 1997.5, openTime: '2026-09-15T00:00:00.000Z', ...o,
 })
 

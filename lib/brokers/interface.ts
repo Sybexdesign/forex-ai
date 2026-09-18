@@ -44,6 +44,28 @@ export interface OpenTrade {
   lots: number
   entryPrice: number
   currentPrice: number
+  /**
+   * Genuine broker MARK price for this position right now, or `null` when no
+   * authoritative mark is available. NEVER the entry price as a stand-in.
+   *
+   * WHY THIS IS SEPARATE FROM `currentPrice`
+   *
+   * Several adapters historically wrote `currentPrice = entryPrice` because their
+   * position payload carries no mark field (MT5-direct's EA pushes
+   * `{ticket,symbol,type,lots,openPrice,sl,tp,profit}` only). That produces a
+   * plausible-looking number that is silently WRONG: the price appears frozen at
+   * entry for the whole life of the position. Anything downstream that reasons
+   * about where price is — rather than only about realised P&L in dollars — then
+   * measures a flat line.
+   *
+   * `currentPrice` is left exactly as it was so no existing consumer changes
+   * behaviour. Consumers that need a real mark read this field and MUST handle
+   * `null` by declining to act, rather than falling back to `entryPrice`.
+   *
+   *   null/undefined  no authoritative mark available — caller must fail closed
+   *   number > 0      a genuine broker mark
+   */
+  markPrice?: number | null
   unrealizedPL: number
   takeProfitPrice?: number
   stopLossPrice?: number

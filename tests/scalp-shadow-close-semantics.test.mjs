@@ -33,7 +33,7 @@ t('item1: scalpRowKind maps WOULD_CLOSE to decision (open position)', () => {
 
 t('item1: WOULD_CLOSE requires ARMED protection; the evaluator never emits row_kind=close', () => {
   const XAU = { pip: 0.1, pipValuePerLot: 10 }
-  const trade = { id: 'T-1', pair: 'XAU/USD', direction: 'BUY', lots: 0.14, entryPrice: 2000, currentPrice: 2000, unrealizedPL: 0, stopLossPrice: 1997.5, openTime: at(0) }
+  const trade = { id: 'T-1', pair: 'XAU/USD', direction: 'BUY', lots: 0.14, entryPrice: 2000, currentPrice: 2000, markPrice: 2000, unrealizedPL: 0, stopLossPrice: 1997.5, openTime: at(0) }
   const peaks = [40, 60, 80, 100, 150, 200, 250, 300]
   const curs  = [300, 200, 150, 120, 100, 80, 60, 50, 40, 30, 25, 20, 15, 12, 10, 8, 6, 5, 4, 3, 2, 1, 0, -5, -10, -20, -35]
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { decisionFor, plannedRiskUsd, normaliseScalpPosition, evaluateScalpShadow } from '../lib/scalp-shadow-protection.mjs'
 
 const XAU = { pip: 0.1, pipValuePerLot: 10 }
-const trade = (o = {}) => ({ id: 'T-1', pair: 'XAU/USD', direction: 'BUY', lots: 0.14, entryPrice: 2000, currentPrice: 2000, unrealizedPL: 0, stopLossPrice: 1997.5, openTime: '2026-09-15T00:00:00.000Z', ...o })
+const trade = (o = {}) => ({ id: 'T-1', pair: 'XAU/USD', direction: 'BUY', lots: 0.14, entryPrice: 2000, currentPrice: 2000, markPrice: 2000, unrealizedPL: 0, stopLossPrice: 1997.5, openTime: '2026-09-15T00:00:00.000Z', ...o })
 const ev = (t, prior = null) => evaluateScalpShadow({ position: normaliseScalpPosition(t, { priorState: prior, ...XAU }), priorState: prior })
 
 let bad = 0
@@ -29,9 +29,9 @@ t('no risk -> no row invented', () => {
   assert.equal(r.row, null); assert.equal(r.reason, 'no-risk')
 })
 t('peak is monotonic', () => {
-  const a = ev(trade({ currentPrice: 2001, unrealizedPL: 40 }))
+  const a = ev(trade({ currentPrice: 2001, markPrice: 2001, unrealizedPL: 40 }))
   assert.equal(a.state.peakProfit, 40)
-  const b = ev(trade({ currentPrice: 2000.5, unrealizedPL: 12 }), a.state)
+  const b = ev(trade({ currentPrice: 2000.5, markPrice: 2000.5, unrealizedPL: 12 }), a.state)
   assert.equal(b.state.peakProfit, 40)
 })
 t('initial SL captured once (moved stop cannot restate 1R)', () => {
@@ -41,15 +41,15 @@ t('initial SL captured once (moved stop cannot restate 1R)', () => {
 })
 t('SHADOW SAFETY: row is always shadow + never emitted a command', () => {
   for (const p of [120, 60, 20, 8, 3, -35]) {
-    const r = ev(trade({ currentPrice: 2002, unrealizedPL: p }))
+    const r = ev(trade({ currentPrice: 2002, markPrice: 2002, unrealizedPL: p }))
     if (!r.row) continue
     assert.equal(r.row.protection_mode, 'shadow')
     assert.equal(r.row.shadow_command_emitted, false)
   }
 })
 t('a would-CLOSE scenario stays a non-close row', () => {
-  const peak = ev(trade({ currentPrice: 2004, unrealizedPL: 120 }))
-  const r = ev(trade({ currentPrice: 2000.1, unrealizedPL: 3 }), peak.state)
+  const peak = ev(trade({ currentPrice: 2004, markPrice: 2004, unrealizedPL: 120 }))
+  const r = ev(trade({ currentPrice: 2000.1, markPrice: 2000.1, unrealizedPL: 3 }), peak.state)
   assert.equal(r.row.shadow_command_emitted, false)
   assert.notEqual(r.row.row_kind, 'close')
 })
@@ -60,7 +60,7 @@ t('decisionFor bridges to the MT5 telemetry vocabulary', () => {
   assert.equal(decisionFor(null, false), 'NONE')
 })
 t('row uses the existing telemetry schema', () => {
-  const r = ev(trade({ currentPrice: 2001.5, unrealizedPL: 21 }))
+  const r = ev(trade({ currentPrice: 2001.5, markPrice: 2001.5, unrealizedPL: 21 }))
   for (const k of ['broker_ticket','pair','direction','lots','open_price','initial_sl','current_sl','current_price','current_profit_usd','peak_profit_usd','planned_risk_usd','current_r','peak_r','protection_stage','target_floor_usd','shadow_decision','protection_mode','row_kind','shadow_command_emitted']) {
     assert.ok(k in r.row, 'missing ' + k)
   }

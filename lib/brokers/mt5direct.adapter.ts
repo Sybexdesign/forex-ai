@@ -181,9 +181,27 @@ export class Mt5DirectBroker implements IBroker {
 
   async getOpenTrades(): Promise<OpenTrade[]> {
     const positions: any[] = this.config.openPositions || []
+    const now = Date.now()
     return positions.map(p => {
       const sym: string = p.symbol || ''
       const pair = sym.length === 6 ? `${sym.slice(0, 3)}/${sym.slice(3)}` : sym
+      // ── Genuine mark price ──────────────────────────────────────────────
+      // The EA's openPositions payload carries {ticket,symbol,type,lots,
+      // openPrice,sl,tp,profit} — there is NO per-position mark price in it, so
+      // `currentPrice` below can only ever be the entry price. The EA pushes a
+      // separate `latestPrices` map ({ SYM: { bid, ask, updatedAt } }), and that
+      // IS authoritative — so the mark is read from there and freshness-checked
+      // against the same PRICE_TTL the pricing path uses.
+      //
+      // When it is absent or stale this is `null`, deliberately. The previous
+      // behaviour (mark = entry) looked plausible and was silently wrong for the
+      // whole life of every position; a null is visible, and every consumer of
+      // `markPrice` is required to fail closed on it.
+      const live = this.config.latestPrices?.[sym]
+      const liveAgeMs = live?.updatedAt ? now - new Date(live.updatedAt).getTime() : Infinity
+      const mark = live && liveAgeMs < PRICE_TTL && Number(live.bid) > 0
+        ? (p.type === 'BUY' ? Number(live.bid) : Number(live.ask)) || Number(live.bid)
+        : null
       return {
         id:              String(p.ticket),
         pair,
@@ -191,7 +209,10 @@ export class Mt5DirectBroker implements IBroker {
         units:           Math.round((p.lots || 0) * 100000),
         lots:            p.lots || 0,
         entryPrice:      p.openPrice || 0,
+        // UNCHANGED — no consumer behaviour moves. See markPrice in interface.ts.
         currentPrice:    p.openPrice || 0,
+        // The genuine mark, or null. Never the entry price.
+        markPrice:       mark,
         unrealizedPL:    p.profit   || 0,
         takeProfitPrice: p.tp       || undefined,
         stopLossPrice:   p.sl       || undefined,

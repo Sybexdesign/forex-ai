@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic'
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { getBroker } from '@/lib/brokers'
+import { getPipValue, getPipValuePerLot } from '@/lib/brokers/interface'
 import { runRiskGuards, isTradeAllowed, getBlockReasons } from '@/lib/risk'
 import { calcPropFirmStatus, applyPropFirmGuards, DEFAULT_PROP_FIRM } from '@/lib/propfirm'
 import type { PropFirmSettings } from '@/lib/propfirm'
@@ -466,6 +467,35 @@ export async function POST(req: NextRequest) {
     if (userId) {
       try {
         const admin = getAdminClient()
+        // §8 — anchor the trade's 1R AT ENTRY TIME from the geometry that was
+        // actually filled:
+        //
+        //     |entry − initial SL| ÷ pipSize × pipValuePerLot × lots
+        //
+        // WHY ENTRY TIME AND NOT LATER
+        //
+        // `sl_price` is overwritten whenever a stop is moved (break-even, ratchet,
+        // trail), so it stops describing the money originally at risk. Deriving 1R
+        // from a later stop would shrink R with every ratchet and inflate every
+        // peak-R figure, silently dragging trades into higher protection bands.
+        // Pinning it once here is what makes 1R immutable for the life of the trade.
+        //
+        // Additive and best-effort: if the geometry is unusable this is `null` and
+        // the order is unaffected. No historical row is ever backfilled.
+        const plannedRiskAmount = (() => {
+          const pip = getPipValue(pair)
+          const pv  = getPipValuePerLot(pair)
+          const entry = Number(orderResult.filledPrice)
+          const sl    = Number(orderResult.slPrice)
+          const l     = Number(lots)
+          if (!(pip > 0) || !(pv > 0) || !(l > 0)) return null
+          if (!Number.isFinite(entry) || !Number.isFinite(sl)) return null
+          const distance = Math.abs(entry - sl)
+          if (!(distance > 0)) return null
+          const risk = (distance / pip) * pv * l
+          return Number.isFinite(risk) && risk > 0 ? Math.round(risk * 100) / 100 : null
+        })()
+
         const { data: trade } = await admin.from('trades').insert({
           user_id: userId,
           oanda_trade_id: orderResult.tradeId,
@@ -473,6 +503,7 @@ export async function POST(req: NextRequest) {
           entry_price: orderResult.filledPrice,
           tp_price: orderResult.tpPrice,
           sl_price: orderResult.slPrice,
+          planned_risk_amount: plannedRiskAmount,
           lots, result: 'OPEN', rules_followed: true,
           checklist_score: checklistScore,
           ai_confidence: aiConfidence,

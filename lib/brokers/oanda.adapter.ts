@@ -131,6 +131,9 @@ export class OandaBroker implements IBroker {
         direction: units > 0 ? 'BUY' : 'SELL',
         units: Math.abs(units), lots: +(Math.abs(units) / 100000).toFixed(4),
         entryPrice: parseFloat(t.price), currentPrice: parseFloat(t.price),
+        // OANDA's position `price` IS the current mark — authoritative, so it is
+        // safe to publish directly (see markPrice in interface.ts).
+        markPrice: parseFloat(t.price),
         unrealizedPL: parseFloat(t.unrealizedPL),
         takeProfitPrice: t.takeProfitOrder ? parseFloat(t.takeProfitOrder.price) : undefined,
         stopLossPrice: t.stopLossOrder ? parseFloat(t.stopLossOrder.price) : undefined,

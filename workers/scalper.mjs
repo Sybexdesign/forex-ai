@@ -1416,7 +1416,23 @@ async function loadStrategy() {
 // observation cadence: no second /v1/positions request is added, and the
 // worker's 10s sweep is untouched.
 
-const SHADOW_EVAL_MS       = 60_000   // observe at most once per minute (~2 risk-cache refreshes)
+// §6 — EVALUATION cadence, deliberately separate from BROKER POLLING.
+//
+// POLL_MS is 10s, and the sweep already fetches ONE authoritative account
+// snapshot per cycle which the observer then reuses
+// (lib/scalp-shadow-cadence.mjs, 30s snapshot TTL). Evaluating on every sweep
+// therefore adds NO broker traffic — the snapshot is already in hand — and the
+// evaluator is pure arithmetic with no I/O and no broker write.
+//
+// The previous 60s throttle was the direct cause of the missed peaks in
+// production: ticket 3247075325 reached +$454.50 broker MFE but lived under
+// ~40s, so it received AT MOST ONE evaluation and the favourable excursion fell
+// entirely between observations. Peak capture is bounded above by this cadence,
+// so it is brought in line with the sweep that feeds it.
+//
+// Operator-overridable via SCALP_SHADOW_EVAL_MS. Read-only observation
+// parameter: it cannot affect signals, sizing, entries or protection.
+const SHADOW_EVAL_MS       = Math.max(1_000, Number(process.env.SCALP_SHADOW_EVAL_MS) || POLL_MS)
 const SHADOW_IO_TIMEOUT_MS = 10_000
 const SCALP_SHADOW_KEY     = 'scalpShadowState'
 const SCALP_SOURCE         = 'scalp'
