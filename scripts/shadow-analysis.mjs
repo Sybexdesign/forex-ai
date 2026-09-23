@@ -27,6 +27,36 @@ const includeAllSources = args.includes('--all')
 const daysArg = args.indexOf('--days')
 const DAYS = daysArg >= 0 ? Math.max(1, Math.min(365, Number(args[daysArg + 1]) || 90)) : 90
 
+// ── --since <ISO_TIMESTAMP> ──────────────────────────────────────────────────
+// Hard lower bound on telemetry, applied IN THE QUERY (not after the fact), so
+// rows from before a study cutoff can never reach lifecycle reconstruction.
+// This is how the 29 defective forensic rows are kept out of fresh-sample
+// metrics: a lifecycle physically cannot span the boundary because its earlier
+// rows were never fetched.
+//
+// The trades join needs no separate bound: it is keyed on the tickets present in
+// the already-filtered telemetry, so survivor tickets can only pull their own
+// trade rows.
+//
+// Absent --since, behaviour is exactly as before (--days window).
+const sinceArg = args.indexOf('--since')
+const sinceRaw = sinceArg >= 0 ? args[sinceArg + 1] : null
+if (sinceArg >= 0 && (sinceRaw == null || sinceRaw.startsWith('--'))) {
+  console.error('shadow-analysis: --since requires an ISO-8601 timestamp, e.g. --since 2026-09-18T19:03:37Z')
+  process.exit(2)
+}
+let CUTOFF = null
+if (sinceRaw != null) {
+  const parsed = new Date(sinceRaw)
+  if (Number.isNaN(parsed.getTime())) {
+    console.error(
+      `shadow-analysis: invalid --since timestamp ${JSON.stringify(sinceRaw)} — expected ISO-8601, e.g. 2026-09-18T19:03:37Z`,
+    )
+    process.exit(2)
+  }
+  CUTOFF = parsed.toISOString()
+}
+
 const env = Object.fromEntries(
   readFileSync(new URL('../.env.local', import.meta.url), 'utf8')
     .split('\n')
@@ -54,7 +84,8 @@ async function readAll(table, build, { pageSize = 1000, max = 50000 } = {}) {
   return out
 }
 
-const since = new Date(Date.now() - DAYS * 86400_000).toISOString()
+// The study cutoff wins when supplied; otherwise the --days window is used.
+const since = CUTOFF ?? new Date(Date.now() - DAYS * 86400_000).toISOString()
 
 const rows = await readAll('profit_protection_telemetry', (q) =>
   q.select('*').gte('created_at', since).order('created_at', { ascending: true }),
@@ -65,6 +96,8 @@ if (!rows.length) {
     generatedAt: new Date().toISOString(),
     state: 'NO TELEMETRY',
     windowDays: DAYS,
+    cutoffApplied: CUTOFF,
+    cutoffSource: CUTOFF ? '--since' : 'none (using --days window)',
     message:
       'profit_protection_telemetry has no rows in this window. Nothing to analyse — the shadow study cannot start until the trade path that places these trades writes telemetry.',
     shadowCommandEmittedCount: 0,
@@ -148,6 +181,17 @@ const report = buildReport(summaries, {
   rows: reportRows,
 })
 
+// Study-cutoff provenance — carried into BOTH the human report and the JSON so a
+// reader can always tell which window produced the numbers. Attached here rather
+// than inside buildReport so lib/shadow-analysis.mjs stays free of CLI concerns.
+report.window = {
+  ...(report.window || {}),
+  cutoffApplied: CUTOFF,
+  cutoffSource: CUTOFF ? '--since' : 'none (--days window)',
+  rowsFetched: rows.length,
+  sinceIso: since,
+}
+
 /** Human-readable report. Formatting only — every number comes from buildReport. */
 function formatReport(r) {
   const L = []
@@ -156,6 +200,8 @@ function formatReport(r) {
   L.push('=============================================================')
   L.push(`generated      : ${r.generatedAt}`)
   L.push(`window         : last ${r.windowDays} days`)
+  L.push(`cutoff (--since): ${r.window?.cutoffApplied ?? 'none'}`)
+  if (r.window?.cutoffSource) L.push(`cutoff source   : ${r.window.cutoffSource}`)
   L.push(`source filter  : ${r.sourceFilter}`)
   L.push(`telemetry rows : ${r.telemetryRows}  (unmatched groups: ${r.unmatchedTelemetryGroups})`)
 
@@ -281,6 +327,8 @@ function formatEmpty(p) {
     '=============================================================',
     `generated : ${p.generatedAt}`,
     `window    : last ${p.windowDays} days`,
+    `cutoff    : ${p.cutoffApplied ?? 'none'}`,
+    `cutoff src: ${p.cutoffSource ?? 'n/a'}`,
     '',
     p.message,
     '',

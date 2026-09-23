@@ -20,7 +20,7 @@
     "test:scalp-shadow": "node --import ./scripts/test-ts-register.mjs tests/scalp-shadow-lifecycle.test.mjs && node --import ./scripts/test-ts-register.mjs tests/scalp-shadow-repair.test.mjs && node --import ./scripts/test-ts-register.mjs tests/scalp-shadow-cadence.test.mjs && node --import ./scripts/test-ts-register.mjs tests/scalp-shadow-readonly.test.mjs && node --import ./scripts/test-ts-register.mjs tests/scalp-shadow-instrumentation.test.mjs",
     "test:scalp-shadow-instrumentation": "node --import ./scripts/test-ts-register.mjs tests/scalp-shadow-instrumentation.test.mjs",
     "test:profit-telemetry": "node tests/profit-telemetry.test.mjs",
-    "test:shadow-analysis": "node tests/shadow-analysis.test.mjs",
+    "test:shadow-analysis": "node tests/shadow-analysis.test.mjs && node tests/shadow-analysis-cutoff.test.mjs",
     "test:phase2": "npm run test:market-health && npm run test:prediction-contract",
     "test:phase3": "npm run test:market-health && npm run test:prediction-contract && npm run test:outcome-reconciliation",
     "test:phase4": "npm run test:market-health && npm run test:prediction-contract && npm run test:outcome-reconciliation && npm run test:execution-truth"
