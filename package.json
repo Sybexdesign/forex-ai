@@ -22,6 +22,7 @@
     "test:profit-telemetry": "node tests/profit-telemetry.test.mjs",
     "test:shadow-analysis": "node tests/shadow-analysis.test.mjs && node tests/shadow-analysis-cutoff.test.mjs",
     "test:reconcile-close-accounting": "node tests/reconcile-close-accounting.test.mjs",
+    "test:prediction-measurement": "node tests/prediction-measurement-v2.test.mjs",
     "test:phase2": "npm run test:market-health && npm run test:prediction-contract",
     "test:phase3": "npm run test:market-health && npm run test:prediction-contract && npm run test:outcome-reconciliation",
     "test:phase4": "npm run test:market-health && npm run test:prediction-contract && npm run test:outcome-reconciliation && npm run test:execution-truth"

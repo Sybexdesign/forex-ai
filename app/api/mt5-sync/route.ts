@@ -12,6 +12,7 @@ import { resolveProfitProtectionMode, describeProfitProtectionMode } from '@/lib
 import { alertRiskBreach, alertProfitReversal, alertCircuitBreaker } from '@/lib/telegram'
 import { normaliseExecution, EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 import { completionToTradeUpdate, completionDiagnosticLine } from '@/lib/mt5-fill-attribution.mjs'
+import { persistCandleHistory, applyV2Measurements } from '@/lib/prediction-measurement-v2-runtime.mjs'
 
 export const dynamic = 'force-dynamic'
 
@@ -600,6 +601,54 @@ export async function POST(req: NextRequest) {
         // Belt-and-braces: persistence must never throw into the trading path.
         console.error('[mt5-sync] ppt telemetry persist failed (non-blocking):', e?.message)
       }
+    }
+
+    // ── PREDICTION MEASUREMENT v2 (analytics only — never execution) ────────
+    // Two strictly additive jobs, run here because this is where the EA's M5
+    // candle feed actually arrives:
+    //
+    //   1. Freeze the existing M5 feed into m5_candle_history. The candleCache
+    //      is a rolling ~200-bar window, which is too short to build a
+    //      100-200 prediction study. Closed bars only + (symbol,timeframe,
+    //      bar_time) primary key make re-ingest an idempotent no-op.
+    //   2. Apply v2 candle-derived measurement to fresh predictions whose
+    //      15-minute window has ended and which have not yet been measured.
+    //
+    // SAFETY: placed AFTER every trade-management decision and AFTER the
+    // broker_configs write, so it cannot influence this cycle. It writes ONLY
+    // the additive v2 columns on prediction_logs; `outcome`, `mfe_pips`,
+    // `mae_pips`, `r_multiple` and `time_to_*_s` are read-only for the shadow
+    // comparison and are never written. It cannot place, close or modify an
+    // order. Best-effort: a failure here can never block or alter execution.
+    try {
+      const hist = await persistCandleHistory(sb, candleCache)
+      if (hist.rows_attempted > 0 || hist.error) {
+        console.log(`[mt5-sync] m5 history: attempted=${hist.rows_attempted} inserted=${hist.rows_inserted} matched=${hist.matched} openSkipped=${hist.openSkipped} invalid=${hist.invalid} ms=${hist.candle_history_ms} err=${hist.error ?? 'none'}`)
+      }
+      const v2 = await applyV2Measurements(sb, { candleCache, userId })
+      if (v2.considered > 0 || v2.error) {
+        console.log(`[mt5-sync] predlog v2: considered=${v2.considered} measured=${v2.measured} notExpired=${v2.notExpired} noCandles=${v2.noCandles} disagree=${v2.disagreements} v1zero_v2pos=${v2.v1ZeroButV2Positive} failed=${v2.failed} err=${v2.error ?? 'none'}`)
+      }
+      // Duration/volume instrumentation: production tells us whether the
+      // sequential per-row updates need batching. No timings are assumed.
+      if (v2.rows_attempted > 0 || v2.v2_measurement_ms >= 250) {
+        console.log(`[mt5-sync] predlog v2 timing: v2_measurement_ms=${v2.v2_measurement_ms} select_ms=${v2.select_ms} update_ms=${v2.update_ms} rows_attempted=${v2.rows_attempted} rows_updated=${v2.rows_updated} rows_skipped=${v2.rows_skipped} errors=${v2.errors}`)
+      }
+      // A write that reports no error but lands zero rows means the service role
+      // cannot write. On the prediction_logs path this is unambiguous: a genuine
+      // race is counted as rows_skipped, so 0 updated AND 0 skipped AND 0 errors
+      // can only mean the write did not land.
+      if (v2.rls_blocked) {
+        console.error('[mt5-sync] predlog v2: RLS/service-role write produced 0 rows with 0 errors — writes are NOT landing')
+      }
+      // NOTE: hist.rls_blocked is deliberately NOT alarmed on. Once the history
+      // is warm, every sync re-sends the same rolling cache and legitimately
+      // inserts 0 rows, so it would fire on nearly every sync. Treat `inserted=0`
+      // as expected in steady state and watch for `err=`. A first-ever sync that
+      // reports attempted>0 / inserted=0 / err=none is the real signal.
+    } catch (e: any) {
+      // Belt-and-braces: measurement must never throw into the trading path.
+      console.error('[mt5-sync] prediction measurement v2 failed (non-blocking):', e?.message)
     }
 
     return NextResponse.json({ ok: true, prices: priceSymbols.length, candles: candleSymbols.length })
