@@ -9,7 +9,8 @@ import {
   PREDICTION_TIMEFRAME, PREDICTION_WINDOW_MS, PREDICTION_WINDOW_MINUTES,
   PREDICTION_FUTURE_CANDLES, PREDICTION_RESOLUTION_RULE, PREDICTION_FALLBACK_OUTCOME,
   predictionExpiresAt, buildPredictionMeta, resolveSampleOutcome,
-  isWithinPredictionWindow, predictionIdentityKey,
+  isWithinPredictionWindow, predictionIdentityKey, isResolvableTick,
+  PREDICTION_MAX_TICK_AGE_SEC, PREDICTION_MAX_EXCURSION_R,
 } from '../lib/prediction-contract.mjs'
 
 const FIVE_MIN = 5 * 60_000
@@ -158,4 +159,45 @@ const EXP0 = '2026-09-04T20:30:05.000Z'          // T0 + 15 min
 }
 
 // K (no-lookahead) is covered by tests/closed-candle.test.mjs (tests A + H).
+// ── Test M — resolution-input guards (production regression, 2026-11-04) ─────
+// On 2026-11-04 00:10–00:16 UTC the worker graded live predictions against a
+// stale quote series: entry 3935.488 / 49.78 with a 15-minute sample of
+// 4184.354 / 57.375. TP "hit" instantly → WIN with mfe_pips 2488.66 / 759.5 on
+// targets of 58 / 22 pips. Candles showed SL first in every case. These exact
+// numbers are the regression fixture.
+{
+  assert.equal(PREDICTION_MAX_TICK_AGE_SEC, 150, 'M: default tick age = signal TTL')
+  assert.equal(PREDICTION_MAX_EXCURSION_R, 10, 'M: default plausibility bound = 10R')
+  const xau = { entry: 3935.488, sl: 3929.396293, price: 4184.354, closedCandleAgeSec: 12 }
+  assert.deepEqual(isResolvableTick(xau), { ok: false, reason: 'IMPLAUSIBLE_PRICE' },
+    'M: XAU 4184 vs entry 3935 must never grade a prediction')
+
+  const xag = { entry: 49.78, sl: 49.646841, price: 57.375, closedCandleAgeSec: 12 }
+  assert.deepEqual(isResolvableTick(xag), { ok: false, reason: 'IMPLAUSIBLE_PRICE' },
+    'M: XAG 57.375 vs entry 49.78 must never grade a prediction')
+
+  // A genuine move inside the window is still graded normally.
+  assert.deepEqual(isResolvableTick({ ...xau, price: 3945.6 }), { ok: true, reason: null },
+    'M: TP-distance move is plausible')
+  assert.deepEqual(isResolvableTick({ ...xau, price: 3929.3 }), { ok: true, reason: null },
+    'M: SL-distance move is plausible')
+
+  // Stale feed: the same guard /api/scalper/signal applies before generating.
+  assert.deepEqual(isResolvableTick({ ...xau, price: 3936, closedCandleAgeSec: 2400 }),
+    { ok: false, reason: 'STALE_FEED' }, 'M: feed older than the signal TTL is refused')
+  assert.deepEqual(isResolvableTick({ ...xau, price: 3936, closedCandleAgeSec: 100 }),
+    { ok: true, reason: null }, 'M: fresh feed is accepted')
+
+  // No price at all never resolves.
+  for (const bad of [0, null, undefined, NaN, 'x']) {
+    assert.deepEqual(isResolvableTick({ ...xau, price: bad }), { ok: false, reason: 'NO_PRICE' },
+      `M: price ${String(bad)} is refused`)
+  }
+
+  // Missing SL (legacy row) must not block a valid price.
+  assert.deepEqual(isResolvableTick({ price: 3936, entry: 3935.488, sl: null }),
+    { ok: true, reason: null }, 'M: unguarded when the row carries no SL')
+  console.log('PASS M: stale/implausible ticks are refused before they can write an outcome')
+}
+
 console.log('\nAll prediction-contract tests passed.')

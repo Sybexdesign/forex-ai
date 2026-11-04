@@ -16,7 +16,7 @@
 import {
   PREDICTION_WINDOW_MS, PREDICTION_MAX_AGE_MS, PREDICTION_TIMEFRAME,
   PREDICTION_FUTURE_CANDLES, PREDICTION_RESOLUTION_RULE, predictionExpiresAt,
-  resolveSampleOutcome, isWithinPredictionWindow,
+  resolveSampleOutcome, isWithinPredictionWindow, isResolvableTick,
 } from '../lib/prediction-contract.mjs'
 
 // ── Scalp shadow protection — read-only observation of the profit algorithm ───
@@ -1074,6 +1074,9 @@ const EXPIRED_PENDING_SCAN_MS = 60 * 1000
 // only while the evaluated candle is fresh.
 const SIGNAL_MAX_AGE_SECONDS = parseInt(process.env.SIGNAL_MAX_AGE_SECONDS || '150', 10)
 const predLogs = new Map()                     // id → { pair, direction, entry, sl, tp, at, minP, maxP, sampled }
+// Resolution-input guard counters (audit 2026-11-04) — reported per sweep so a
+// silently broken price feed is visible instead of being absorbed as bad data.
+const predlogGuardSkips = { NO_PRICE: 0, STALE_FEED: 0, IMPLAUSIBLE_PRICE: 0 }
 
 function trackPredictionLog(id, pair, direction, entry, sl, tp) {
   if (!id) return
@@ -1098,6 +1101,20 @@ async function resolvePredictionLogs(ticksByPair) {
     if (!tick) continue
     const price = tick.price
     if (!(price > 0)) continue
+
+    // Resolution-INPUT guard (audit 2026-11-04). A stale feed or an absurd jump
+    // must never grade a prediction: on 2026-11-04 a weeks-old quote series
+    // produced 15-min samples of 4184.354 / 57.375 against entries of 3930 /
+    // 49.8, instantly "reaching" TP and writing WIN with mfe_pips 2471–2553.
+    // Refusing the tick keeps the row pending; the max-age ceiling above then
+    // writes INCONCLUSIVE instead of a fabricated outcome.
+    const tickGuard = isResolvableTick({
+      price, entry: sig.entry, sl: sig.sl, closedCandleAgeSec: tick.closedCandleAgeSec,
+    })
+    if (!tickGuard.ok) {
+      predlogGuardSkips[tickGuard.reason] = (predlogGuardSkips[tickGuard.reason] ?? 0) + 1
+      continue
+    }
 
     // Track min/max excursion + fixed-interval price samples.
     if (price < sig.minP) sig.minP = price
@@ -1140,6 +1157,11 @@ async function resolvePredictionLogs(ticksByPair) {
         console.log(`[predlog] ${id.slice(0, 8)} already resolved elsewhere — idempotent skip`)
       }
     }
+  }
+  const skipped = Object.entries(predlogGuardSkips).filter(([, n]) => n > 0)
+  if (skipped.length > 0) {
+    console.warn(`[predlog] refused ${skipped.map(([k, n]) => `${k}=${n}`).join(' ')} — stale/implausible price, prediction left pending`)
+    for (const k of Object.keys(predlogGuardSkips)) predlogGuardSkips[k] = 0
   }
 }
 

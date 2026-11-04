@@ -21,7 +21,7 @@ import {
 import {
   buildCandleHistoryRows, buildCandleHistoryRowsForCache, parseCandleCacheKey,
 } from '../lib/m5-candle-history.mjs'
-import { pipSizeOf, symbolOf, applyV2Measurements, persistCandleHistory, V2_WINDOW_MS } from '../lib/prediction-measurement-v2-runtime.mjs'
+import { pipSizeOf, symbolOf, applyV2Measurements, persistCandleHistory, V2_WINDOW_MS, selectMeasurableFeeds, newestM5BarMs, FRESH_FEED_MS } from '../lib/prediction-measurement-v2-runtime.mjs'
 
 let failed = 0
 const pending = []
@@ -707,6 +707,74 @@ t('instr: candle history counts genuinely new bars as inserted', () => {
     assert.equal(s.rows_inserted, 1)
     assert.equal(s.rls_blocked, false)
   })
+})
+
+// ═══ SCHEDULED APPLIER — FEED SELECTION (2026-11-04 production repair) ═══════
+// v2 measurement was only reachable from POST /api/mt5-sync, which the shipping
+// EA never calls. These cases pin the behaviour of the replacement scheduler
+// input: only a LIVE MT5 feed may be measured, and only with attribution.
+t('feeds: only a live M5 feed is selectable', () => {
+  const nowMs = (T0 + M5_BAR_SECONDS + 600) * 1000
+  const feeds = selectMeasurableFeeds([
+    {
+      id: 'cfg-live', user_id: 'u-1', broker_type: 'mt5direct', is_active: true,
+      config: { candleCache: { XAUUSD_M5: { candles: bars(T0, [[2000, 2005, 1998, 2002], [2002, 2006, 2000, 2004]]) } } },
+    },
+  ], nowMs)
+  assert.equal(feeds.length, 1)
+  assert.equal(feeds[0].userId, 'u-1')
+  assert.equal(feeds[0].configId, 'cfg-live')
+  assert.equal(feeds[0].newestBarMs, (T0 + M5_BAR_SECONDS) * 1000)
+  assert.equal(feeds[0].ageMs, 600 * 1000)
+})
+
+t('feeds: a stale feed is refused, not measured', () => {
+  const cache = { XAUUSD_M5: { candles: bars(T0, [[2000, 2005, 1998, 2002]]) } }
+  const lastBarMs = T0 * 1000 // single bar, open time = its cache timestamp
+  const mk = () => ({ id: 'cfg', user_id: 'u-1', broker_type: 'mt5direct', is_active: true, config: { candleCache: cache } })
+  // 1 minute past FRESH_FEED_MS (30 min) → the feed is not authoritative any more.
+  assert.equal(selectMeasurableFeeds([mk()], lastBarMs + FRESH_FEED_MS + 60_000).length, 0,
+    'a disconnected feed must never be measured against')
+  // 1 minute inside the tolerance → usable.
+  assert.equal(selectMeasurableFeeds([mk()], lastBarMs + FRESH_FEED_MS - 60_000).length, 1)
+})
+
+t('feeds: inactive, non-MT5, unattributed and M5-less configs are skipped', () => {
+  const cache = { XAUUSD_M5: { candles: bars(T0, [[2000, 2005, 1998, 2002]]) } }
+  const nowMs = (T0 + 600) * 1000
+  const mk = (over) => ({ id: 'c', user_id: 'u', broker_type: 'mt5direct', is_active: true, config: { candleCache: cache }, ...over })
+  assert.equal(selectMeasurableFeeds([mk({ is_active: false })], nowMs).length, 0)
+  assert.equal(selectMeasurableFeeds([mk({ broker_type: 'capital' })], nowMs).length, 0)
+  assert.equal(selectMeasurableFeeds([mk({ user_id: null })], nowMs).length, 0)
+  assert.equal(selectMeasurableFeeds([mk({ config: { candleCache: { XAUUSD_M15: { candles: bars(T0, [[2000, 2005, 1998, 2002]]) } } } })], nowMs).length, 0)
+  assert.equal(selectMeasurableFeeds([mk({ config: {} })], nowMs).length, 0)
+  assert.equal(selectMeasurableFeeds(null, nowMs).length, 0)
+})
+
+t('feeds: freshest first and bounded by maxFeeds', () => {
+  const nowMs = (T0 + 600) * 1000
+  const mk = (id) => ({
+    id, user_id: 'u-' + id, broker_type: 'mt5direct', is_active: true,
+    config: { candleCache: { XAUUSD_M5: { candles: bars(T0, [[2000, 2005, 1998, 2002]]) } } },
+  })
+  const older = mk('old', T0)
+  older.config.candleCache.XAUUSD_M5.candles = bars(T0, [[2000, 2005, 1998, 2002]]) // T0
+  const newer = mk('new', T0 + 300)
+  newer.config.candleCache.XAUUSD_M5.candles = bars(T0 + 300, [[2000, 2005, 1998, 2002]]) // T0+300
+  const feeds = selectMeasurableFeeds([older, newer], nowMs)
+  assert.deepEqual(feeds.map((f) => f.configId), ['new', 'old'], 'newest feed measured first')
+  assert.equal(selectMeasurableFeeds([older, newer], nowMs, { maxFeeds: 1 }).length, 1)
+})
+
+t('feeds: millisecond bar times and newestM5BarMs agree on the same convention', () => {
+  const nowMs = (T0 + 600) * 1000
+  const cache = { XAUUSD_M5: { candles: [{ t: (T0 + 300) * 1000, o: 2000, h: 2005, l: 1998, c: 2002, v: 1 }] } }
+  assert.equal(newestM5BarMs(cache), (T0 + 300) * 1000)
+  const feeds = selectMeasurableFeeds([
+    { id: 'cfg', user_id: 'u-1', broker_type: 'exness', is_active: true, config: { candleCache: cache } },
+  ], nowMs)
+  assert.equal(feeds.length, 1)
+  assert.equal(feeds[0].newestBarMs, (T0 + 300) * 1000)
 })
 
 const settled = await Promise.all(pending)
