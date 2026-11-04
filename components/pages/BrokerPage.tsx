@@ -5,6 +5,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { Panel, LoadingDots } from '../ui'
 import { BROKER_INFO, type BrokerKey } from '@/lib/brokers/index'
 import { authFetch } from '@/lib/api'
+import { diagnoseBrokerConnection, ACCOUNT_VERDICT, type AccountVerdict } from '@/lib/mt5-account-verdict.mjs'
 
 interface BrokerConfig {
   id: string
@@ -20,7 +21,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
   const [editing, setEditing] = useState<Partial<BrokerConfig> | null>(null)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
-  const [testResult, setTestResult] = useState<string | null>(null)
+  const [testResult, setTestResult] = useState<AccountVerdict | null>(null)
   const [showSecrets, setShowSecrets] = useState(false)
   const [changingBroker, setChangingBroker] = useState(false)
   // Account-switch modal state. id = the broker_configs row being activated.
@@ -165,30 +166,28 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
       const res = await authFetch('/api/account')
       const d = await res.json()
       const isMt5 = activeConfig?.broker_type === 'mt5direct' || activeConfig?.broker_type === 'exness'
-      if (d.error) {
-        setTestResult(`✕ Error: ${d.error}`)
-      } else if (d.balance > 0) {
-        const login = (activeConfig?.config as any)?.login
-        const server = (activeConfig?.config as any)?.server
-        const extra = login ? ` · Login ${login}${server ? ' @ ' + server : ''}` : ''
-        setTestResult(`✓ Connected — ${d.currency || 'USD'} ${d.balance?.toFixed(2)}${extra} via ${d.broker}`)
-      } else if (isMt5) {
-        const lastSync = (activeConfig?.config as any)?.updatedAt
-        if (!lastSync) {
-          setTestResult(`⚠ EA has not synced yet — step-by-step checklist:\n1. EA is attached to a chart in MT5\n2. MT5: Tools → Options → Expert Advisors → Allow WebRequest → add the webhook URL\n3. Auto Trading is enabled in the MT5 toolbar`)
-        } else {
-          const minsAgo = Math.floor((Date.now() - new Date(lastSync).getTime()) / 60000)
-          if (minsAgo < 5) {
-            setTestResult(`⚠ EA is online (synced ${minsAgo}m ago) but MT5 account shows $0 — account may not be funded or is a demo that hasn't been initialized`)
-          } else {
-            setTestResult(`⚠ EA last synced ${minsAgo}m ago and appears offline — recheck that MT5 is open and the EA is attached to a chart`)
-          }
-        }
-      } else {
-        setTestResult(`⚠ Connected to ${d.broker} but balance is $0 — check your broker API credentials`)
-      }
+      const cfg   = (activeConfig?.config as any) || {}
+      const ea    = d.eaStatus || null
+      // Every input below is what the broker/EA just reported, never what the
+      // page happens to have cached: `activeConfig.config.updatedAt` is only as
+      // fresh as the last /api/broker-config fetch, so an EA that died after the
+      // page loaded was still being called "online (synced 0m ago)". `lastSyncAt`
+      // comes from the adapter, i.e. from the row as it is read right now.
+      setTestResult(diagnoseBrokerConnection({
+        isMt5,
+        brokerName:  d.broker || BROKER_INFO[activeConfig?.broker_type as BrokerKey]?.name || 'broker',
+        error:       d.error || null,
+        balance:     Number(d.balance) || 0,
+        equity:      Number(d.nav ?? d.balance) || 0,
+        currency:    d.currency || 'USD',
+        login:       ea?.login  ?? cfg.login  ?? '',
+        server:      ea?.server ?? cfg.server ?? '',
+        lastSyncAt:  d.lastSyncAt ?? ea?.reportedAt ?? null,
+        priceSymbols: ea?.priceSymbols ?? 0,
+        candleSets:   ea?.candleSets   ?? 0,
+      }))
     } catch (e: any) {
-      setTestResult('✕ Connection failed: ' + e.message)
+      setTestResult({ level: ACCOUNT_VERDICT.ERROR, message: '✕ Connection failed: ' + e.message })
     } finally { setTesting(false) }
   }
 
@@ -224,8 +223,8 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                 </button>
               </div>
               {testResult && (() => {
-                const isOk   = testResult.startsWith('✓')
-                const isWarn = testResult.startsWith('⚠')
+                const isOk   = testResult.level === ACCOUNT_VERDICT.OK
+                const isWarn = testResult.level === ACCOUNT_VERDICT.WARN
                 return (
                   <div style={{
                     width: '100%', padding: '10px 14px', borderRadius: 3, fontSize: 12,
@@ -234,7 +233,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                     color: isOk ? '#00ff87' : isWarn ? '#ffb800' : '#ff6060',
                     fontFamily: 'JetBrains Mono', whiteSpace: 'pre-line', lineHeight: 1.7,
                   }}>
-                    {testResult}
+                    {testResult.message}
                   </div>
                 )
               })()}
@@ -278,6 +277,14 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                       {(cfg.config as any)?.balance && parseFloat((cfg.config as any).balance) > 0 && (
                         <span style={{ fontSize: 10, color: '#60c0ff', fontFamily: 'JetBrains Mono' }}>
                           {(cfg.config as any).currency || 'USD'} {parseFloat((cfg.config as any).balance).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </span>
+                      )}
+                      {/* An EA that is pushing but reporting zero is the confusing case:
+                          the row said "● EA online" and simply omitted the balance, so
+                          nothing in the list showed that the account figure was 0.00. */}
+                      {isMt5 && eaOnline && !(parseFloat((cfg.config as any)?.balance || '0') > 0) && (
+                        <span style={{ fontSize: 10, color: '#ffb800', fontFamily: 'JetBrains Mono' }}>
+                          ⚠ reports {(cfg.config as any)?.currency || 'USD'} 0.00
                         </span>
                       )}
                       {pending > 0 && (

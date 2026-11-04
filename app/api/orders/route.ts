@@ -76,6 +76,10 @@ export async function POST(req: NextRequest) {
     let maxDailyPLEver = 0
     let brokerSynced = false
     let lastSyncAt: string | undefined
+    // AccountSummary.accountReady + currency, hoisted: the zero-balance guard runs
+    // after the try block, where `account` is out of scope.
+    let brokerAccountReady: boolean | undefined
+    let accountCurrency = 'USD'
 
     try {
       const [trades, account] = await Promise.all([broker.getOpenTrades(), broker.getAccountSummary()])
@@ -84,6 +88,8 @@ export async function POST(req: NextRequest) {
       equity       = account.nav ?? account.balance
       brokerSynced = balance > 0
       lastSyncAt   = account.lastSyncAt
+      brokerAccountReady = account.accountReady
+      accountCurrency    = account.currency || 'USD'
     } catch { /* use defaults if broker fails */ }
 
     // ─── Broker data staleness guard (MT5 Direct / Exness) ───────────────
@@ -101,6 +107,23 @@ export async function POST(req: NextRequest) {
         await alertOrderBlocked({ pair, direction, reason })
         return NextResponse.json({ success: false, blocked: true, reasons: [reason] }, { status: 422 })
       }
+    }
+
+    // ─── Zero-balance guard (MT5 Direct / Exness push model) ──────────────
+    // `brokerSynced` is false both when the EA has never pushed and when it just
+    // pushed "0.00". Only the second is a broker figure, and it used to reach the
+    // planner as a zero risk budget — which floored to the 0.01 minimum lot and
+    // depended on the broker's margin check to stop it. `accountReady` makes the
+    // distinction explicit; `lastSyncAt` is the fallback for adapters that predate it.
+    const accountReady = brokerAccountReady ?? (balance > 0)
+    if (!accountReady && lastSyncAt) {
+      const ageS = Math.max(0, Math.round((Date.now() - new Date(lastSyncAt).getTime()) / 1000))
+      const reason = `Broker reports ${accountCurrency} ${balance.toFixed(2)} balance `
+        + `(last EA sync ${ageS}s ago) — refusing to size a trade from a zero balance. `
+        + `Fund the account, or check MT5 is logged into the account shown in the app.`
+      console.warn(`[orders] ZERO BALANCE — ${broker.name} reports ${balance} ${accountCurrency}, blocking ${pair} ${direction}`)
+      await alertOrderBlocked({ pair, direction, reason })
+      return NextResponse.json({ success: false, blocked: true, reasons: [reason] }, { status: 422 })
     }
 
     // ─── Final signal freshness / duplication validation (execution audit) ───

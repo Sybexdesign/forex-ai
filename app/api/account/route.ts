@@ -33,7 +33,7 @@ export async function GET(req: NextRequest) {
       broker.getOpenTrades(),
     ])
 
-    const summary = summaryResult.status === 'fulfilled' ? summaryResult.value : { balance: 0, unrealizedPL: 0, realizedPL: 0, openTradeCount: 0, currency: 'USD', nav: 0 }
+    const summary = summaryResult.status === 'fulfilled' ? summaryResult.value : { balance: 0, unrealizedPL: 0, realizedPL: 0, openTradeCount: 0, currency: 'USD', nav: 0, accountReady: false }
     const openTrades = openTradesResult.status === 'fulfilled' ? openTradesResult.value : []
     const brokerReliable = openTradesResult.status === 'fulfilled'
 
@@ -57,6 +57,22 @@ export async function GET(req: NextRequest) {
     let lastCbArmedOneR:     string | null = null
     let profitFixedUsd:      number | null = null
     let profitTargetPct:     number | null = null
+    // MT5 Direct / Exness only: what the EA last pushed about the ACCOUNT.
+    //
+    // A zero balance is ambiguous on its own — an unfunded account and a terminal
+    // that is logged into some other account look identical. The EA identifies the
+    // account in every push, and the size of the market-data feed proves the EA is
+    // alive, so both are surfaced here rather than left for the UI to infer.
+    // Whitelisted fields only: `config` also holds the webhook token.
+    let eaStatus: {
+      login: string
+      server: string
+      currency: string
+      reportedAt: string | null
+      priceSymbols: number
+      candleSets: number
+      openPositions: number
+    } | null = null
     if (token) {
       try {
         const parts = token.split('.')
@@ -67,7 +83,7 @@ export async function GET(req: NextRequest) {
             const admin = getAdminClient()
             const { data: cfg } = await admin
               .from('broker_configs')
-              .select('last_switched_at, config')
+              .select('last_switched_at, config, broker_type')
               .eq('user_id', userId)
               .eq('is_active', true)
               .limit(1)
@@ -81,6 +97,21 @@ export async function GET(req: NextRequest) {
             lastCbArmedOneR     = c.lastCbArmedOneR     ?? null
             profitFixedUsd      = typeof c.profitFixedUsd  === 'number' ? c.profitFixedUsd  : null
             profitTargetPct     = typeof c.profitTargetPct === 'number' ? c.profitTargetPct : null
+
+            // EA-pushed account identity, for the MT5 Direct / Exness push model only.
+            // These are the exact values the EA sent — never the API keys that sit
+            // beside them in the same JSON blob.
+            if (cfg?.broker_type === 'mt5direct' || cfg?.broker_type === 'exness') {
+              eaStatus = {
+                login:         String(c.login   ?? ''),
+                server:        String(c.server  ?? ''),
+                currency:      String(c.currency ?? ''),
+                reportedAt:    typeof c.updatedAt === 'string' ? c.updatedAt : null,
+                priceSymbols:  c.latestPrices ? Object.keys(c.latestPrices).length : 0,
+                candleSets:    c.candleCache  ? Object.keys(c.candleCache).length  : 0,
+                openPositions: Array.isArray(c.openPositions) ? c.openPositions.length : 0,
+              }
+            }
           }
         }
       } catch { /* metadata fetch is best-effort */ }
@@ -114,6 +145,10 @@ export async function GET(req: NextRequest) {
       ...summary, broker: broker.name, openTrades, lastSwitchedAt,
       circuitBreakerUntil, lastCbArmedAt, lastCbArmedPair, lastCbArmedPl, lastCbArmedOneR,
       profitFixedUsd, profitTargetPct,
+      // Uniform contract across adapters: MT5 Direct reports it from the last push
+      // (a live "0.00" is NOT ready); everything else falls back to balance > 0.
+      accountReady: summary.accountReady ?? (summary.balance > 0),
+      eaStatus,
       instrumentGeometry,
     })
   } catch (error: any) {

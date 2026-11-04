@@ -71,6 +71,13 @@ export class Mt5DirectBroker implements IBroker {
       // EA pushes balance every ~30s; anything older than BALANCE_TTL (5 min) means
       // the EA is likely down or MT5 is closed and trades MUST NOT be placed.
       lastSyncAt:     this.config.updatedAt,
+      // Distinguishes "the EA just told us the account is empty" from "we have no
+      // push at all". Both yield balance 0, but only the first is a broker figure:
+      // it means the account is unfunded or the terminal is logged into a
+      // different account — not that the EA is missing. Callers that used
+      // `balance > 0` as a proxy for "synced" lose that distinction and skip the
+      // guards that would flag it.
+      accountReady:   !eaStale && balance > 0,
     }
   }
 

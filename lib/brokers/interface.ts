@@ -34,6 +34,18 @@ export interface AccountSummary {
    * Callers can use it to detect a disconnected source and block trading on stale data.
    */
   lastSyncAt?: string
+  /**
+   * Whether `balance` is a figure the broker actually reported just now.
+   *
+   * MT5 Direct returns a balance of 0 in two very different situations: the EA
+   * has never pushed, and a live EA pushed "0.00" for an unfunded account. The
+   * number alone cannot tell them apart, and both produce the same `balance: 0`
+   * downstream — where it used to be indistinguishable from "not synced yet" and
+   * was therefore skipped by every guard. Optional because live-API adapters
+   * always have a real figure; consumers should treat `undefined` as "derive it
+   * from balance > 0".
+   */
+  accountReady?: boolean
 }
 
 export interface OpenTrade {
@@ -170,7 +182,17 @@ export function calcStandardPositionSize(
 ): number {
   // Guard: slPips=0 causes division-by-zero → NaN → order with no stop loss
   if (!slPips || slPips <= 0) return 0
-  const riskAmount = balance * (riskPct / 100)
+  // Guard: the risk budget is `balance × riskPct`. With no usable balance the
+  // budget is zero, and the lot floor below (Math.max(0.01, …)) would turn that
+  // zero into the MINIMUM LOT — an order sized from money the account does not
+  // have. MT5 Direct makes this reachable in normal use: a connected EA happily
+  // reports balance 0 for an unfunded account or a terminal that lost its trade
+  // server, so "0.00" is a real state, not a hypothetical one. MANUAL sizing
+  // already refuses an unusable balance (MANUAL_REJECT.BALANCE_INVALID); AUTO now
+  // agrees instead of quietly trading 0.01. Callers see 0 and refuse to place.
+  const bal = Number(balance)
+  if (!Number.isFinite(bal) || bal <= 0) return 0
+  const riskAmount = bal * (riskPct / 100)
   const pipValPerLot = getPipValuePerLot(pair)
   if (!pipValPerLot || pipValPerLot <= 0) return 0
   const lots = riskAmount / (slPips * pipValPerLot)

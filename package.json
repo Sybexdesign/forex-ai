@@ -14,6 +14,7 @@
     "test:execution-truth": "node tests/execution-truth.test.mjs",
     "test:execution-guards": "node tests/execution-guards.test.mjs",
     "test:trade-state": "node tests/trade-state.test.mjs",
+    "test:mt5-account": "node tests/mt5-account-verdict.test.mjs && node --import ./scripts/test-ts-register.mjs tests/zero-balance-sizing.test.mjs",
     "test:manual-sizing": "node --import ./scripts/test-ts-register.mjs tests/manual-sizing.test.mjs && node --import ./scripts/test-ts-register.mjs tests/manual-preview.test.mjs && node --import ./scripts/test-ts-register.mjs tests/order-sizing-runtime.test.mjs && node --import ./scripts/test-ts-register.mjs tests/order-planner-boundary.test.mjs && node --import ./scripts/test-ts-register.mjs tests/strategy-page-sizing.test.mjs && node --import ./scripts/test-ts-register.mjs tests/strategy-page-render.test.mjs",
     "test:profit-protection": "node tests/profit-protection.test.mjs && node --import ./scripts/test-ts-register.mjs tests/profit-protection-activation.test.mjs",
     "test:llm-timeout": "node --import ./scripts/test-ts-register.mjs tests/llm-timeout.test.mjs",
