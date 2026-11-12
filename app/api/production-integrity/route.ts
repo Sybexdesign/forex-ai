@@ -15,6 +15,8 @@ import { NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
 import { buildEvidence } from '@/lib/execution-evidence.mjs'
 import { ukOffsetMinutes } from '@/lib/uk-time.mjs'
+import { buildScopedAnalytics } from '@/lib/analytics-metrics.mjs'
+import { POPULATION } from '@/lib/analytics-scope.mjs'
 
 const WINDOW_DAYS = 120
 const EVIDENCE_LIMIT = 3000
@@ -49,6 +51,18 @@ export async function GET() {
     if (evRes.error) throw new Error(`trades read failed — ${evRes.error.message}`)
 
     const evidence = buildEvidence(evRes.data ?? [], { bucketBy: 'ukEntryHour' })
+
+    // ── 3b. Population scope (Phase 4.2C) ─────────────────────────────────
+    // Every analytics surface must be able to answer "how many rows did you
+    // exclude, and why". This block is that answer, computed from the same
+    // classifier the UI uses, so the endpoint cannot disagree with the pages.
+    const scopeRes = await admin.from('trades')
+      .select('id,broker_ticket,pl_usd,net_realised_pnl,commission,swap,other_fees,accounting_complete,accounting_missing,trade_result,result,trade_status,closed_at')
+      .gte('opened_at', since)
+      .order('opened_at', { ascending: false })
+      .limit(EVIDENCE_LIMIT)
+    const scoped = buildScopedAnalytics(scopeRes.error ? [] : (scopeRes.data ?? []))
+    const c = scoped.scope.counts
 
     // ── 2. Row counts ─────────────────────────────────────────────────────
     const [totalRows, closedRows, legacyClosed, ticketless, withExecSource] = await Promise.all([
@@ -167,6 +181,40 @@ export async function GET() {
           ukOffsetNowMinutes: ukOffsetMinutes(new Date()) ?? 0,
           isBst: ukOffsetMinutes(new Date()) === 60 ? 1 : 0,
         }),
+
+      // ── Phase 4.2C — analytics population hygiene ──────────────────────
+      // A number is only honest if the denominator is stated. This check fails
+      // loudly if any simulated row could ever reach a net figure.
+      check('analytics_population',
+        scoped.scope.totalRows === 0 ? 'INSUFFICIENT_DATA'
+          : (c[POPULATION.SIMULATION] > 0 && c[POPULATION.NET_CONFIRMED] === 0) ? 'WARNING' : 'HEALTHY',
+        scoped.scope.disclosure
+          + ' — net metrics are computed ONLY from net-complete executions; '
+          + 'gross-only and simulated rows are reported separately and never averaged into net.',
+        {
+          netComplete: c[POPULATION.NET_CONFIRMED],
+          grossOnly: c[POPULATION.GROSS_ONLY],
+          accountingPending: c[POPULATION.ACCOUNTING_PENDING],
+          accountingError: c[POPULATION.ACCOUNTING_ERROR],
+          simulated: c[POPULATION.SIMULATION],
+          cancelled: c[POPULATION.CANCELLED],
+          open: c[POPULATION.OPEN],
+          netMetricAvailable: scoped.net.n > 0 ? 1 : 0,
+        }),
+
+      // ── Phase 4.2E — scheduler authentication ──────────────────────────
+      // The Vercel preview/production process is the only environment this
+      // endpoint can inspect. THE VPS WORKER's CRON_SECRET is NOT observable
+      // from here and is reported separately as NOT VERIFIED.
+      check('scheduler_authentication',
+        process.env.CRON_SECRET ? 'HEALTHY' : 'FAILED',
+        process.env.CRON_SECRET
+          ? 'CRON_SECRET is set in this runtime; the refresh endpoint requires an exact timing-safe match and no longer accepts a forgeable x-vercel-cron header.'
+          : 'CRON_SECRET is NOT set in this runtime. The refresh endpoint refuses unauthenticated production requests (503), so scheduled reconciliation cannot run. Worker-side configuration is NOT VERIFIED from here.',
+        {
+          cronSecretConfigured: process.env.CRON_SECRET ? 1 : 0,
+          workerSchedulerVerified: 0,
+        }),
     ]
 
 
@@ -202,6 +250,14 @@ export async function GET() {
         : checks.some((c) => c.status === 'INCOMPLETE') ? 'INCOMPLETE'
           : checks.some((c) => c.status === 'WARNING') ? 'WARNING' : 'HEALTHY',
       checks,
+      analytics: {
+        scope: scoped.scope,
+        net: scoped.net,
+        gross: scoped.gross,
+        netComplete: scoped.netComplete,
+        excluded: scoped.excluded,
+        note: 'net.* is confirmed net profitability. gross.* is provisional and is labelled GROSS. They are never summed together.',
+      },
       tradingSessionEvidence: {
         overall: evidence.overall,
         sensitivity: evidence.sensitivity,

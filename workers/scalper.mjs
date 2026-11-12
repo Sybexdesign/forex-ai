@@ -770,6 +770,113 @@ async function alertStaleReconciliations() {
   }
 }
 
+// ── Derived outcome_reconciliation refresh (Phase 4.2E) ──────────────────────
+// WHY THIS LIVES IN THE WORKER
+// vercel.json used to request `*/10 * * * *` for this endpoint. Vercel's Hobby
+// plan cannot express a sub-daily schedule, so it never ran: production evidence
+// showed outcome_reconciliation.updated_at 1,608 hours (67 days) stale while the
+// endpoint itself answered 200 when called by hand. Changing CRON_SECRET could
+// never have fixed that — it was a plan limit, not a secret problem.
+//
+// The VPS worker already runs continuously, already holds the credentials and is
+// already monitored, so it is the scheduler that actually exists. No new
+// infrastructure, no new paid service.
+const RECON_REFRESH_MS     = 10 * 60_000   // match the cadence the cron could not
+const RECON_STALE_WARN_MS  = 30 * 60_000   // 3 missed ticks before shouting
+let lastReconRefreshAttemptAt = 0
+let lastReconRefreshOkAt      = 0
+let lastReconRefreshError     = null
+let lastReconStaleAlertAt     = 0
+
+async function refreshOutcomeReconciliation() {
+  if (Date.now() - lastReconRefreshAttemptAt < RECON_REFRESH_MS) return
+  lastReconRefreshAttemptAt = Date.now()
+
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    // Do NOT fall back to a forgeable header. The endpoint now rejects
+    // unauthenticated refreshes in production, and a fallback here would just
+    // reintroduce the hole while looking like it worked.
+    lastReconRefreshError = 'CRON_SECRET not set on the worker'
+    if (Date.now() - lastReconStaleAlertAt > STALE_RECON_ALERT_COOLDOWN_MS) {
+      lastReconStaleAlertAt = Date.now()
+      console.warn('[recon-refresh] CRON_SECRET not configured — cannot refresh derived analytics')
+      wlog('warn', 'Outcome reconciliation refresh BLOCKED: CRON_SECRET not set on the worker', {
+        metadata: { reason: 'missing_worker_cron_secret', cadenceMin: RECON_REFRESH_MS / 60_000 },
+      })
+      await tgSend(
+        '⚠️ <b>RECONCILIATION NOT REFRESHING</b>\n\n' +
+        'CRON_SECRET is not set on the VPS worker, so the scheduled refresh cannot ' +
+        'authenticate. Derived analytics (lineage, agreement classes) will go stale.\n\n' +
+        'Fix: set CRON_SECRET in the worker environment to the same value as the ' +
+        'Vercel project, then restart the worker.'
+      ).catch(() => {})
+    }
+    return
+  }
+
+  try {
+    const res = await fetch(`${BASE_URL}/api/outcome-reconciliation/refresh?windowDays=2`, {
+      headers: { Authorization: `Bearer ${secret}` },
+      signal:  AbortSignal.timeout(90_000),
+    })
+    const body = await res.json().catch(() => ({}))
+
+    // `refreshed !== true` is not success. The endpoint sets it false on any
+    // failure, and a 503 means the secret is missing server-side.
+    if (!res.ok || body?.refreshed !== true) {
+      throw new Error(`HTTP ${res.status}${body?.error ? ` — ${body.error}` : ''}`)
+    }
+
+    const wasFailing = lastReconRefreshError !== null
+    lastReconRefreshOkAt = Date.now()
+    lastReconRefreshError = null
+
+    if (body.changed || wasFailing) {
+      const line = `[recon-refresh] ok — examined ${body.examined?.predictions ?? 0}p/${body.examined?.signals ?? 0}s/`
+        + `${body.examined?.reconciliations ?? 0}r/${body.examined?.trades ?? 0}t → `
+        + `+${body.inserted ?? 0} ~${body.updated ?? 0} =${body.unchanged ?? 0}`
+      console.log(line)
+      wlog('info', 'Outcome reconciliation refreshed', { metadata: {
+        inserted: body.inserted ?? 0, updated: body.updated ?? 0,
+        unchanged: body.unchanged ?? 0, derivedRows: body.derivedRows ?? 0,
+        executionLinks: body.executionLinks ?? 0, ambiguous: body.ambiguous ?? 0,
+      } })
+    }
+  } catch (e) {
+    lastReconRefreshError = e.message
+    console.warn('[recon-refresh] failed:', e.message)
+    if (Date.now() - lastReconStaleAlertAt > STALE_RECON_ALERT_COOLDOWN_MS) {
+      lastReconStaleAlertAt = Date.now()
+      wlog('error', 'Outcome reconciliation refresh FAILED', {
+        metadata: { error: e.message, cadenceMin: RECON_REFRESH_MS / 60_000 },
+      })
+      await tgSend(
+        `❌ <b>RECONCILIATION REFRESH FAILED</b>\n\n<code>${String(e.message).slice(0, 300)}</code>\n\n` +
+        `Derived analytics stop advancing while this persists.`
+      ).catch(() => {})
+    }
+    return
+  }
+
+  // Staleness: a refresh that keeps returning 200 while writing nothing is still
+  // a working refresh, so this only fires when successes stop entirely.
+  if (lastReconRefreshOkAt > 0
+      && Date.now() - lastReconRefreshOkAt > RECON_STALE_WARN_MS
+      && Date.now() - lastReconStaleAlertAt > STALE_RECON_ALERT_COOLDOWN_MS) {
+    lastReconStaleAlertAt = Date.now()
+    const ageMin = Math.round((Date.now() - lastReconRefreshOkAt) / 60_000)
+    console.warn(`[recon-refresh] stale — last success ${ageMin} min ago`)
+    wlog('warn', `Outcome reconciliation stale (${ageMin} min since success)`, {
+      metadata: { ageMin, cadenceMin: RECON_REFRESH_MS / 60_000 },
+    })
+    await tgSend(
+      `⚠️ <b>RECONCILIATION STALE</b>\n\nNo successful refresh for ${ageMin} min ` +
+      `(expected every ${RECON_REFRESH_MS / 60_000} min).`
+    ).catch(() => {})
+  }
+}
+
 // Sweep hook — resolves any reconciliation rows that are due, and alerts on
 // stale PENDING rows (worker-down / missed-sweep gaps). Both are observability
 // only — never gate or alter auto-trade execution.
@@ -2604,6 +2711,13 @@ async function runSweep() {
   // gates or alters auto-trade execution.
   await resolvePendingReconciliations().catch(e =>
     console.error('[recon] sweep resolve failed:', e.message)
+  )
+
+  // Derived outcome_reconciliation refresh (Phase 4.2E). Throttled to 10 min
+  // inside the function; runs on the VPS worker because the Vercel Hobby plan
+  // cannot express the sub-daily cron this used to rely on.
+  await refreshOutcomeReconciliation().catch(e =>
+    console.error('[recon-refresh] sweep hook failed:', e.message)
   )
 
   // Phase 2a: fast sync pre-filter — no I/O, builds candidate list

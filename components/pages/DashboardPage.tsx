@@ -7,6 +7,8 @@ import { Panel, LiveDot, StatCard, LoadingDots } from '../ui'
 import { authFetch } from '@/lib/api'
 import type { PriceData } from '@/hooks/useForex'
 import { currencySymbol, currencySigned } from '@/lib/currency'
+import { buildScopedAnalytics, scopedEquityCurve } from '@/lib/analytics-metrics.mjs'
+import { isGenuineExecution } from '@/lib/analytics-scope.mjs'
 
 
 const DIR_COLOR: Record<string, string> = { BUY: '#00ff87', SELL: '#ff3056' }
@@ -47,33 +49,52 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
   const [openPage, setOpenPage] = useState(0)
   const [closedPage, setClosedPage] = useState(0)
 
-  // Real stats from actual trade records
-  const today = new Date().toDateString()
-  const closedTrades = trades.filter((t: any) => t.result && t.result !== 'OPEN')
-  const openTrades = trades.filter((t: any) => t.result === 'OPEN')
-  const todayClosedTrades = closedTrades.filter((t: any) => t.closed_at && new Date(t.closed_at).toDateString() === today)
-  const todayPL = todayClosedTrades.reduce((s: number, t: any) => s + (t.pl_usd || 0), 0)
-  const wins = closedTrades.filter((t: any) => t.result === 'WIN').length
-  const winRate = closedTrades.length ? Math.round((wins / closedTrades.length) * 100) : 0
+  // Real stats from actual trade records — SCOPED (Phase 4.2C).
+  //
+  // The previous version was:
+  //   closedTrades = trades.filter(t => t.result && t.result !== 'OPEN')
+  //   todayPL      = closedTrades.reduce((s,t) => s + (t.pl_usd || 0), 0)
+  //   winRate      = wins / closedTrades.length
+  //
+  // Three things were wrong with that on real production data:
+  //   • `pl_usd || 0` turned an UNKNOWN result into zero, dragging every average;
+  //   • ticket-less simulation/model rows (1,143 of 1,284) were counted as trades;
+  //   • gross-only rows (commission/swap not proven) were reported as net.
+  // `buildScopedAnalytics` answers all three and gives us the excluded counts so
+  // the denominator can be shown instead of assumed.
+  const scoped = buildScopedAnalytics(trades as any[])
+  const scopeCounts = scoped.scope.counts
+  const netBasis = scoped.net.n > 0
+  const headline = netBasis ? scoped.net : scoped.gross
 
-  // Equity curve from actual closed trades (last 30)
+  const openTrades = trades.filter((t: any) => t.result === 'OPEN')
+  // Closed list for the table: genuine broker executions only.
+  const closedTrades = trades.filter((t: any) =>
+    isGenuineExecution(t as any) && t.result && t.result !== 'OPEN')
+
+  const today = new Date().toDateString()
+  const plKey = netBasis ? 'net_realised_pnl' : 'pl_usd'
+  const todayPL = trades
+    .filter((t: any) => isGenuineExecution(t as any) && t.closed_at
+      && new Date(t.closed_at).toDateString() === today
+      && Number.isFinite(Number(t[plKey])))
+    .reduce((s: number, t: any) => s + Number(t[plKey]), 0)
+
+  const winRate = headline.winRate === null ? null : Math.round(headline.winRate * 100)
+
+  // Equity curve from ONE population only. Mixing net-complete with gross-only
+  // produced a curve shape that never existed at the broker.
   const equityData = (() => {
     const initial = account?.balance || 0
-    if (!initial || closedTrades.length === 0) return []
-    const sorted = [...closedTrades].sort((a, b) => new Date(a.closed_at).getTime() - new Date(b.closed_at).getTime())
-    let bal = initial
-    // Subtract all closed P/L to get starting point
-    const totalPL = sorted.reduce((s: number, t: any) => s + (t.pl_usd || 0), 0)
-    bal = initial - totalPL
-    return sorted.map((t, i) => {
-      bal += t.pl_usd || 0
-      return {
-        day: new Date(t.closed_at).toLocaleDateString('en', { month: 'short', day: 'numeric' }),
-        balance: +bal.toFixed(2),
-        i,
-      }
-    })
+    if (!initial) return []
+    const curve = scopedEquityCurve(
+      trades as any[],
+      initial,
+      netBasis ? 'NET_CONFIRMED' : 'GROSS_ONLY',
+    )
+    return curve.points.slice(-30)
   })()
+
 
   async function handleClose(tradeId: string, pair: string, direction: string) {
     setClosingId(tradeId)
@@ -139,14 +160,39 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
         />
         <StatCard
           label="WIN RATE"
-          value={closedTrades.length ? `${winRate}%` : '—'}
-          color={winRate > 55 ? '#00ff87' : winRate > 0 ? '#ff6060' : '#607080'}
+          value={winRate === null ? '—' : `${winRate}%`}
+          color={winRate === null ? '#607080' : winRate > 55 ? '#00ff87' : winRate > 0 ? '#ff6060' : '#607080'}
         />
         <StatCard
           label="TOTAL TRADES"
           value={closedTrades.length || '—'}
           color="#607080"
         />
+      </div>
+
+      {/* Population disclosure (Phase 4.2C). Every headline figure above is
+          computed from ONE labelled population; this line names it and states
+          what was excluded, so "profit" can never silently mean gross. */}
+      <div style={{
+        fontSize: 10, color: 'var(--text-dim)', letterSpacing: 0.3,
+        padding: '6px 10px', border: '1px solid var(--border)', borderRadius: 4,
+        display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center',
+      }}>
+        <span style={{
+          fontWeight: 700,
+          color: netBasis ? '#00ff87' : '#ffb800',
+        }}>
+          {netBasis ? 'NET' : 'GROSS (provisional)'}
+        </span>
+        <span>{scoped.scope.disclosure}</span>
+        {!netBasis && scopeCounts.GROSS_ONLY > 0 && (
+          <span style={{ color: '#ffb800' }}>
+            commission/swap not confirmed by broker — figures above are NOT net
+          </span>
+        )}
+        {scopeCounts.SIMULATION > 0 && (
+          <span>· {scopeCounts.SIMULATION} ticket-less simulation rows excluded</span>
+        )}
       </div>
 
       {/* Live prices */}

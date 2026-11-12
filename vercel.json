@@ -8,7 +8,7 @@
     { "path": "/api/scalper/label", "schedule": "0 12 * * *" },
     { "path": "/api/scalper/label", "schedule": "0 18 * * *" },
     { "path": "/api/scalper/label", "schedule": "0 22 * * *" },
-    { "path": "/api/outcome-reconciliation/refresh", "schedule": "*/10 * * * *" },
-    { "path": "/api/prediction-measure", "schedule": "*/10 * * * *" }
+    { "path": "/api/outcome-reconciliation/refresh", "schedule": "0 4 * * *" },
+    { "path": "/api/prediction-measure", "schedule": "0 5 * * *" }
   ]
 }

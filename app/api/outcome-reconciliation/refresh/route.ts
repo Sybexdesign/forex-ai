@@ -24,29 +24,64 @@ let lastSuccessfulRefreshAt: string | null = null
 let lastRefreshError: { at: string, message: string } | null = null
 
 /**
- * Authorisation.
+ * Authorisation (Phase 4.2E).
  *
- * The previous check trusted the `x-vercel-cron` request header whenever
- * CRON_SECRET was absent — and that header is trivially forgeable by any caller.
- * Now:
- *   • if CRON_SECRET is configured, an exact match is REQUIRED (header ignored);
- *   • if it is NOT configured, production requests carrying the cron header are
- *     still allowed so the scheduled job keeps working, but the mode is reported
- *     as `header_only_INSECURE` so the weakness is visible, not silent.
+ * Three separate weaknesses existed and are all closed here:
+ *
+ *   1. The secret was read ONLY from the query string (`?secret=`). A query
+ *      string is written to access logs, proxy logs, browser history and every
+ *      Referer header, so a valid secret leaked itself. Headers are now the
+ *      supported transport and the query string is kept only as a fallback for
+ *      a deliberately hand-typed manual call.
+ *   2. When CRON_SECRET was absent in production the check fell back to trusting
+ *      the `x-vercel-cron` request header — which any caller can forge, so the
+ *      "authentication" was decorative. That fallback is GONE. Unconfigured in
+ *      production now denies, and says so.
+ *   3. Comparison was a plain `===`. It is now timing-safe.
+ *
+ * Modes are returned so /api/production-integrity can report the real state
+ * instead of a boolean that hides why a request was rejected.
  */
-function authorise(req: NextRequest): { ok: boolean, authMode: string } {
-  const secret = req.nextUrl.searchParams.get('secret')
+function timingSafeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'utf8')
+  const bb = Buffer.from(b, 'utf8')
+  if (ab.length !== bb.length) return false
+  let diff = 0
+  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i]
+  return diff === 0
+}
+
+function authorise(req: NextRequest): { ok: boolean, authMode: string, configured: boolean } {
   const configured = process.env.CRON_SECRET
-  if (configured) return { ok: secret === configured, authMode: 'cron_secret' }
-  if (process.env.NODE_ENV !== 'production') return { ok: true, authMode: 'development_open' }
-  const hasHeader = !!req.headers.get('x-vercel-cron')
-  return { ok: hasHeader, authMode: hasHeader ? 'header_only_INSECURE' : 'denied' }
+  const presented = req.headers.get('authorization')?.replace(/^Bearer\s+/i, '').trim()
+    || req.headers.get('x-cron-secret')?.trim()
+    || req.nextUrl.searchParams.get('secret')?.trim()
+    || ''
+
+  if (configured) {
+    const ok = presented.length > 0 && timingSafeEqual(presented, configured)
+    return { ok, authMode: 'cron_secret', configured: true }
+  }
+
+  // No secret configured. Never open in production — an unauthenticated endpoint
+  // that rewrites derived analytical rows is an open invitation.
+  if (process.env.NODE_ENV !== 'production') return { ok: true, authMode: 'development_open', configured: false }
+  return { ok: false, authMode: 'cron_secret_not_configured', configured: false }
 }
 
 export async function GET(req: NextRequest) {
   const auth = authorise(req)
   if (!auth.ok) {
-    return NextResponse.json({ refreshed: false, error: 'Unauthorized', authMode: auth.authMode }, { status: 401 })
+    // 503 (not 401) when the secret is simply absent: this is a deployment
+    // misconfiguration that an operator must fix, not a bad caller.
+    const status = auth.authMode === 'cron_secret_not_configured' ? 503 : 401
+    return NextResponse.json({
+      refreshed: false,
+      error: auth.authMode === 'cron_secret_not_configured'
+        ? 'CRON_SECRET is not configured; refusing to refresh unauthenticated'
+        : 'Unauthorized',
+      authMode: auth.authMode,
+    }, { status })
   }
   try {
     const windowDays = Math.max(1, Math.min(90, parseInt(req.nextUrl.searchParams.get('windowDays') || '2', 10) || 2))

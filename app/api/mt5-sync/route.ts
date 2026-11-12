@@ -1,6 +1,15 @@
 // app/api/mt5-sync/route.ts
 // Called by the MT5 Expert Advisor to push account data and receive pending orders.
 // Secured by per-user webhook token — no user auth required.
+//
+// ⚠ NOT ON THE LIVE PATH (Phase 4.2B). The shipping EA posts straight to the
+// Supabase RPC public.mt5_webhook_sync (see SYNC_URL in
+// public/SybexForexAI_EA_v9.4.mq5). This route is retained as the documented
+// fallback. If the EA is ever pointed here, the close-accounting rules in
+// lib/broker-deal-ingest.mjs MUST stay in step with
+// supabase/migrations/20261113_phase42_rpc_broker_deal_accounting.sql — the
+// tests for both live in tests/broker-deal-ingest.test.mjs and
+// tests/phase42-integrity-guards.test.mjs.
 
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
