@@ -650,6 +650,8 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
         signal_at:         signal.scannedAt,
         signal_confidence: signal.confidence,
         signal_id_ref:     signal.id?.toString(),
+        // Phase 4.1A — explicit authority lane (see lib/order-authority.mjs).
+        submission_source: 'UI_SCAN_APPROVE',
       }),
     })
     return res.json()
@@ -716,6 +718,8 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           signal_at:         new Date(sig.fetchedAt).toISOString(),
           signal_confidence: sig.confidence,
           signal_id_ref:     `scalp-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+          // Phase 4.1A — explicit authority lane (see lib/order-authority.mjs).
+          submission_source: 'UI_SCALP_CARD',
         }),
       }).then(r => r.json())
 
@@ -776,6 +780,8 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
           signal_at:         new Date(sig.fetchedAt).toISOString(),
           signal_confidence: sig.confidence,
           signal_id_ref:     `mirror-${sig.pair.replace('/', '')}-${sig.fetchedAt}`,
+          // Phase 4.1A — explicit authority lane (see lib/order-authority.mjs).
+          submission_source: 'UI_MIRROR_CARD',
         }),
       }).then(r => r.json())
 
@@ -831,6 +837,10 @@ export default function AutoTradePage({ strategy, onSaveStrategy, autoTrade, onS
       signal_at:            sig.prediction?.startsAt ?? new Date(sig.fetchedAt).toISOString(),
       signal_confidence:    sig.confidence,
       signal_id_ref:        signalRef,
+      // Phase 4.1A — explicit authority lane. The route can also infer this from
+      // the signal_id_ref prefix, but stating it here means a future change to
+      // the reference format cannot silently reclassify who submitted the order.
+      submission_source:    'UI_AUTO_TRADER',
     }
     if (isMirror) {
       body.mirrorSl = live.sl

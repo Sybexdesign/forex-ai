@@ -16,6 +16,9 @@ export interface LinkPoolRow {
   generated_at?: string
   resolved_at?: string | null
   result?: string | null
+  trade_status?: string | null
+  trade_result?: string | null
+  prediction_log_id?: string | null
   opened_at?: string
   closed_at?: string | null
   pl_usd?: number | null
@@ -39,7 +42,17 @@ export interface LinkedRecord {
   executionPnl: number | null
   [k: string]: unknown
 }
+export interface LinkAmbiguity {
+  setupKey: string
+  reason: 'MULTIPLE_CANDIDATE_EXECUTIONS' | 'MULTIPLE_LINEAGE_MATCHES'
+  candidates: string[]
+}
 export function linkRecords(
   pools: LinkPools,
   options?: Record<string, unknown>,
-): { records: LinkedRecord[]; ambiguousSkipped: Record<string, number>; linkedCounts: Record<string, number> }
+): {
+  records: LinkedRecord[]
+  ambiguousSkipped: Record<string, number>
+  linkedCounts: Record<string, number>
+  ambiguities: LinkAmbiguity[]
+}

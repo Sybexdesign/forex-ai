@@ -177,6 +177,8 @@ export default function AnalysisPage({
           aiConfidence: rec.confidence,
           checklistScore: passCount,
           userId,
+          // Phase 4.1A — explicit authority lane (see lib/order-authority.mjs).
+          submission_source: 'UI_ANALYSIS',
         }),
       })
       const data = await res.json()

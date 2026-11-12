@@ -542,6 +542,8 @@ export default function ScalperPage({ prices, account, strategy, onToast, userId
                 userId, newsInWindow: false,
                 aiConfidence: sig.confidence, checklistScore: 0,
                 currentPrice: tick.price,
+                // Phase 4.1A — explicit authority lane (see lib/order-authority.mjs).
+                submission_source: 'UI_SCALPER_PAGE',
               }),
             })
             if (order.success || order.tradeId) {

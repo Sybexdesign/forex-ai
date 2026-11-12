@@ -333,6 +333,8 @@ export default function ScalpPage({ prices, account, strategy, onToast, userId, 
           pair, direction: dir, strategy, currentPrice: price,
           newsInWindow: false, aiConfidence: confirmCount >= 3 ? 85 : 65,
           checklistScore: confirmCount + 3, userId, scalp: true, slPips,
+          // Phase 4.1A — explicit authority lane (see lib/order-authority.mjs).
+          submission_source: 'UI_SCALP_PAGE',
         }),
       })
       const data = await res.json()

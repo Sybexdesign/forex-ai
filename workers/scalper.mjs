@@ -1938,6 +1938,11 @@ async function placeOrder(pair, direction, signal, section = 'scalp') {
       signal_at:           signal?.prediction?.startsAt ?? nowIso,
       signal_confidence:   signal.confidence,
       signal_id_ref:       signalRef,
+      // Phase 4.1A — explicit authority lane. Until now the ONLY way to tell a
+      // worker order from a browser scalp-card order was the `worker-` prefix on
+      // signal_id_ref; that inference still works, but stating the lane makes the
+      // audit trail intentional rather than accidental.
+      submission_source:   'WORKER_AUTOTRADE',
     }),
   })
 }

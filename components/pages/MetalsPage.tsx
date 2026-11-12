@@ -139,6 +139,8 @@ export default function MetalsPage({ prices, strategy, news, account, onToast, u
           aiConfidence: rec.confidence,
           checklistScore: rec.checklist_passed,
           userId,
+          // Phase 4.1A — explicit authority lane (see lib/order-authority.mjs).
+          submission_source: 'UI_METALS',
         }),
       })
       const data = await res.json()

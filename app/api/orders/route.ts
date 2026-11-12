@@ -13,6 +13,7 @@ import { minStopPips } from '@/lib/trade-levels'
 import { planOrder } from '@/lib/order-planner.mjs'
 import { EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 import { evaluateExecutionGuards } from '@/lib/execution-guards.mjs'
+import { classifySubmission, deriveRequestId, evaluateOrderAuthority } from '@/lib/order-authority.mjs'
 
 import { alertOrderPlaced, alertOrderBlocked, alertOrderFailed, alertProfitTargetDisabled } from '@/lib/telegram'
 
@@ -53,6 +54,8 @@ export async function POST(req: NextRequest) {
       // Phase 4 lineage (optional): explicit prediction/setup references so
       // signal → prediction → execution does not rely on fuzzy timestamp matching.
       predictionLogId, setupId,
+      // Phase 4.1A authority (optional): explicit lane + idempotency key.
+      submission_source, request_id,
     } = body
 
     const authToken = req.headers.get('Authorization')?.replace('Bearer ', '') || undefined
@@ -64,6 +67,76 @@ export async function POST(req: NextRequest) {
         { success: false, blocked: true, reasons: ['No live broker connected — configure MT5 Direct or another broker before trading live'] },
         { status: 422 }
       )
+    }
+
+    // ─── Order authority (Phase 4.1A) ────────────────────────────────────────
+    // Classify the submission lane and record ONE auditable authorisation
+    // decision for every order, including rejected ones.
+    //
+    // WHY: on 2026-11-12 two XAU/USD SELLs reached the broker while the worker
+    // logged `auto-trade skipped-confidence`. `trades.source` was 'scalp' for
+    // BOTH the worker and the browser scalp card, so the row could not say who
+    // submitted it. Only `signal_id_ref` distinguished them
+    // (`worker-scalp-…` vs `scalp-…`). That distinction is now explicit,
+    // persisted, and paired with the authorisation outcome.
+    //
+    // ENFORCEMENT: audit-only by default. The decision is always written to the
+    // trade row; it only blocks the request when ORDER_AUTHORITY_ENFORCE=true.
+    // Turning enforcement on is a separate, reportable change because it can
+    // alter existing manual-trading behaviour (see BLOCKING_REASONS in
+    // lib/order-authority.mjs).
+    const effectiveSignalRef = (typeof signal_id_ref === 'string' && signal_id_ref)
+      || (typeof signalId === 'string' ? signalId : undefined)
+    const classifiedSubmission = classifySubmission({
+      submissionSource: submission_source, signalIdRef: effectiveSignalRef, signalId,
+    })
+    const resolvedRequestId = (typeof request_id === 'string' && request_id.trim())
+      || deriveRequestId({
+        submissionSource: classifiedSubmission.submissionSource,
+        userId, pair, direction, signalIdRef: effectiveSignalRef,
+        signalAtMs: signal_at ? new Date(signal_at).getTime() : null,
+      })
+
+    // Replay protection: has this exact submission already produced an order?
+    // Best-effort — the trades.request_id column arrives with the Phase 4.1
+    // migration, so a lookup error must never block a legitimate order.
+    let seenRequestIds: string[] = []
+    if (userId && resolvedRequestId) {
+      try {
+        const dup = await getAdminClient()
+          .from('trades').select('id').eq('user_id', userId)
+          .eq('request_id', resolvedRequestId).limit(1)
+        if (!dup.error && Array.isArray(dup.data) && dup.data.length > 0) {
+          seenRequestIds = [resolvedRequestId]
+        }
+      } catch { /* migration not applied yet — authority stays audit-only */ }
+    }
+
+    const authority = evaluateOrderAuthority({
+      submissionSource: classifiedSubmission.submissionSource,
+      signalIdRef: effectiveSignalRef,
+      signalId,
+      userId,
+      confidence: aiConfidence,
+      requestId: resolvedRequestId,
+      seenRequestIds,
+      // Neither the confidence threshold nor the trading window is re-derived
+      // here: both are owned by workers/scalper.mjs (confidence at line ~2225,
+      // window at line ~2386) and re-deriving them would risk changing an
+      // approved limit. Omitted ⇒ this layer records, it does not overrule.
+    })
+    if (authority.blocking && process.env.ORDER_AUTHORITY_ENFORCE === 'true') {
+      console.warn(`[orders] AUTHORITY REJECTED ${authority.reason} — ${pair} ${direction} lane=${authority.submissionSource}: ${authority.detail}`)
+      return NextResponse.json({
+        success: false, blocked: true,
+        reasons: [authority.detail],
+        code: 'ORDER_AUTHORITY_REJECTED',
+        authorityReason: authority.reason,
+        submissionSource: authority.submissionSource,
+      }, { status: 403 })
+    }
+    if (authority.decision !== 'APPROVED_MANUAL' && authority.decision !== 'APPROVED_AUTOMATED') {
+      console.warn(`[orders] authority audit (not enforced) ${authority.reason} — ${pair} ${direction} lane=${authority.submissionSource}`)
     }
 
     // Fetch real-time account data for risk checks
@@ -519,7 +592,24 @@ export async function POST(req: NextRequest) {
           return Number.isFinite(risk) && risk > 0 ? Math.round(risk * 100) / 100 : null
         })()
 
-        const { data: trade } = await admin.from('trades').insert({
+        // Phase 4.1A/4.1E audit + risk-provenance fields. These columns arrive
+        // with 20261112_phase41_order_authority_and_accounting.sql. If that
+        // migration has not been applied yet, the insert is retried WITHOUT them
+        // rather than lost — a live broker fill must never fail to reach the DB.
+        const executionAuditFields = {
+          submission_source:        authority.submissionSource,
+          submitted_by:             userId ?? null,
+          request_id:               resolvedRequestId,
+          authority_decision:       authority.decision,
+          authority_reason:         authority.reason,
+          authority_policy_version: authority.policyVersion,
+          submitted_at:             new Date().toISOString(),
+          // Requested levels preserved beside the actual fill so the MT5
+          // adapter's re-anchor delta stays auditable (Phase 4.1E).
+          requested_entry_price:    effectivePrice ?? null,
+        }
+
+        const baseTradeRow = {
           user_id: userId,
           oanda_trade_id: orderResult.tradeId,
           pair, direction,
@@ -546,7 +636,22 @@ export async function POST(req: NextRequest) {
           broker_ticket:             orderResult.tradeId ?? null,
           prediction_log_id:         predictionLogId ?? null,
           setup_id:                  setupId ?? null,
-        }).select().single()
+        }
+
+        let trade: any = null
+        const firstInsert = await admin.from('trades')
+          .insert({ ...baseTradeRow, ...executionAuditFields }).select().single()
+        if (firstInsert.error) {
+          const msg = firstInsert.error.message || ''
+          const missingAuditColumn = /could not find the '.*' column|column .* does not exist/i.test(msg)
+          if (!missingAuditColumn) throw firstInsert.error
+          console.warn(`[orders] Phase 4.1 audit columns absent — retrying insert without them: ${msg}`)
+          const retry = await admin.from('trades').insert(baseTradeRow).select().single()
+          if (retry.error) throw retry.error
+          trade = retry.data
+        } else {
+          trade = firstInsert.data
+        }
 
         // Only attempt the signals-table update when signalId is a real UUID — the
         // browser scalp/mirror paths use synthetic strings (e.g. mirror-XAUUSD-…) which
