@@ -103,6 +103,8 @@ const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8')
   assert.match(sql, /executionPayloadVersion/, 'E: reads the payload version')
   assert.match(sql, /grossProfit/, 'E: prefers explicit gross')
   assert.match(sql, /v_cp_commission/, 'E: parses commission')
+
+
   assert.match(sql, /v_cp_swap/, 'E: parses swap')
   assert.match(sql, /v_payload_version >= 2/, 'E: components are gated on the v2 contract')
   assert.match(sql, /commission = v_cp_commission/, 'E: writes commission')
@@ -115,6 +117,39 @@ const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8')
   // It must NOT invent a net figure when costs are absent.
   assert.match(sql, /ELSE NULL/, 'E: net is NULL when a cost term is missing')
   console.log('PASS E: Phase 4.2 RPC migration is additive, idempotent and non-destructive')
+}
+// ── F — every P&L surface uses the scoped populations ──────────────────────
+{
+  // Phase 4.2D. The Dashboard and the Journal must not disagree about the same
+  // account. Both previously filtered only on `result !== 'OPEN'` and then
+  // summed `pl_usd || 0`, which counted 1,143 ticket-less simulation rows as
+  // trades and averaged unknown results in as breakevens.
+  const journal = read('components/pages/JournalPage.tsx')
+  // Assertions must ignore prose: the comments above explain the old defect by
+  // quoting it, so a naive text match would flag the documentation itself.
+  const code = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const journalCode = code(journal)
+  assert.match(journalCode, /buildJournalStats/, 'F: Journal statistics come from the scoped helper')
+  assert.ok(!/pl_usd \|\| 0/.test(journalCode), 'F: Journal has no pl_usd||0 coercion')
+  assert.ok(!/result && t\.result !== 'OPEN'/.test(journalCode), 'F: Journal no longer defines closedTrades locally')
+  assert.match(journalCode, /realisedValue/, 'F: per-row money uses the net-preferred value')
+
+  const dashCode = code(read('components/pages/DashboardPage.tsx'))
+  assert.match(read('components/pages/DashboardPage.tsx'), /buildScopedAnalytics/, 'F: Dashboard uses the scoped analytics')
+  assert.ok(!/pl_usd \|\| 0/.test(dashCode), 'F: Dashboard has no pl_usd||0 coercion')
+
+  // The order-gating path is deliberately NOT routed through the analytics
+  // helper. Changing when the bot may trade is a separate decision that needs
+  // its own approval, so this guard documents the boundary instead of silently
+  // tightening it. If someone does route it through, they must update the
+  // integrity checks at the same time.
+  const shell = read('components/AppShell.tsx')
+  assert.match(shell, /todayPL/, 'F: AppShell still publishes todayPL to the scanner')
+  assert.ok(
+    !/buildJournalStats|buildScopedAnalytics/.test(shell),
+    'F: order-gating todayPL is unchanged — routing it through the analytics helper changes live trading and needs approval',
+  )
+  console.log('PASS F: P&L surfaces share one classifier; order-gating path untouched by design')
 }
 
 console.log('\nphase42-integrity-guards: all groups passed')

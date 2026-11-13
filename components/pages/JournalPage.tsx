@@ -9,6 +9,7 @@ import {
 import { Panel, StatCard, DirectionBadge } from '../ui'
 import { authFetch } from '@/lib/api'
 import { currencySymbol } from '@/lib/currency'
+import { buildJournalStats, realisedValue } from '@/lib/journal-stats.mjs'
 
 
 interface JournalPageProps { trades: any[]; userId?: string; onTradeAdded?: () => void; account?: any }
@@ -26,15 +27,32 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
 
   // ─── Stats ───────────────────────────────────────────────────────────────
 
-  const closedTrades = trades.filter(t => t.result && t.result !== 'OPEN')
-  const wins = closedTrades.filter(t => t.result === 'WIN')
-  const losses = closedTrades.filter(t => t.result === 'LOSS')
-  const winRate = closedTrades.length ? (wins.length / closedTrades.length * 100).toFixed(1) : '0'
-  const grossProfit = wins.reduce((s: number, t: any) => s + Math.max(0, t.pl_usd || 0), 0)
-  const grossLoss = Math.abs(losses.reduce((s: number, t: any) => s + Math.min(0, t.pl_usd || 0), 0))
-  const profitFactor = grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : '∞'
-  const avgWinPips = wins.length ? (wins.reduce((s: number, t: any) => s + (t.pips || 0), 0) / wins.length).toFixed(1) : '0'
-  const avgLossPips = losses.length ? (Math.abs(losses.reduce((s: number, t: any) => s + (t.pips || 0), 0)) / losses.length).toFixed(1) : '0'
+  // Phase 4.2D — every figure below comes from ONE scoped population
+  // (lib/journal-stats.mjs), the same classifier the Dashboard uses. The old
+  // code here filtered only on `result !== 'OPEN'` and then summed
+  // `pl_usd || 0`, which counted ticket-less simulation rows as trades and
+  // averaged unknown results in as breakevens — so this page and the Dashboard
+  // reported different P&L for the same account.
+  const startingBalance = account?.balance ?? 10000
+  const j = useMemo(
+    () => buildJournalStats(trades, { startingBalance }),
+    [trades, startingBalance],
+  )
+
+  // Broker executions only — simulation, cancelled and open rows are excluded
+  // and disclosed rather than silently dropped.
+  const closedTrades: any[] = j.genuineRows
+  const winRate = j.winRate
+  const profitFactor = j.profitFactor
+  const avgWinPips = j.avgWinPips
+  const avgLossPips = j.avgLossPips
+
+  // Display strings: an undefined statistic reads as '—', never as 0 or ∞.
+  const winRateText = winRate === null ? '—' : `${winRate.toFixed(1)}%`
+  const pfText = profitFactor === null ? '—' : profitFactor.toFixed(2)
+  const avgWinPipsText = avgWinPips === null ? '—' : `+${avgWinPips.toFixed(1)}p`
+  const avgLossPipsText = avgLossPips === null ? '—' : `-${avgLossPips.toFixed(1)}p`
+  const basisLabel = j.basis === 'NET' ? 'NET' : 'GROSS (provisional)'
 
   // Rules-followed analysis
   const rulesFollowed = closedTrades.filter(t => t.rules_followed)
@@ -46,20 +64,10 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
     ? (rulesBroken.filter(t => t.result === 'WIN').length / rulesBroken.length * 100).toFixed(0)
     : '0'
 
-  // Pair stats
-  const pairStats = useMemo(() => {
-    const map: Record<string, { wins: number; losses: number; pl: number }> = {}
-    closedTrades.forEach((t: any) => {
-      if (!map[t.pair]) map[t.pair] = { wins: 0, losses: 0, pl: 0 }
-      if (t.result === 'WIN') map[t.pair].wins++
-      if (t.result === 'LOSS') map[t.pair].losses++
-      map[t.pair].pl += t.pl_usd || 0
-    })
-    return Object.entries(map).map(([pair, s]) => ({ pair: pair.replace('/', ''), ...s }))
-  }, [closedTrades])
-
-  const bestPair = pairStats.sort((a, b) => b.pl - a.pl)[0]?.pair || '—'
-  const worstPair = [...pairStats].sort((a, b) => a.pl - b.pl)[0]?.pair || '—'
+  // Pair stats — already scoped, valued and sorted by realised P&L in the helper.
+  const pairStats = j.pairStats
+  const bestPair = j.bestPair ?? '—'
+  const worstPair = j.worstPair ?? '—'
 
   // Win/loss by day of week
   const dayStats = useMemo(() => {
@@ -76,27 +84,11 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
     return days.map(d => ({ day: d, ...map[d] }))
   }, [closedTrades])
 
-  // Equity curve
-  const equityCurve = useMemo(() => {
-    const totalPL = closedTrades.reduce((s: number, t: any) => s + (t.pl_usd || 0), 0)
-    let bal = (account?.balance ?? 10000) - totalPL
-    return [...closedTrades]
-      .sort((a, b) => new Date(a.opened_at || 0).getTime() - new Date(b.opened_at || 0).getTime())
-      .map((t: any, i) => {
-        bal += t.pl_usd || 0
-        return { trade: i + 1, balance: +bal.toFixed(2), pl: t.pl_usd }
-      })
-  }, [closedTrades])
+  // Equity curve — genuine executions only, anchored to the account balance.
+  const equityCurve = j.equityCurve
 
-  // Consecutive streaks
-  const streaks = useMemo(() => {
-    let maxWin = 0, maxLoss = 0, curWin = 0, curLoss = 0
-    closedTrades.forEach((t: any) => {
-      if (t.result === 'WIN') { curWin++; curLoss = 0; maxWin = Math.max(maxWin, curWin) }
-      else { curLoss++; curWin = 0; maxLoss = Math.max(maxLoss, curLoss) }
-    })
-    return { maxWin, maxLoss }
-  }, [closedTrades])
+  // Consecutive streaks — money sign, consistent with the win rate above.
+  const streaks = j.streaks
 
   // Filtered trades for table
   const availablePairs = ['ALL', ...Array.from(new Set(trades.map((t: any) => t.pair)))]
@@ -108,7 +100,7 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
   function exportCSV() {
     const headers = 'ID,Date,Pair,Direction,Entry,Exit,Pips,P/L($),Result,Rules,AI Confidence,Notes\n'
     const rows = trades.map((t: any) =>
-      `${t.id},${new Date(t.opened_at || '').toLocaleDateString()},${t.pair},${t.direction},${t.entry_price || t.entry},${t.exit_price || t.exit || ''},${t.pips || ''},${t.pl_usd || ''},${t.result || ''},${t.rules_followed ? 'YES' : 'NO'},${t.ai_confidence || ''},"${t.notes || ''}"`
+      `${t.id},${new Date(t.opened_at || '').toLocaleDateString()},${t.pair},${t.direction},${t.entry_price || t.entry},${t.exit_price || t.exit || ''},${t.pips ?? ''},${t.pl_usd ?? ''},${t.result || ''},${t.rules_followed ? 'YES' : 'NO'},${t.ai_confidence || ''},"${t.notes || ''}"`
     ).join('\n')
     const blob = new Blob([headers + rows], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
@@ -122,15 +114,38 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
 
       {/* Stats grid */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 10 }}>
-        <StatCard label="TOTAL TRADES"   value={closedTrades.length}                color="#60c0ff" />
-        <StatCard label="WIN RATE"        value={`${winRate}%`}                      color={+winRate > 55 ? '#00ff87' : '#ff6060'} />
-        <StatCard label="PROFIT FACTOR"  value={profitFactor}                        color={+profitFactor > 1.5 ? '#00ff87' : '#ffb800'} />
-        <StatCard label="AVG WIN PIPS"   value={`+${avgWinPips}p`}                  color="#00ff87" />
-        <StatCard label="AVG LOSS PIPS"  value={`-${avgLossPips}p`}                 color="#ff6060" />
+        <StatCard label="EXECUTIONS"      value={j.n}                                 color="#60c0ff" />
+        <StatCard label={`WIN RATE (${j.basis})`} value={winRateText}                 color={(winRate ?? 0) > 55 ? '#00ff87' : '#ff6060'} />
+        <StatCard label="PROFIT FACTOR"  value={pfText}                              color={(profitFactor ?? 0) > 1.5 ? '#00ff87' : '#ffb800'} />
+        <StatCard label="AVG WIN PIPS"   value={avgWinPipsText}                      color="#00ff87" />
+        <StatCard label="AVG LOSS PIPS"  value={avgLossPipsText}                     color="#ff6060" />
         <StatCard label="BEST PAIR"      value={bestPair}                            color="#00ff87" />
         <StatCard label="WORST PAIR"     value={worstPair}                           color="#ff6060" />
         <StatCard label="WIN STREAK"     value={`${streaks.maxWin}×`}               color="#00ff87" />
         <StatCard label="LOSS STREAK"    value={`${streaks.maxLoss}×`}              color="#ff6060" />
+      </div>
+
+      {/* Population disclosure — states the basis and what was excluded, so a
+          reader can never mistake provisional gross for confirmed net. */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+        padding: '9px 12px', borderRadius: 3,
+        background: j.basis === 'NET' ? 'rgba(0,255,135,0.06)' : 'rgba(255,184,0,0.07)',
+        border: `1px solid ${j.basis === 'NET' ? 'rgba(0,255,135,0.2)' : 'rgba(255,184,0,0.22)'}`,
+      }}>
+        <span className="mono" style={{
+          fontSize: 10, fontWeight: 700, letterSpacing: 0.5, padding: '2px 6px', borderRadius: 2,
+          color: j.basis === 'NET' ? '#00ff87' : '#ffb800',
+          border: `1px solid ${j.basis === 'NET' ? 'rgba(0,255,135,0.35)' : 'rgba(255,184,0,0.35)'}`,
+        }}>
+          {basisLabel}
+        </span>
+        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{j.disclosure}</span>
+        {j.basis !== 'NET' && (
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            — broker commission/swap not yet confirmed, so these figures exclude trading costs.
+          </span>
+        )}
       </div>
 
       {/* Rules insight */}
@@ -187,7 +202,7 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
       {/* Charts */}
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: 12 }}>
         {/* Equity curve */}
-        <Panel title="EQUITY CURVE (ALL TRADES)">
+        <Panel title={`EQUITY CURVE — ${j.equityBasis === 'NET' ? 'NET' : 'GROSS PROVISIONAL'}`}>
           <div style={{ padding: '8px 4px 12px' }}>
             <ResponsiveContainer width="100%" height={160}>
               <LineChart data={equityCurve} margin={{ top: 4, right: 16, left: 0, bottom: 0 }}>
@@ -275,7 +290,7 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
             <thead>
               <tr>
                 <th>#</th><th>DATE</th><th>PAIR</th><th>DIR</th>
-                <th>ENTRY</th><th>EXIT</th><th>PIPS</th><th>P/L $</th>
+                <th>ENTRY</th><th>EXIT</th><th>PIPS</th><th>P/L $ (*=open)</th>
                 <th>RESULT</th><th>RULES</th><th>AI%</th><th>NOTES</th>
               </tr>
             </thead>
@@ -288,7 +303,13 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
                 </tr>
               )}
               {filteredTrades.map((t: any, i) => {
-                const plPos = (t.pl_usd || 0) >= 0
+                // Per-row money is the realised value: net when the broker
+                // confirmed the cost breakdown, else gross. A row with no value
+                // reads '—', not 0.00. Open rows are marked '*' because their
+                // P&L is still floating, not realised.
+                const pl = realisedValue(t)
+                const plPos = (pl ?? 0) >= 0
+                const plOpen = String(t.trade_result || t.result || '').toUpperCase() === 'OPEN'
                 const pipsPos = (t.pips || 0) >= 0
                 return (
                   <tr key={t.id || i}>
@@ -307,8 +328,8 @@ export default function JournalPage({ trades, userId, onTradeAdded, account }: J
                     <td className="mono" style={{ color: pipsPos ? '#00ff87' : '#ff6060' }}>
                       {pipsPos ? '+' : ''}{t.pips?.toFixed(1) || '—'}
                     </td>
-                    <td className="mono" style={{ color: plPos ? '#00ff87' : '#ff6060', fontWeight: 700 }}>
-                      {plPos ? '+' : ''}{currencySymbol(account?.currency)}{(t.pl_usd || 0).toFixed(2)}
+                    <td className="mono" style={{ color: pl === null ? 'var(--text-muted)' : plPos ? '#00ff87' : '#ff6060', fontWeight: 700 }}>
+                      {pl === null ? '—' : `${plPos ? '+' : ''}${currencySymbol(account?.currency)}${pl.toFixed(2)}${plOpen ? '*' : ''}`}
                     </td>
 
                     <td>
