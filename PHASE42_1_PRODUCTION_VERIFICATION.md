@@ -8,6 +8,11 @@ empty result for a green tick.
 **Rule for the whole document:** copy the raw output. A summary that cannot be re-derived from pasted
 evidence is an opinion, and this phase exists because opinions were accepted as evidence.
 
+**Code under test:** commit `b7ee215` (`fix(accounting): fail closed on unknown P&L, scope risk rows to real
+broker executions`), 34 files, on top of baseline `6c89bfe`. Every result recorded here is evidence about
+*that* tree and no other — if a later commit is deployed instead, update this line, because evidence that does
+not name a commit silently becomes evidence about nothing.
+
 ---
 
 ## 1. Is the deployed RPC the Phase 4.2 body? (the md5(prosrc) probe)
@@ -83,9 +88,16 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
   "https://<deployment>/api/outcome-reconciliation/refresh?windowDays=2"
 ```
 
-| Response | Meaning |
-|---|---|
-| `200` | secret matches; the scheduler can authenticate |
+| Response | Meaning | What it tells you |
+|---|---|---|
+| `200` | secret matches; the scheduler can authenticate | §1 is done for this runtime — but only for *this* runtime; the VPS worker's env is still unproven until 2a shows `age` < 15 min |
+| `401` | `CRON_SECRET` **is** set in this runtime, and the value presented did not match | The secret exists but the worker holds a different value. Do not conclude "C-2 fixed": fix the worker's copy (`PHASE42_1_OWNER_ACTIONS.md` §1) |
+| `503` | `CRON_SECRET` is **not** set in this runtime — the endpoint refuses unauthenticated production requests | The deployment half of C-2 is still open. Code is correct and failing closed; the configuration is missing |
+| `404` / HTML | wrong URL, or the deployment does not contain this commit | Stop: nothing else in this section is measurable |
+
+The status codes come from `lib/cron-auth.mjs` (`cronRejectionStatus`): `503` for an unconfigured
+runtime, `401` for a caller that presented the wrong value. There is no code path that allows an
+unauthenticated production refresh, and `x-vercel-cron` is no longer trusted.
 
 ---
 

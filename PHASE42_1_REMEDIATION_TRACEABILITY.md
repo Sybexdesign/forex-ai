@@ -2,6 +2,9 @@
 
 **Phase:** 4.2.1 (consolidated remediation)
 **Baseline HEAD:** `6c89bfe` (`HEAD` == `origin/main` at time of writing)
+
+**Remediation commit:** `b7ee215` — the tree this document's patches were verified against and the commit
+`PHASE42_1_PRODUCTION_VERIFICATION.md` names as "code under test".
 **Source documents:**
 - Report A — `SYBEX_FOREX_AI_FULL_PRODUCTION_AUDIT.md` (Sections 0–M; 16 defects in §K; 10 ordered steps in §L)
 - Report B — `SYBEX_FOREX_AI_PHASE42_VERIFICATION.md` (patches P-A…P-J; findings D1–D8, H-A, H-B)
