@@ -6,6 +6,7 @@ import { Panel, LoadingDots } from '../ui'
 import { BROKER_INFO, type BrokerKey } from '@/lib/brokers/index'
 import { authFetch } from '@/lib/api'
 import { diagnoseBrokerConnection, ACCOUNT_VERDICT, type AccountVerdict } from '@/lib/mt5-account-verdict.mjs'
+import { EA_BUILD, BUILD_STATUS, describeEaBuild, extractReportedBuild } from '@/lib/ea-version.mjs'
 
 interface BrokerConfig {
   id: string
@@ -244,6 +245,35 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
         </div>
       </Panel>
 
+      {/* Broker-deal accounting — which build the terminal reports vs the build
+          the accounting requires. Only meaningful for the MT5/Exness bridge, so
+          other brokers never see a spurious "outdated EA" warning. */}
+      {activeConfig && (activeConfig.broker_type === 'mt5direct' || activeConfig.broker_type === 'exness') && (() => {
+        const reported = extractReportedBuild((activeConfig.config as any)?.openPositions)
+        const verdict = describeEaBuild(reported)
+        const colour = verdict.status === BUILD_STATUS.CURRENT ? '#00ff87'
+                     : verdict.status === BUILD_STATUS.UNKNOWN ? '#ffb800' : '#ff6060'
+        return (
+          <Panel title="BROKER-DEAL ACCOUNTING — EA BUILD">
+            <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', fontFamily: 'JetBrains Mono', fontSize: 11 }}>
+                <span style={{ color: 'var(--text-muted)' }}>REQUIRED <span style={{ color: '#00e5b4' }}>{EA_BUILD.label}</span></span>
+                <span style={{ color: 'var(--text-muted)' }}>REPORTED <span style={{ color: colour }}>{verdict.reported || 'not reported'}</span></span>
+                <span style={{ color: 'var(--text-muted)' }}>PAYLOAD <span style={{ color: '#60c0ff' }}>{reported?.payloadVersion ?? '—'}</span></span>
+              </div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: colour }}>{verdict.headline}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6 }}>{verdict.detail}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.7 }}>
+                {EA_BUILD.label} writes each close with <strong>separate signed commission, swap and fee</strong>, the
+                <strong> broker ticket</strong> on the closed position, and <code>provenance</code> = <code>ea_observed</code> | <code>ea_recovered</code>.
+                Until it is attached, closes stay <strong>gross</strong> with RESULT PENDING in Recent Trades, and TODAY P/L counts only
+                net-complete rows — no cost is ever assumed to be zero.
+              </div>
+            </div>
+          </Panel>
+        )
+      })()}
+
       {/* Saved configs */}
       {configs.length > 0 && (
         <Panel title="YOUR BROKER CONFIGS">
@@ -254,6 +284,11 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
               const lastSync = (cfg.config as any)?.updatedAt
               const minutesAgo = lastSync ? Math.floor((Date.now() - new Date(lastSync).getTime()) / 60000) : null
               const eaOnline = minutesAgo !== null && minutesAgo < 5
+              // Which build the terminal says it is running. Taken from the
+              // stamp v9.5 writes into every position entry and the sync RPC
+              // persists; an absent stamp stays UNKNOWN rather than being
+              // reported as "up to date".
+              const eaBuild = describeEaBuild(isMt5 ? extractReportedBuild((cfg.config as any)?.openPositions) : null)
               return (
               <div key={cfg.id} style={{
                 display: 'flex', alignItems: 'center', gap: 12,
@@ -268,6 +303,20 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                     <div style={{ marginTop: 4, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                       <span style={{ fontSize: 10, color: eaOnline ? '#00ff87' : minutesAgo === null ? '#607080' : '#ff6060' }}>
                         {eaOnline ? '● EA online' : minutesAgo === null ? '○ EA never synced' : `○ EA last seen ${minutesAgo}m ago`}
+                      </span>
+                      <span
+                        title={eaBuild.detail}
+                        style={{
+                          fontSize: 10, fontFamily: 'JetBrains Mono',
+                          color: eaBuild.status === BUILD_STATUS.CURRENT ? '#00ff87'
+                               : eaBuild.status === BUILD_STATUS.OUTDATED ? '#ff6060' : '#ffb800',
+                        }}
+                      >
+                        {eaBuild.status === BUILD_STATUS.CURRENT
+                          ? `⚙ EA ${eaBuild.reported}`
+                          : eaBuild.status === BUILD_STATUS.OUTDATED
+                            ? `⚙ EA ${eaBuild.reported} — ${eaBuild.required} required, closes gross-only`
+                            : '⚙ EA build not reported — gross-only'}
                       </span>
                       {(cfg.config as any)?.login && (
                         <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'JetBrains Mono' }}>
@@ -360,11 +409,12 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                 <div style={{ marginBottom: 14 }}>
                   {/* Setup instructions */}
                   <div style={{ padding: '12px 14px', background: 'rgba(0,255,135,0.04)', border: '1px solid rgba(0,255,135,0.2)', borderRadius: 3, fontSize: 12, color: '#80d0a0', marginBottom: 12 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 8, color: '#00ff87' }}>EA v9.3.1 setup — native ticket propagation + MFE/MAE tracking + closed position recording + fast order polling (2s), direct Supabase sync:</div>
-                    <div style={{ marginBottom: 5 }}>1. Save this broker config, then download <strong>SybexForexAI_EA_v9.3.1.mq5</strong> below</div>
+                    <div style={{ fontWeight: 700, marginBottom: 8, color: '#00ff87' }}>EA {EA_BUILD.label} setup — broker-deal accounting (separate commission, swap and fee), ticket-stamped closes, offline close recovery, native ticket propagation, MFE/MAE tracking, fast order polling (2s), direct Supabase sync:</div>
+                    <div style={{ marginBottom: 5 }}>1. Save this broker config, then download <strong>{EA_BUILD.fileName}</strong> below</div>
                     <div style={{ marginBottom: 5 }}>2. In MT5: <strong>Tools → Options → Expert Advisors → Allow WebRequest</strong> → add the Supabase URL below</div>
-                    <div style={{ marginBottom: 5 }}>3. Compile the EA in MetaEditor (F7) and attach to your chart. The Experts tab must show <strong>&quot;SybexForexAI EA v9.3.1 started&quot;</strong> — if it shows v9.3 you are running a stale compile.</div>
-                    <div>4. In EA Inputs, paste your <strong>Webhook Token</strong> — copy it below</div>
+                    <div style={{ marginBottom: 5 }}>3. Compile the EA in MetaEditor (F7) and attach to your chart. The Experts tab must show <strong>&quot;{EA_BUILD.expertsLogLine}&quot;</strong> — if it prints an older build you are running a stale compile.</div>
+                    <div style={{ marginBottom: 5 }}>4. In EA Inputs, paste your <strong>Webhook Token</strong> — copy it below</div>
+                    <div>{EA_BUILD.label} is <strong>required</strong>: older builds report one folded profit number and no ticket on a closed position, so those closes can only be shown as <strong>gross</strong> (RESULT PENDING) in Recent Trades.</div>
                   </div>
 
                   {/* Supabase URL to add to MT5 allowed list */}
@@ -378,7 +428,7 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                   </div>
 
                   {/* Webhook token */}
-                  <label style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, display: 'block', marginBottom: 6 }}>WEBHOOK TOKEN (paste into EA v9.3.1 Inputs → WebhookToken)</label>
+                  <label style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1, display: 'block', marginBottom: 6 }}>WEBHOOK TOKEN (paste into EA {EA_BUILD.label} Inputs → WebhookToken)</label>
                   <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
                     <input readOnly value={token} style={{ ...inputSt, flex: 1, fontSize: 13, color: '#00e5b4', letterSpacing: 1, fontFamily: 'monospace' }} />
                     <button
@@ -387,10 +437,10 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                     >Copy</button>
                   </div>
 
-                  {/* Download EA v9.3.1 */}
+                  {/* Download the current EA build */}
                   <a
-                    href="/SybexForexAI_EA_v9.3.1.mq5"
-                    download="SybexForexAI_EA_v9.3.1.mq5"
+                    href={EA_BUILD.downloadPath}
+                    download={EA_BUILD.fileName}
                     style={{
                       display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
                       background: 'rgba(0,229,180,0.12)', color: '#00e5b4',
@@ -399,10 +449,10 @@ export default function BrokerPage({ onToast, onBrokerSaved }: { onToast?: (msg:
                       textDecoration: 'none', letterSpacing: 0.3, width: '100%', boxSizing: 'border-box',
                     }}
                   >
-                    ↓ Download SybexForexAI_EA_v9.3.1.mq5
+                    ↓ Download {EA_BUILD.fileName}
                   </a>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
-                    v9.3.1 — native MT5 position-ticket propagation (deterministic scalp attribution) plus MFE/MAE excursion tracking, closed position recording, and the per-symbol price-skip log (Experts tab shows which symbols were dropped from the price push and why). Peak and trough profit captured per trade for SL-distance optimisation.
+                    {EA_BUILD.label} — writes commission, swap and fee as separate signed terms with execution payload v{EA_BUILD.executionPayloadVersion}, stamps every position entry with the running build (<code>eaVersion {EA_BUILD.buildStamp}</code>) and labels each close as <code>ea_observed</code> or <code>ea_recovered</code>, so a rebuilt close is never mistaken for a witnessed one; recovers closes missed while the terminal was down from a persisted watermark. Carries forward native ticket propagation, MFE/MAE excursion tracking and the per-symbol price-skip log.
                   </div>
                 </div>
               )

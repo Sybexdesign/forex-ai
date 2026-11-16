@@ -175,6 +175,7 @@ select percentile_cont(0.5) within group (order by extract(epoch from (closed_at
 | `closedAt` (broker close time) | v9.5, as broker-server local time with **no zone** |
 | Compile / install / deploy | **NOT DONE** — owner action |
 | Which EA is live in production | **Not verifiable from this repository** |
+| Broker Connection page advertises | **v9.5** — from `lib/ea-version.mjs`, not hand-written JSX (see §13) |
 
 Consequence: until v9.5 is deployed, the prepared patch can only take its
 price-proximity fallback and can never populate a close time. That is stated in the
@@ -381,4 +382,74 @@ worker (needs the worker redeploy), EA v9.5, and any net-P&L proof on a genuine 
 | 5. Worker log + `worker_logs` | ⬜ owner (VPS) |
 | 6. Genuine close after patch | ⬜ blocked (§8 items 1–4) |
 | 7. `test:phase42` regression | ✅ exit 0 on this commit |
+
+
+---
+
+## 13. Broker Connection page now reflects EA v9.5 — 2026-11-17
+
+### 13.1 The defect
+
+The page hard-coded one EA version in five places (setup step 1, setup step 3, the
+webhook-token label, the download button and its description). That version was
+**v9.3.1**, which is:
+
+- two payload generations behind the server (`executionPayloadVersion: 2` lands in v9.4);
+- unable to report commission and swap separately, so every close it produces is
+  gross-only by contract (`lib/broker-deal-ingest.mjs`);
+- unable to put a `ticket` on a closed position, which is what R-1/R-2/R-3 need.
+
+An operator following the page was therefore being told, by the product itself, to
+install a build that cannot produce the accounting the product displays. §6 already
+records that v9.5 is required; the UI did not.
+
+### 13.2 What changed
+
+| File | Change |
+|---|---|
+| `lib/ea-version.mjs` (new) | Single source of truth: `EA_BUILD` (version, `9.50` stamp, file name, download path, Experts-tab line, payload version), `parseEaBuild`, `extractReportedBuild`, `describeEaBuild` |
+| `lib/ea-version.d.mts` (new) | Type surface for the above |
+| `components/pages/BrokerPage.tsx` | All four hard-coded strings now derive from `EA_BUILD`; download link points at the shipped v9.5 file; new **BROKER-DEAL ACCOUNTING — EA BUILD** panel; per-config build chip |
+| `tests/ea-version.test.mjs` (new) | 6 groups, 58 assertions |
+| `package.json` | `test:ea-version`, added to `test:phase42` |
+
+### 13.3 Where the "reported build" comes from (and its limit)
+
+Not from a probe and not from a guess. v9.5 stamps `eaVersion` + `executionPayloadVersion`
+into **every position entry** (A-7), and the sync RPC persists those entries into
+`broker_configs.config.openPositions` ("Write back", migration `20261113`). The page reads
+that array through the `/api/broker-config` payload it already loads — no new endpoint and
+no new column.
+
+The limit is stated on the page rather than hidden: a stale array written before the
+upgrade carries no stamp, so the verdict is **UNKNOWN** — never "current". Three states:
+
+| Reported | Verdict | What the operator is told |
+|---|---|---|
+| `9.50` (or newer) | `CURRENT` | ticket + separate cost terms are being reported |
+| `9.40` / `9.3.1` | `OUTDATED` | closes stay gross-only until v9.5 is attached |
+| absent | `UNKNOWN` | why it cannot be proven, and to check the Experts tab |
+
+Note that v9.4 *does* send `eaVersion: "9.40"` at the payload root, but the RPC's
+fixed-key write-back drops unknown top-level fields, so that copy never survives. Only the
+per-entry stamp does — which is exactly why the page reads `openPositions` and not the root.
+
+### 13.4 Verification
+
+| Check | Result |
+|---|---|
+| `node tests/ea-version.test.mjs` | ✅ 6 groups passed |
+| `npm run test:phase42` | ✅ exit 0 (41 ok lines) |
+| `npx tsc --noEmit` | ✅ 0 errors (excluding stale `.next/types/* 2.ts` duplicates from a prior build) |
+| `npm run build` | ✅ exit 0 |
+| `public/SybexForexAI_EA_v9.5.mq5` exists | ✅ asserted by the test, so the link cannot 404 |
+| Page contains v9.3.1 anywhere | ✅ no (`grep` + test) |
+
+### 13.5 What this does NOT claim
+
+The page states which build the product **requires** and which build the terminal
+**last reported**. It does not prove v9.5 is compiled, attached or running — that remains
+owner action §8, and the verdict stays `UNKNOWN` until a stamped position entry arrives.
+The Recent Trades verdict is unchanged: **PARTIALLY IMPLEMENTED — OWNER ACTIONS REQUIRED**
+until the genuine-close evidence of §12.6 step 6 exists.
 
