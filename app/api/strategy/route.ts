@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient, DEFAULT_STRATEGY } from '@/lib/supabase'
 import { normaliseSizingSettings } from '@/lib/strategy-validation.mjs'
+import { validateSessionSettings } from '@/lib/trading-session.mjs'
 
 // Default auto-trade gate — safe-off so the worker never executes until the
 // user explicitly flips auto_trade_enabled=TRUE in their strategies row.
@@ -66,6 +67,15 @@ export async function POST(req: NextRequest) {
       const sizing = normaliseSizingSettings(settings)
       if (!sizing.ok) {
         return NextResponse.json({ error: sizing.error }, { status: 400 })
+      }
+      // Saved ACTIVE TRADING HOURS (UTC) are validated on WRITE as well as on
+      // read. Before this, `sessionStart: 'banana'` or `sessionEnd: 99` was
+      // stored happily and the naive comparison in the risk guard then evaluated
+      // false for every hour — i.e. "no restriction" (ACTIVE_TRADING_HOURS_AUDIT.md
+      // H-7). An invalid window is refused here rather than silently stored.
+      const session = validateSessionSettings(settings)
+      if (!session.ok) {
+        return NextResponse.json({ error: session.error }, { status: 400 })
       }
       const normalisedSettings = sizing.normalised as typeof settings
       payload.settings = normalisedSettings

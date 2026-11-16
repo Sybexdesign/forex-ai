@@ -488,7 +488,7 @@ export default function AppShell() {
               onRefreshAccount={refreshAccount} onRefreshTrades={refreshTrades}
             />
           )}
-          {page === 'strategy' && <StrategyPage strategy={strategy} onSave={handleSaveStrategy} account={account} />}
+          {page === 'strategy' && <StrategyPage strategy={strategy} onSave={handleSaveStrategy} account={account} userId={user?.id} />}
           {/* {page === 'journal' && <JournalPage trades={trades} userId={user?.id} onTradeAdded={refreshTrades} account={account} />} */}
           {page === 'signals' && <SignalsPage signals={signals} />}
           {/* {page === 'advanced' && <AdvancedPage prices={prices} />} */}

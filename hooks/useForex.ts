@@ -162,13 +162,26 @@ export function useIndicators(pair: string, timeframe: string) {
 export function useTrades(userId?: string) {
   const [trades, setTrades] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  // Phase 4.2.1: the endpoint has always reported whether it truncated the
+  // window, and nothing consumed it — so 1,001+ rows silently looked complete
+  // (RECENT_TRADES_ACCOUNTING_AUDIT.md R-5). Exposed now so the UI can say so.
+  const [window, setWindow] = useState<{ truncated: boolean; limit: number; rows: number }>({
+    truncated: false, limit: 0, rows: 0,
+  })
 
   const refresh = useCallback(async () => {
     if (!userId) { setTrades([]); setLoading(false); return }
     try {
-      const res = await fetch(`/api/trades?userId=${userId}`)
+      // The dashboard shows at most a few pages, but the day/win-rate figures are
+      // computed from this array, so ask for an explicit, reported window.
+      const res = await fetch(`/api/trades?userId=${userId}&limit=2000`)
       const data = await res.json()
       setTrades(data.trades || [])
+      setWindow({
+        truncated: data.truncated === true,
+        limit: Number(data.limit) || 0,
+        rows: Number(data.rows) || (data.trades || []).length,
+      })
     } catch { /* keep stale on network error */ } finally {
       setLoading(false)
     }
@@ -180,7 +193,7 @@ export function useTrades(userId?: string) {
     return () => clearInterval(id)
   }, [refresh])
 
-  return { trades, loading, refresh }
+  return { trades, loading, refresh, window }
 }
 
 // ─── SIGNALS ──────────────────────────────────────────────────────────────────

@@ -35,6 +35,10 @@ import {
 } from '../lib/direction-validation.mjs'
 import { createShadowObserver } from '../lib/scalp-shadow-cadence.mjs'
 import { resolveProfitProtectionMode, describeProfitProtectionMode } from '../lib/profit-protection-mode.mjs'
+// Saved ACTIVE TRADING HOURS (UTC) — the ONE shared eligibility rule. Same module
+// the order route, the signal route and the Strategy UI use, so the worker cannot
+// disagree with them about whether the saved window is open.
+import { evaluateTradingSession, SESSION_REASON } from '../lib/trading-session.mjs'
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -108,8 +112,12 @@ let liveStrategy = {
   tpPips: 50,
   slPips: 25,
   watchlist: ['XAU/USD', 'XAG/USD'],
-  sessionStart: 0,
-  sessionEnd: 24,
+  // Saved ACTIVE TRADING HOURS (UTC). These MUST mirror DEFAULT_STRATEGY in
+  // lib/supabase.ts (7 → 20) — they previously read 0 → 24, which is not even a
+  // value the UI can produce and silently meant "no restriction" if the
+  // /api/strategy fetch had not yet completed (ACTIVE_TRADING_HOURS_AUDIT.md H-4).
+  sessionStart: 7,
+  sessionEnd: 20,
   hardDailyStop: true,
   hardNews: true,
   demoLock: false,
@@ -134,6 +142,13 @@ const PAIRS = ['XAU/USD', 'XAG/USD']
 const PAIR_STRATEGY = {
   'XAU/USD': 'Breakout',
   'XAG/USD': 'Breakout',
+}
+
+// ── Saved trading-hours gate ──────────────────────────────────────────────────
+// Evaluated from the live saved strategy every time it is asked. No caching, no
+// staleness window: the answer always describes the strategy as it stands now.
+function tradingSessionAt(d = new Date()) {
+  return evaluateTradingSession(liveStrategy, d)
 }
 
 // ── Session Detection ─────────────────────────────────────────────────────────
@@ -1451,7 +1466,13 @@ async function fetchSignal(tick, pair, strategy) {
   return apiFetch('/api/scalper/signal', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ ...tick, pair, strategy }),
+    // The saved hours travel with the request so /api/scalper/signal can enforce
+    // the same window INDEPENDENTLY of this worker (it has no userId on this
+    // path). Both sides use lib/trading-session.mjs, so they cannot disagree.
+    body:    JSON.stringify({
+      ...tick, pair, strategy,
+      sessionSettings: { sessionStart: liveStrategy.sessionStart, sessionEnd: liveStrategy.sessionEnd },
+    }),
   })
 }
 
@@ -2443,11 +2464,18 @@ async function processSignal(pair, tick, strategy, session, direction) {
   //                 the gate below always judges the same row either way.
   // Only fetched when the cheap upstream gates would otherwise have passed, so
   // we don't waste DB round-trips during disabled / paper-mode / pair states.
+  // Saved ACTIVE TRADING HOURS (UTC), evaluated at THIS instant — the instant of
+  // the execution decision, not the instant the signal was generated.
+  const execSession = tradingSessionAt()
+
   let directionConfirmation = null
   if (
     WORKER_MODE === 'live' &&
     liveStrategy.autoTradeEnabled &&
-    liveStrategy.autoTradePairs.includes(pair)
+    liveStrategy.autoTradePairs.includes(pair) &&
+    // Out of the saved window there is no decision to make, so do not spend a
+    // confirmation round trip on it. The branch below still reports the refusal.
+    execSession.eligible
   ) {
     directionConfirmation = await fetchLatestDirectionConfirmation(pair)
     if (!directionConfirmation && AUTOMATED_CONFIRMATION) {
@@ -2479,6 +2507,20 @@ async function processSignal(pair, tick, strategy, session, direction) {
     logAutoTradeDecision('skipped-disabled', pair, dir, signal)
   } else if (!liveStrategy.autoTradePairs.includes(pair)) {
     logAutoTradeDecision('skipped-pair-filter', pair, dir, signal, { allowedPairs: liveStrategy.autoTradePairs })
+  } else if (!execSession.eligible) {
+    // Saved ACTIVE TRADING HOURS (UTC) — re-evaluated HERE, at execution time,
+    // not inherited from the moment the signal was produced. A signal generated
+    // at 15:58 must not execute at 16:02 just because it was legal when it was
+    // created (brief §3.D, ACTIVE_TRADING_HOURS_AUDIT.md H-1).
+    //
+    // Placed before the confirmation branch so an out-of-window signal does not
+    // even spend a direction-confirmation round trip.
+    logAutoTradeDecision('skipped-outside-trading-session', pair, dir, signal, {
+      tradingSession: execSession.label,
+      reason: execSession.reason,
+      utcTimestamp: execSession.utcTimestamp,
+      nextOpen: execSession.nextOpen?.label ?? null,
+    })
   } else if (!confirmationGate.pass) {
     // Every confirmation failure lands here with a structured reason
     // (confirmation-unavailable / -hold / -stale / -account-mismatch /
@@ -2719,6 +2761,43 @@ async function runSweep() {
   await refreshOutcomeReconciliation().catch(e =>
     console.error('[recon-refresh] sweep hook failed:', e.message)
   )
+
+  // ── Saved ACTIVE TRADING HOURS (UTC) — SIGNAL GENERATION GATE ────────────
+  //
+  // Positioned HERE, deliberately, and not at the top of the sweep:
+  //   • the four blocks above are OBSERVABILITY/ACCOUNTING jobs — resolving
+  //     predictions, settling tracked signals and refreshing the reconciliation
+  //     aggregate. They must keep running at 02:00 UTC and at the weekend,
+  //     otherwise outcome data stalls exactly when a close needs to resolve.
+  //   • everything BELOW is signal generation: candidate building, HTF fetches,
+  //     and the Claude call. None of it should run outside the saved window,
+  //     which is the "avoid unnecessary AI calls" requirement.
+  //
+  // This gate is the generation half of ACTIVE_TRADING_HOURS_AUDIT.md H-1. The
+  // execution half lives in processSignal() and is re-evaluated at the moment of
+  // execution, so a signal cannot ride an earlier "open" decision.
+  const sessionGate = tradingSessionAt(sweepAt)
+  if (!sessionGate.eligible) {
+    stats.sessionBlocked = (stats.sessionBlocked || 0) + 1
+    if (stats.sweeps % 6 === 0) {
+      await wlog('info',
+        sessionGate.reason === SESSION_REASON.OUTSIDE
+          ? `⏸ Sweep #${stats.sweeps} · outside saved trading hours${sessionGate.label ? ` (${sessionGate.label})` : ''}${sessionGate.nextOpen ? ` — reopens ${sessionGate.nextOpen.label}` : ''}`
+          : `⏸ Sweep #${stats.sweeps} · trading hours unusable (${sessionGate.reason}) — no signals generated`,
+        {
+          session,
+          metadata: {
+            sweeps: stats.sweeps, tradingSession: sessionGate.label,
+            utcTimestamp: sessionGate.utcTimestamp, reason: sessionGate.reason,
+            nextOpen: sessionGate.nextOpen?.label ?? null, market: '✅ OPEN',
+          },
+        }
+      ).catch(() => {})
+    }
+    if (stats.sweeps % 360 === 0)
+      console.log(`[sweep #${stats.sweeps}] Outside saved trading hours (${sessionGate.reason}) — observability only, no generation`)
+    return
+  }
 
   // Phase 2a: fast sync pre-filter — no I/O, builds candidate list
 

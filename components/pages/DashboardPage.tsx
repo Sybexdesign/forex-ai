@@ -1,14 +1,17 @@
 'use client'
 // components/pages/DashboardPage.tsx
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import { Panel, LiveDot, StatCard, LoadingDots } from '../ui'
+import RecentTradesTable from '../RecentTradesTable'
 import { authFetch } from '@/lib/api'
 import type { PriceData } from '@/hooks/useForex'
 import { currencySymbol, currencySigned } from '@/lib/currency'
 import { buildScopedAnalytics, scopedEquityCurve } from '@/lib/analytics-metrics.mjs'
-import { isGenuineExecution } from '@/lib/analytics-scope.mjs'
+import {
+  isGenuineExecution, describeTradeRow, sortDescribedRows, realisedPnlForUtcDay,
+} from '@/lib/analytics-scope.mjs'
 
 
 const DIR_COLOR: Record<string, string> = { BUY: '#00ff87', SELL: '#ff3056' }
@@ -48,6 +51,24 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
   const [closingId, setClosingId] = useState<string | null>(null)
   const [openPage, setOpenPage] = useState(0)
   const [closedPage, setClosedPage] = useState(0)
+  // Server-evaluated trading-session state (brief §3.F). The dashboard must state
+  // whether trading is currently permitted, and that answer has to come from the
+  // same server module that gates signal generation and order submission — not
+  // from a browser calculation that could disagree with it.
+  const [sessionStatus, setSessionStatus] = useState<any>(null)
+  useEffect(() => {
+    let alive = true
+    const load = async () => {
+      try {
+        const res = await fetch(`/api/trading-session${userId ? `?userId=${encodeURIComponent(userId)}` : ''}`, { cache: 'no-store' })
+        const data = await res.json()
+        if (alive) setSessionStatus(data.session ?? null)
+      } catch { /* leave the indicator blank rather than guess */ }
+    }
+    load()
+    const id = setInterval(load, 30_000)
+    return () => { alive = false; clearInterval(id) }
+  }, [userId])
 
   // Real stats from actual trade records — SCOPED (Phase 4.2C).
   //
@@ -68,17 +89,28 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
   const headline = netBasis ? scoped.net : scoped.gross
 
   const openTrades = trades.filter((t: any) => t.result === 'OPEN')
-  // Closed list for the table: genuine broker executions only.
+  // Closed list for the table: genuine broker executions only, mapped to the
+  // exact fields a human may be shown by the ONE shared row classifier.
+  //   • net P&L only when accounting is NET_COMPLETE,
+  //   • gross shown as GROSS with an explicit "provisional" result,
+  //   • a ticket-less close is SIMULATED (labelled, not silently dropped).
+  const closedRows = sortDescribedRows(
+    trades
+      .filter((t: any) => isGenuineExecution(t as any) && t.result && t.result !== 'OPEN')
+      .map((t: any) => describeTradeRow(t as any)),
+  )
   const closedTrades = trades.filter((t: any) =>
     isGenuineExecution(t as any) && t.result && t.result !== 'OPEN')
 
-  const today = new Date().toDateString()
-  const plKey = netBasis ? 'net_realised_pnl' : 'pl_usd'
-  const todayPL = trades
-    .filter((t: any) => isGenuineExecution(t as any) && t.closed_at
-      && new Date(t.closed_at).toDateString() === today
-      && Number.isFinite(Number(t[plKey])))
-    .reduce((s: number, t: any) => s + Number(t[plKey]), 0)
+  // TODAY P/L — UTC day, NET_CONFIRMED rows only (Phase 4.2.1).
+  //
+  // The previous expression used `new Date().toDateString()` (the BROWSER's day)
+  // and picked `net_realised_pnl` per row whenever any net row existed, so a net
+  // figure for one trade sat beside a gross figure for the next. Both are gone:
+  // one population, one UTC day boundary, and the excluded counts are returned so
+  // an unexplained zero is impossible.
+  const todayRealised = realisedPnlForUtcDay(trades as any[], new Date())
+  const todayPL = todayRealised.total
 
   const winRate = headline.winRate === null ? null : Math.round(headline.winRate * 100)
 
@@ -148,9 +180,9 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
           color={account?.balance ? '#60c0ff' : '#ffb800'}
         />
         <StatCard
-          label="TODAY P/L"
-          value={currencySigned(todayPL, account?.currency)}
-          color={todayPL > 0 ? '#00ff87' : todayPL < 0 ? '#ff3056' : '#607080'}
+          label="TODAY P/L (UTC, NET)"
+          value={todayPL === null ? '—' : currencySigned(todayPL, account?.currency)}
+          color={todayPL === null ? '#607080' : todayPL > 0 ? '#00ff87' : todayPL < 0 ? '#ff3056' : '#607080'}
         />
 
         <StatCard
@@ -169,6 +201,32 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
           color="#607080"
         />
       </div>
+
+      {/* Trading-session indicator (brief §3.F). Derived entirely from the server
+          endpoint — status, window and next boundary are not recomputed here. */}
+      {sessionStatus && (
+        <div style={{
+          fontSize: 10, color: 'var(--text-dim)',
+          padding: '6px 10px', border: '1px solid var(--border)', borderRadius: 4,
+          display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center',
+        }}>
+          <span style={{ fontWeight: 700, color: sessionStatus.eligible ? '#00ff87' : '#ffb800' }}>
+            {sessionStatus.eligible ? '● TRADING SESSION OPEN' : '○ TRADING SESSION CLOSED'}
+          </span>
+          <span>Saved hours: {sessionStatus.window ?? 'not configured'}</span>
+          <span>Now: {sessionStatus.utcTimestamp ? `${sessionStatus.utcTimestamp.slice(11, 16)} UTC` : 'unknown'}</span>
+          {sessionStatus.eligible
+            ? sessionStatus.nextClose && <span>Closes: {sessionStatus.nextClose.label}</span>
+            : sessionStatus.nextOpen && <span>Opens: {sessionStatus.nextOpen.label}</span>}
+          {!sessionStatus.eligible && (
+            <span style={{ color: '#ffb800' }}>
+              {sessionStatus.reason === 'outside_session'
+                ? 'Signals and new orders are blocked outside the saved window.'
+                : `Trading hours unusable (${sessionStatus.reason}) — server fails closed.`}
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Population disclosure (Phase 4.2C). Every headline figure above is
           computed from ONE labelled population; this line names it and states
@@ -304,72 +362,31 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
         </Panel>
       )}
 
-      {/* Recent trades */}
-      {closedTrades.length > 0 ? (
-        <Panel title={`RECENT TRADES${closedTrades.length ? ` (${closedTrades.length})` : ''}`}>
-          {(() => {
-            const sorted = [...closedTrades].sort((a, b) => new Date(b.closed_at || b.opened_at).getTime() - new Date(a.closed_at || a.opened_at).getTime())
-            const page = sorted.slice(closedPage * PAGE_SIZE, (closedPage + 1) * PAGE_SIZE)
-            return (
-              <>
-                <div style={{ overflowX: 'auto' }}>
-                  <table>
-                    <thead>
-                      <tr><th>DATE</th><th>PAIR</th><th>DIR</th><th>LOTS</th><th>P/L</th><th>RESULT</th></tr>
-                    </thead>
-                    <tbody>
-                      {page.map((t: any) => (
-                        <tr key={t.id}>
-                          <td style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                            {t.closed_at ? new Date(t.closed_at).toLocaleDateString('en', { day: 'numeric', month: 'short' }) : '—'}
-                          </td>
-                          <td className="mono" style={{ color: '#90b0d0' }}>{t.pair}</td>
-                          <td>
-                            <span style={{ color: DIR_COLOR[t.direction] || '#ffb800', fontWeight: 700, fontSize: 12 }}>
-                              {t.direction}
-                            </span>
-                          </td>
-                          <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t.lots?.toFixed(2) ?? '—'}</td>
-                          <td className="mono" style={{
-                            // Phase 4.2.1 (P-F): `t.pl_usd ?? 0` rendered a
-                            // missing result as a green +$0.00 — a loss-shaped
-                            // hole in the record shown as a break-even. Unknown
-                            // is now an em dash in a neutral colour, and the
-                            // result column tells the reader why.
-                            color: t.pl_usd === null || t.pl_usd === undefined
-                              ? '#607080'
-                              : t.pl_usd >= 0 ? '#00ff87' : '#ff6060',
-                            fontWeight: 700,
-                          }}
-                            title={t.pl_usd === null || t.pl_usd === undefined ? 'No realised P&L recorded for this row yet' : undefined}
-                          >
-                            {t.pl_usd === null || t.pl_usd === undefined
-                              ? '—'
-                              : currencySigned(t.pl_usd, account?.currency)}
-                          </td>
-
-                          <td>
-                            <span style={{
-                              fontSize: 11, fontWeight: 700,
-                              color: t.result === 'WIN' ? '#00ff87' : t.result === 'LOSS' ? '#ff3056' : '#ffb800'
-                            }}>
-                              {t.result}
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <Pager page={closedPage} total={closedTrades.length} onPage={setClosedPage} />
-              </>
-            )
-          })()}
+      {/* Recent trades — every displayed figure traces to the broker row that
+          produced it (Phase 4.2.1). Net is shown only when accounting is
+          net-complete; a gross-only row says so and its RESULT is PENDING. */}
+      {closedRows.length > 0 ? (
+        <Panel title={`RECENT TRADES${closedRows.length ? ` (${closedRows.length})` : ''}`}>
+          <RecentTradesTable
+            rows={closedRows}
+            page={closedPage}
+            onPage={setClosedPage}
+            pageSize={PAGE_SIZE}
+            currency={account?.currency}
+            simulated={scopeCounts.SIMULATION || 0}
+            pendingToday={todayRealised.excluded.accountingPending}
+          />
         </Panel>
       ) : (
         <Panel title="RECENT TRADES">
           <div style={{ padding: '24px 20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
-            No closed trades yet — trades placed through the app will appear here
+            No closed broker executions yet.
+            {scopeCounts.SIMULATION > 0
+              ? ` ${scopeCounts.SIMULATION} simulated/model row(s) exist without a broker ticket — they are not trades and are not shown.`
+              : ' Trades executed on your connected account will appear here.'}
+            {todayRealised.excluded.accountingPending > 0 && (
+              <> {todayRealised.excluded.accountingPending} close(s) are awaiting broker accounting.</>
+            )}
           </div>
         </Panel>
       )}

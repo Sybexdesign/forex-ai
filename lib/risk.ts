@@ -3,6 +3,7 @@
 
 import type { StrategySettings } from './supabase'
 import type { OpenTrade } from './brokers/interface'
+import { evaluateTradingSession, SESSION_REASON } from './trading-session.mjs'
 
 export interface RiskCheck {
   allowed: boolean
@@ -18,7 +19,13 @@ export interface RiskGuardOptions {
   todayRealizedPL: number | null
   newsInWindow: boolean
   newsEvent?: string
+  /**
+   * The authoritative UTC instant to evaluate the saved trading hours against.
+   * Defaults to now. Tests pass a fixed clock; the UI is never consulted.
+   */
+  now?: Date | string
 }
+
 
 export function runRiskGuards(options: RiskGuardOptions): RiskCheck[] {
   const checks: RiskCheck[] = []
@@ -85,14 +92,25 @@ export function runRiskGuards(options: RiskGuardOptions): RiskCheck[] {
     })
   }
 
-  // 5. Session hours check
-  const now = new Date()
-  const currentHour = now.getUTCHours()
-  if (currentHour < strategy.sessionStart || currentHour >= strategy.sessionEnd) {
+  // 5. Saved ACTIVE TRADING HOURS (UTC) — HARD BLOCK
+  //
+  // This was `{ allowed: true, severity: 'WARN' }`, which `isTradeAllowed()`
+  // cannot block on, so the saved window had no effect on submission at all
+  // (ACTIVE_TRADING_HOURS_AUDIT.md H-1). It was also a naive comparison that
+  // inverted a midnight-crossing window (H-2) and failed open on a non-numeric
+  // value (H-7).
+  //
+  // The rule now comes from the ONE shared module (`lib/trading-session.mjs`),
+  // the same one the worker, the signal route and the UI use, and it fails
+  // closed: an unparseable window or an unknown instant denies the order.
+  const session = evaluateTradingSession(strategy, options.now ?? new Date())
+  if (!session.eligible) {
     checks.push({
-      allowed: true,
-      severity: 'WARN',
-      reason: `Outside configured trading hours (${strategy.sessionStart}:00–${strategy.sessionEnd}:00 UTC). Signal may be unreliable.`,
+      allowed: false,
+      severity: 'BLOCK',
+      reason: session.reason === SESSION_REASON.OUTSIDE
+        ? `Outside the saved trading hours (${session.label}). Signals and orders are blocked until the window reopens${session.nextOpen ? ` at ${session.nextOpen.label}` : ''}.`
+        : `Trading hours could not be validated (${session.reason}). Orders are blocked until the active strategy has a valid ACTIVE TRADING HOURS (UTC) window.`,
     })
   }
 

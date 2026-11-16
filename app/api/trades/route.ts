@@ -70,6 +70,14 @@ export async function GET(req: NextRequest) {
       .from('trades')
       .select('*')
       .eq('user_id', userId)
+      // Phase 4.2.1 — ORDER BY THE BROKER'S CLOSE, THEN THE OPEN.
+      //
+      // This was `.order('opened_at', { ascending: false })` while the dashboard
+      // sorted the returned slice by `closed_at` (RECENT_TRADES_ACCOUNTING_AUDIT.md
+      // R-5). The window was therefore chosen by one timestamp and presented by
+      // another, so a long-held position closed today could fall outside it and
+      // never appear. Nulls sort last in PostgREST with `nullsFirst: false`.
+      .order('closed_at', { ascending: false, nullsFirst: false })
       .order('opened_at', { ascending: false })
       // Read one extra row purely to detect that the window was cut short.
       .limit(limit + 1)

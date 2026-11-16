@@ -349,8 +349,17 @@ const mt5 = (over = {}) => ({
   const dashCode = codeLines(dash)
   assert.ok(!dashCode.some((l) => /pl_usd \?\? 0/.test(l)),
     'P-F: no `pl_usd ?? 0` in any render path')
-  assert.match(dash, /No realised P&L recorded for this row yet/, 'P-F: the em dash explains itself')
-  assert.match(dash, /t\.pl_usd === null \|\| t\.pl_usd === undefined\s*\n?\s*\? '—'/, 'P-F: unknown renders as an em dash')
+  // Phase 4.2.1 moved per-row rendering into components/RecentTradesTable.tsx, so
+  // the em-dash contract is asserted there. The INTENT is unchanged and is now
+  // stronger: the number comes from describeTradeRow(), which refuses to emit a
+  // P&L at all when the accounting does not support one.
+  const table = read('components/RecentTradesTable.tsx')
+  assert.match(table, /v === null \|\| v === undefined \? '—' : currencySigned\(v, currency\)/,
+    'P-F: unknown renders as an em dash in the trade table')
+  assert.match(table, /An em dash means the broker has not reported that value — it is never\s*\n?\s*treated as zero\./,
+    'P-F: the em dash explains itself')
+  assert.ok(!/pl_usd \?\? 0/.test(table), 'P-F: no `pl_usd ?? 0` in the table either')
+  assert.match(dash, /describeTradeRow/, 'P-F: rows are described by the shared classifier')
   console.log('PASS P-F: an unknown result is an em dash, not a fake break-even')
 }
 

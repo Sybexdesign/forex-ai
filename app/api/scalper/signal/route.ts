@@ -2,7 +2,8 @@
 export const dynamic = 'force-dynamic'
 
 import { NextRequest, NextResponse } from 'next/server'
-import { getAdminClient } from '@/lib/supabase'
+import { getAdminClient, DEFAULT_STRATEGY } from '@/lib/supabase'
+import { evaluateTradingSession, sessionAudit, SESSION_REASON } from '@/lib/trading-session.mjs'
 import { llmComplete, hasLlmKey, providerLabel } from '@/lib/llm'
 import { getMarketCandles } from '@/lib/marketdata'
 import { calculateIndicators } from '@/lib/indicators'
@@ -468,6 +469,49 @@ function logGateRejection(
   } catch { /* never throw */ }
 }
 
+/**
+ * Resolve the saved ACTIVE TRADING HOURS (UTC) for this caller.
+ *
+ * Order of authority:
+ *   1. `strategies.settings` for the supplied `userId` (the saved strategy).
+ *   2. The same DEFAULT_STRATEGY that GET /api/strategy serves when no row exists.
+ *   3. For a caller with no `userId` (the worker), the hours it loaded from
+ *      /api/strategy and forwarded in the request body.
+ *   4. Anything else — fail closed.
+ *
+ * A DB read error is NOT treated as "no window": it denies, because an unknown
+ * window is not an unrestricted window.
+ */
+async function resolveSessionSettings(
+  userId: string | undefined,
+  body: any,
+): Promise<{ ok: true; settings: any; source: string } | { ok: false; reason: string }> {
+  if (userId) {
+    try {
+      const admin = getAdminClient()
+      const { data, error } = await admin
+        .from('strategies')
+        .select('settings')
+        .eq('user_id', userId)
+        .maybeSingle()
+      if (error) return { ok: false, reason: 'saved_strategy_unreadable' }
+      if (data?.settings && typeof data.settings === 'object') {
+        return { ok: true, settings: data.settings, source: 'saved-strategy' }
+      }
+      return { ok: true, settings: DEFAULT_STRATEGY, source: 'default-strategy' }
+    } catch {
+      return { ok: false, reason: 'saved_strategy_unreadable' }
+    }
+  }
+  const forwarded = body?.sessionSettings && typeof body.sessionSettings === 'object'
+    ? body.sessionSettings
+    : { sessionStart: body?.sessionStart, sessionEnd: body?.sessionEnd }
+  if (forwarded.sessionStart !== undefined || forwarded.sessionEnd !== undefined) {
+    return { ok: true, settings: forwarded, source: 'request' }
+  }
+  return { ok: false, reason: SESSION_REASON.NOT_CONFIGURED }
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
@@ -492,6 +536,44 @@ export async function POST(req: NextRequest) {
         ml: null,
       })
     }
+
+    // ── Saved ACTIVE TRADING HOURS (UTC) — generation gate ────────────────────
+    //
+    // The saved strategy window is the ONLY authority on when a signal may be
+    // produced (ACTIVE_TRADING_HOURS_AUDIT.md H-1). This runs BEFORE any indicator
+    // work, candle fetch or AI call, so an out-of-window request costs nothing and
+    // can never produce an eligible signal.
+    //
+    // It fails closed: no resolvable configuration, or an invalid one, denies.
+    const sessionSettings = await resolveSessionSettings(userId, body)
+    const sessionNow = new Date()
+    const sessionEval = sessionSettings.ok
+      ? evaluateTradingSession(sessionSettings.settings, sessionNow)
+      : { eligible: false, label: null, start: null, end: null, wraps: false,
+          utcTimestamp: sessionNow.toISOString(), utcHour: sessionNow.getUTCHours(),
+          reason: sessionSettings.reason, nextOpen: null, nextClose: null, active: false }
+
+    if (!sessionEval.eligible) {
+      const windowLabel = sessionEval.label ? ` (${sessionEval.label})` : ''
+      const reason = sessionEval.reason === SESSION_REASON.OUTSIDE
+        ? `Outside the saved trading hours${windowLabel} — no signal generated.${sessionEval.nextOpen ? ` The window reopens at ${sessionEval.nextOpen.label}.` : ''}`
+        : `Trading hours are not configured correctly (${sessionEval.reason}) — no signal generated until the active strategy has a valid ACTIVE TRADING HOURS (UTC) window.`
+      logGateRejection(body, { filterName: 'trading_session', reason }, pair, userId)
+      return NextResponse.json({
+        direction:  'HOLD' as Direction,
+        confidence: 0,
+        reasons:    [reason],
+        risk_note:  'Signal blocked by the saved ACTIVE TRADING HOURS (UTC) window. This is a server-side gate; it cannot be overridden by the client or by the AI.',
+        entry: body.price || 0, sl: body.price || 0, tp: body.price || 0,
+        fallback: false,
+        outsideTradingSession: true,
+        session: sessionSettings.ok
+          ? sessionAudit(sessionSettings.settings, sessionNow, sessionNow.getTime())
+          : { utcTimestamp: sessionNow.toISOString(), eligible: false, reason: sessionEval.reason },
+        ml: null,
+      })
+    }
+
 
     // ── Market-data health watchdog gate (audit 2026-09-03) ───────────────────
     // If the tick route detected a broker-clock error or a stalled candle feed

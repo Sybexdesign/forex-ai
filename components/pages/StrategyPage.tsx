@@ -143,6 +143,9 @@ function HardRuleRow({ icon, label, description, enabled, onChange }: HardRuleRo
 interface StrategyPageProps {
   strategy: StrategySettings
   onSave: (s: StrategySettings) => Promise<void>
+  // Needed only by the trading-session status panel, which asks the SERVER
+  // whether the saved window is open rather than deciding it in the browser.
+  userId?: string
   // Live account snapshot from useAccount(). Optional — the page renders fine
   // without it, but the manual-lots dollar-risk preview uses balance +
   // profitFixedUsd/profitTargetPct from this object when present.
@@ -155,10 +158,36 @@ interface StrategyPageProps {
 
 }
 
-export default function StrategyPage({ strategy, onSave, account }: StrategyPageProps) {
+export default function StrategyPage({ strategy, onSave, account, userId }: StrategyPageProps) {
   const [local, setLocal] = useState<StrategySettings>({ ...strategy })
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+
+  // ── Server-evaluated trading-session status ────────────────────────────────
+  // The badge below is NOT computed in the browser. It is whatever
+  // GET /api/trading-session returns, which is computed by the same module that
+  // gates signal generation, the worker and order submission
+  // (ACTIVE_TRADING_HOURS_AUDIT.md F / H-6). A browser-side calculation would be
+  // a second implementation and could disagree with the gate.
+  const [sessionStatus, setSessionStatus] = useState<any>(null)
+  const [sessionError, setSessionError] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    const load = async () => {
+      try {
+        const res = await fetch(`/api/trading-session${userId ? `?userId=${encodeURIComponent(userId)}` : ''}`, { cache: 'no-store' })
+        const data = await res.json()
+        if (!alive) return
+        setSessionStatus(data.session ?? null)
+        setSessionError(data.error ?? null)
+      } catch (e: any) {
+        if (alive) setSessionError(e?.message ?? 'status unavailable')
+      }
+    }
+    load()
+    const id = setInterval(load, 30_000)
+    return () => { alive = false; clearInterval(id) }
+  }, [userId])
 
   // ── Manual lot size: a STRING DRAFT, separate from the committed number ─────
   // The committed value is a number|null (null = auto-size). The draft is what
@@ -702,7 +731,9 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
       <Panel title="ACTIVE TRADING HOURS (UTC)">
         <div style={{ padding: '14px 16px 16px' }}>
           <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 14 }}>
-            AI will only generate signals during these hours. Outside this window signals are marked as low-priority.
+            Signals are generated and orders are accepted <b>only inside this window</b>.
+            Outside it the server blocks generation, execution and order submission.
+            Start hour is inclusive, end hour is exclusive (07:00–16:00 permits 07:00–15:59 UTC).
           </div>
           <div style={{ display: 'flex', gap: 16, alignItems: 'flex-end', flexWrap: 'wrap' }}>
             <div>
@@ -718,11 +749,11 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
             <div>
               <div style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: 1, marginBottom: 6 }}>END HOUR</div>
               <input
-                type="number" min={0} max={23} value={local.sessionEnd}
-                onChange={e => set('sessionEnd', Math.max(0, Math.min(23, +e.target.value)))}
+                type="number" min={1} max={24} value={local.sessionEnd}
+                onChange={e => set('sessionEnd', Math.max(1, Math.min(24, +e.target.value)))}
                 style={{ width: 80 }}
               />
-              <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 4 }}>0–23 UTC</div>
+              <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 4 }}>1–24 UTC (24 = midnight)</div>
             </div>
             {/* Session presets */}
             <div style={{ paddingBottom: 2 }}>
@@ -732,7 +763,10 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
                   { label: 'London', start: 7, end: 16 },
                   { label: 'NY', start: 13, end: 22 },
                   { label: 'Asian', start: 23, end: 8 },
-                  { label: 'All Day', start: 0, end: 23 },
+                  // 24, not 23: with an exclusive end, 0→23 would silently exclude
+                  // the 23:00–23:59 UTC hour while claiming to be "all day"
+                  // (ACTIVE_TRADING_HOURS_AUDIT.md H-3).
+                  { label: 'All Day', start: 0, end: 24 },
                 ].map(preset => (
                   <button
                     key={preset.label}
@@ -754,7 +788,9 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
                 <div style={{
                   position: 'absolute',
                   left: `${(local.sessionStart / 24) * 100}%`,
-                  width: `${((local.sessionEnd - local.sessionStart + 1) / 24) * 100}%`,
+                  // Exclusive end: the bar spans exactly the permitted hours, so
+                  // the picture and the server rule agree (audit H-3).
+                  width: `${((local.sessionEnd - local.sessionStart) / 24) * 100}%`,
                   height: '100%', background: '#0080ff', borderRadius: 4,
                   boxShadow: '0 0 8px rgba(0,128,255,0.5)',
                 }} />
@@ -768,7 +804,7 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
                   }} />
                   <div style={{
                     position: 'absolute', left: 0,
-                    width: `${((local.sessionEnd + 1) / 24) * 100}%`,
+                    width: `${(local.sessionEnd / 24) * 100}%`,
                     height: '100%', background: '#0080ff',
                     boxShadow: '0 0 8px rgba(0,128,255,0.5)',
                   }} />
@@ -778,6 +814,54 @@ export default function StrategyPage({ strategy, onSave, account }: StrategyPage
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: 'var(--text-dim)', marginTop: 4 }}>
               {[0, 4, 8, 12, 16, 20, 24].map(h => <span key={h}>{h}:00</span>)}
             </div>
+          </div>
+
+          {/* Live state, evaluated by the SERVER from the SAVED configuration.
+              Deliberately not derived from `local` — unsaved edits must not appear
+              as an active trading state. */}
+          <div style={{
+            marginTop: 14, padding: '10px 12px', borderRadius: 4,
+            border: '1px solid var(--border)', fontSize: 11,
+            display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center',
+          }}>
+            {sessionError && !sessionStatus ? (
+              <span style={{ color: '#ffb800' }}>
+                Trading-hours status unavailable: {sessionError}
+              </span>
+            ) : sessionStatus ? (
+              <>
+                <span style={{ fontWeight: 700, color: sessionStatus.eligible ? '#00ff87' : '#ffb800' }}>
+                  {sessionStatus.eligible ? '● SIGNAL GENERATION PERMITTED' : '○ SIGNAL GENERATION BLOCKED'}
+                </span>
+                <span style={{ color: 'var(--text-muted)' }}>
+                  Saved window: {sessionStatus.window ?? 'not configured'}
+                </span>
+                <span style={{ color: 'var(--text-muted)' }}>
+                  Now: {sessionStatus.utcTimestamp
+                    ? `${sessionStatus.utcTimestamp.slice(11, 16)} UTC`
+                    : 'unknown'}
+                </span>
+                {sessionStatus.eligible && sessionStatus.nextClose && (
+                  <span style={{ color: 'var(--text-muted)' }}>
+                    Next close: {sessionStatus.nextClose.label}
+                  </span>
+                )}
+                {!sessionStatus.eligible && sessionStatus.nextOpen && (
+                  <span style={{ color: 'var(--text-muted)' }}>
+                    Next open: {sessionStatus.nextOpen.label}
+                  </span>
+                )}
+                {!sessionStatus.eligible && (
+                  <span style={{ color: '#ffb800' }}>
+                    {sessionStatus.reason === 'outside_session'
+                      ? 'Outside the saved hours — no signals will be generated and no orders accepted.'
+                      : `Configuration unusable (${sessionStatus.reason}) — server fails closed.`}
+                  </span>
+                )}
+              </>
+            ) : (
+              <span style={{ color: 'var(--text-dim)' }}>Checking trading-hours state…</span>
+            )}
           </div>
         </div>
       </Panel>

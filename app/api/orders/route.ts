@@ -15,6 +15,7 @@ import { EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 import { evaluateExecutionGuards } from '@/lib/execution-guards.mjs'
 import { classifySubmission, deriveRequestId, evaluateOrderAuthority } from '@/lib/order-authority.mjs'
 import { closedExecutions, sumKnownPL } from '@/lib/analytics-scope.mjs'
+import { evaluateTradingSession, sessionAudit, SESSION_REASON } from '@/lib/trading-session.mjs'
 
 import { alertOrderPlaced, alertOrderBlocked, alertOrderFailed, alertProfitTargetDisabled } from '@/lib/telegram'
 
@@ -402,15 +403,90 @@ export async function POST(req: NextRequest) {
       // hardNews explicitly disabled — allow but stamp a warning in logs
     }
 
+    // ─── Saved ACTIVE TRADING HOURS (UTC) — authoritative source ──────────
+    //
+    // Source of truth is `strategies.settings` for THIS user, read server-side.
+    // The request body's `strategy` object is the client's view and is used only
+    // as a fallback when no saved row exists (the same semantics GET
+    // /api/strategy already has: absent row ⇒ DEFAULT_STRATEGY).
+    //
+    // A failed DB read fails CLOSED. Nothing here can widen or resize a trade:
+    // `strategy` (used for sizing, SL/TP and risk %) is deliberately untouched —
+    // only the two session hours are taken from the saved row.
+    let savedSessionSettings: any = {
+      sessionStart: strategy?.sessionStart,
+      sessionEnd:   strategy?.sessionEnd,
+    }
+    let sessionSource = 'request'
+    if (userId) {
+      try {
+        const admin = getAdminClient()
+        const { data, error } = await admin
+          .from('strategies')
+          .select('settings')
+          .eq('user_id', userId)
+          .maybeSingle()
+        if (error) throw error
+        if (data?.settings && typeof data.settings === 'object') {
+          savedSessionSettings = {
+            sessionStart: (data.settings as any).sessionStart,
+            sessionEnd:   (data.settings as any).sessionEnd,
+          }
+          sessionSource = 'saved-strategy'
+        } else {
+          // No saved row: mirror GET /api/strategy, which serves DEFAULT_STRATEGY.
+          savedSessionSettings = {
+            sessionStart: DEFAULT_STRATEGY.sessionStart,
+            sessionEnd:   DEFAULT_STRATEGY.sessionEnd,
+          }
+          sessionSource = 'default-strategy'
+        }
+      } catch (e: any) {
+        console.error(`[orders] trading-hours read failed for ${userId}: ${e?.message}`)
+        const reason = 'The saved trading-hours configuration could not be read, so the trading window cannot be verified. Orders are blocked until the strategy can be loaded.'
+        await alertOrderBlocked({ pair, direction, reason })
+        return NextResponse.json({
+          success: false, blocked: true, reasons: [reason], code: 'SESSION_UNVERIFIABLE',
+        }, { status: 422 })
+      }
+    }
+
+    const sessionNow = new Date()
+    const sessionEval = evaluateTradingSession(savedSessionSettings, sessionNow)
+    const sessionPayload = sessionAudit(savedSessionSettings, sessionNow, sessionNow.getTime())
+    console.log(`[orders] session gate — ${pair} ${direction} window=${sessionEval.label} now=${sessionPayload.utcTimestamp} eligible=${sessionEval.eligible} (${sessionEval.reason}, source=${sessionSource})`)
+
+    if (!sessionEval.eligible) {
+      const reason = sessionEval.reason === SESSION_REASON.OUTSIDE
+        ? `Outside the saved trading hours (${sessionEval.label}). The active strategy permits trading only inside this UTC window${sessionEval.nextOpen ? ` — it reopens at ${sessionEval.nextOpen.label}` : ''}.`
+        : `Trading hours could not be validated (${sessionEval.reason}). The active strategy must have a valid ACTIVE TRADING HOURS (UTC) window before orders are accepted.`
+      console.warn(`[orders] SESSION BLOCK — ${pair} ${direction} (${sessionEval.reason}) window=${sessionEval.label}`)
+      await alertOrderBlocked({ pair, direction, reason })
+      return NextResponse.json({
+        success: false, blocked: true, reasons: [reason],
+        code: 'OUTSIDE_TRADING_SESSION',
+        session: sessionPayload,
+      }, { status: 422 })
+    }
+
     // ─── Hard risk guards ─────────────────────────────────────────────────
     // `todayPL` is still `number | null` here. An unknown day was already
     // rejected by the guard above, so it cannot reach this comparison; if the
     // DB read itself failed, `todayPL` is 0 and behaviour is unchanged from
     // before this phase (documented residual in PHASE42_1_OWNER_ACTIONS.md).
     const riskChecks = runRiskGuards({
-      strategy, openTrades, accountBalance: balance,
+      // The SAVED hours are authoritative; every other strategy field is the
+      // caller's (unchanged) sizing/risk input. Spreading here would let a stale
+      // client window override the saved one, so only the two hours are replaced.
+      strategy: {
+        ...strategy,
+        sessionStart: savedSessionSettings.sessionStart,
+        sessionEnd:   savedSessionSettings.sessionEnd,
+      } as typeof strategy,
+      openTrades, accountBalance: balance,
       todayRealizedPL: todayPL,
       newsInWindow: newsInWindow || false, newsEvent,
+      now: sessionNow,
     })
     if (!isTradeAllowed(riskChecks)) {
       const reasons = getBlockReasons(riskChecks)
@@ -610,6 +686,31 @@ export async function POST(req: NextRequest) {
     } else {
       console.log(`[orders] DEMO order placing — pair=${pair} direction=${direction} lots=${lots} sl=${safeSlPips}p tp=${safeTpPips}p anchor=${effectivePrice}(${anchorSource}) balance=$${balance.toFixed(2)} broker=${broker.name}`)
     }
+    // ─── FINAL trading-hours gate — immediately before submission ─────────
+    //
+    // Deliberately a SECOND, independent evaluation using a fresh instant:
+    // between the guard above and this line the request has awaited broker
+    // quotes, sizing and authority checks, so the clock may have crossed a
+    // session boundary. Re-evaluating is the only way to guarantee the order is
+    // inside the saved window AT SUBMISSION, not merely at the start of the
+    // request. Same module, same inputs — there is no second implementation.
+    {
+      const fireAt = new Date()
+      const finalEval = evaluateTradingSession(savedSessionSettings, fireAt)
+      if (!finalEval.eligible) {
+        const reason = finalEval.reason === SESSION_REASON.OUTSIDE
+          ? `The saved trading window (${finalEval.label}) closed before submission. Order cancelled${finalEval.nextOpen ? ` — the window reopens at ${finalEval.nextOpen.label}` : ''}.`
+          : `Trading hours could not be validated at submission time (${finalEval.reason}). Order cancelled.`
+        console.warn(`[orders] FINAL SESSION BLOCK — ${pair} ${direction} (${finalEval.reason}) at ${fireAt.toISOString()}`)
+        await alertOrderBlocked({ pair, direction, reason })
+        return NextResponse.json({
+          success: false, blocked: true, reasons: [reason],
+          code: 'OUTSIDE_TRADING_SESSION',
+          session: sessionAudit(savedSessionSettings, fireAt, fireAt.getTime()),
+        }, { status: 422 })
+      }
+    }
+
     const orderResult = await broker.placeOrder({
       pair, direction, lots,
       takeProfitPips: safeTpPips,

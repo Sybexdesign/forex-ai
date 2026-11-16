@@ -103,3 +103,69 @@ export declare const EXECUTION_POPULATIONS: PopulationKey[]
 export declare function closedExecutions(trades?: TradeLike[]): TradeLike[]
 
 export declare function describeScope(counts?: Partial<PopulationCounts>): string
+
+// ── Row presentation (Phase 4.2.1 — RECENT TRADES) ───────────────────────────
+// `describeTradeRow` is the ONLY mapping from a stored row to what a human may be
+// shown. It reuses classifyTrade(), so the table and the headline statistics
+// cannot drift apart.
+
+export declare const ROW_RESULT: {
+  WIN: 'WIN'
+  LOSS: 'LOSS'
+  BREAKEVEN: 'BREAKEVEN'
+  PENDING: 'RESULT PENDING'
+  OPEN: 'OPEN'
+  CANCELLED: 'CANCELLED'
+  SIMULATED: 'SIMULATED'
+}
+
+export interface DescribedTradeRow {
+  id: string | number | null
+  population: PopulationKey
+  isOpen: boolean
+  isCancelled: boolean
+  isSimulated: boolean
+  isGenuineExecution: boolean
+  brokerEvidence: BrokerTicketKind
+  pair: string | null
+  direction: string | null
+  lots: number | null
+  entryPrice: number | null
+  exitPrice: number | null
+  openedAt: string | null
+  closedAt: string | null
+  grossPnl: number | null
+  commission: number | null
+  swap: number | null
+  otherFees: number | null
+  netPnl: number | null
+  pnl: number | null
+  pnlBasis: 'NET' | 'GROSS' | 'NONE' | 'ERROR'
+  result: string
+  provisional: boolean
+  accountingStatus: string
+  accountingComplete: boolean
+  missingCosts: string[]
+  ticket: string | null
+  source: string | null
+  sortTimestamp: string | null
+  reason: string
+  version: string
+}
+
+export declare function describeTradeRow(trade?: TradeLike): DescribedTradeRow
+
+export declare function sortDescribedRows(rows?: DescribedTradeRow[]): DescribedTradeRow[]
+
+export declare function utcDayKey(at: Date | string | number): string | null
+
+export interface UtcDayRealised {
+  day: string | null
+  total: number | null
+  rows: number
+  netComplete: boolean
+  excluded: { grossOnly: number; accountingPending: number }
+}
+
+export declare function realisedPnlForUtcDay(trades?: TradeLike[], at?: Date | string | number): UtcDayRealised
+
