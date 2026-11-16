@@ -148,7 +148,26 @@ redeploy.
 
 ---
 
-## §7 — What "done" looks like
+## §7 — SEC-1: the public diagnostics endpoint (separate release, separate approval)
+
+`GET /api/production-integrity` answered **unauthenticated** callers with the trading performance, the
+accounting census, the reconciliation age and `cronSecretConfigured`. That is fixed in code and frozen
+by `npm run test:security`, and it is **deliberately not bundled into the accounting release**. Full
+exposure inventory, decision and rejected alternatives: `PHASE421_SECURITY_DIAGNOSTICS_ENDPOINT.md`.
+
+What this asks of you:
+
+| # | Action | Notes |
+|---|---|---|
+| 7.1 | Review the security commit on its own | Different risk from the accounting changes; do not merge the two approvals |
+| 7.2 | Deploy it only with `CRON_SECRET` already present | If the secret is absent the endpoint is `401` to everyone, owner included — correct, but it must not be mistaken for a broken deploy |
+| 7.3 | Record the three probes from §6a–§6c of the security document | `401` anonymous, `200` with the secret, `401` with a wrong one |
+
+Until 7.3 is recorded, SEC-1's verdict is `IMPLEMENTED — AWAITING SEPARATE DEPLOY APPROVAL`.
+
+---
+
+## §8 — What "done" looks like
 
 | Defect | Closes when |
 |---|---|
@@ -156,6 +175,7 @@ redeploy.
 | C-2 | §1 confirmed: `200` from the refresh, freshness < 15 min, 0 BLOCKED lines in the worker log |
 | H-4 | §2 confirmed: v9.5 start-up line, and a close survives a terminal restart |
 | M-6 | §1 then §5: `warnHours = 0.5`, a 4.4 h-stale layer reads `WARNING` |
+| SEC-1 | §7 confirmed: anonymous `401`, secret `200`, wrong secret `401` |
 | Everything else | Already closed by code + regression test in this repository (`npm run test:phase42`) |
 
 Then re-run `PHASE42_1_PRODUCTION_VERIFICATION.md` §9 and replace the verdict with the observed state. Until

@@ -81,6 +81,13 @@ select max(updated_at)                                  as last_refresh,
 **Pass:** `age` < 15 minutes with `execution_linked > 0`.
 **On 2026-11-13 the observed value was `age ≈ 4.4 h` with the row count pinned — a fail.**
 
+> **Which scheduler this measures.** The 10-minute cadence is the **VPS worker**
+> (`workers/scalper.mjs`, `RECON_REFRESH_MS = 10 * 60_000`). The only in-repo Vercel schedule for this
+> path is `0 4 * * *` (daily) — the Hobby plan does not honour sub-daily schedules, which is exactly why
+> the worker owns the tick. So `age < 15 min` is achievable only while the worker is running *and*
+> authenticated; a `200` from 2b with a stale `age` in 2a means the worker is not ticking, not that the
+> secret is wrong.
+
 ```bash
 # 2b. Does the refresh endpoint accept the configured secret?
 curl -sS -o /dev/null -w '%{http_code}\n' \
@@ -240,7 +247,11 @@ grep -c "UNKNOWN DAILY P&L" <deployment function log>
 
 ```bash
 # 7a. What the integrity endpoint says it used.
-curl -sS "<deployment>/api/production-integrity" | jq '.reconciliation | {ageHours, warnHours, status}'
+#     SEC-1: the endpoint is authenticated. Anonymous callers get 401 and no data;
+#     use the operator secret (or an admin session token). See
+#     PHASE421_SECURITY_DIAGNOSTICS_ENDPOINT.md.
+curl -sS -H "Authorization: Bearer $CRON_SECRET" \
+  "<deployment>/api/production-integrity" | jq '.reconciliation | {ageHours, warnHours, status}'
 ```
 
 **Before opt-in:** `warnHours` must be `6` — identical to the pre-4.2.1 behaviour, nothing changed.

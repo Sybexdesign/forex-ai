@@ -8,11 +8,30 @@
 // evidence is another thing to distrust.
 //
 // Statuses: HEALTHY | INCOMPLETE | WARNING | FAILED | INSUFFICIENT_DATA
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// SEC-1 — AUTHENTICATED (Phase 4.2.1, separate decision, separate release)
+//
+// Read-only is not the same as public. This endpoint used to answer anyone who
+// knew the URL with the firm's per-UK-hour win rates, net, profit factor, max
+// drawdown and consecutive losses, the accounting-completeness counts, the
+// reconciliation layer's age, the order-authority lane tallies, AND
+// `cronSecretConfigured` — which tells a stranger whether the scheduler is
+// currently blocked. It also echoed raw PostgREST error text on failure.
+//
+// It is an operator evidence tool: no UI page, no `vercel.json` cron and no
+// worker calls it. So the payload is now gated on either the operator secret
+// (`Authorization: Bearer $CRON_SECRET`, timing-safe) or an authenticated admin
+// session — the same convention `/api/admin/users` already uses. Unauthenticated
+// callers get a 401 whose body contains nothing derived from data. See
+// PHASE421_SECURITY_DIAGNOSTICS_ENDPOINT.md for the exposure inventory and the
+// decision record.
 // ─────────────────────────────────────────────────────────────────────────────
 export const dynamic = 'force-dynamic'
 
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { getAdminClient } from '@/lib/supabase'
+import { classifyDiagnosticsCaller, restrictedDiagnosticsBody } from '@/lib/diagnostics-auth.mjs'
 import { buildEvidence } from '@/lib/execution-evidence.mjs'
 import { ukOffsetMinutes } from '@/lib/uk-time.mjs'
 import { buildScopedAnalytics } from '@/lib/analytics-metrics.mjs'
@@ -21,6 +40,28 @@ import { reconStatus, reconWarnHours } from '@/lib/integrity-thresholds.mjs'
 
 const WINDOW_DAYS = 120
 const EVIDENCE_LIMIT = 3000
+
+// Mirrors `app/api/admin/users/route.ts`: a signed-in session is only an admin
+// if it belongs to this address. Kept as a literal for the same reason the admin
+// route keeps one — an env-driven allow-list that silently reads empty would
+// lock the owner out of their own diagnostics.
+const ADMIN_EMAIL = 'sybexdesigns@gmail.com'
+
+/**
+ * Resolve a candidate session token to an admin email, or null.
+ *
+ * This is the only part of authorisation that needs the database, so it stays in
+ * the route: `lib/diagnostics-auth.mjs` classifies, the route verifies. Any
+ * error, including a Supabase timeout, denies.
+ */
+async function verifyAdminSession(token: string): Promise<string | null> {
+  try {
+    const { data: { user } } = await getAdminClient().auth.getUser(token)
+    return user?.email === ADMIN_EMAIL ? user.email : null
+  } catch {
+    return null
+  }
+}
 
 type Status = 'HEALTHY' | 'INCOMPLETE' | 'WARNING' | 'FAILED' | 'INSUFFICIENT_DATA'
 
@@ -36,7 +77,29 @@ async function countOf(build: (q: any) => any): Promise<number | null> {
   } catch { return null }
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  // ── SEC-1: authorise BEFORE any read ─────────────────────────────────────
+  // Ordering is the control. The gate sits above every query so an
+  // unauthenticated caller cannot make the endpoint touch the database, time
+  // the response, or read anything through the failure path.
+  const caller = classifyDiagnosticsCaller({ headers: req.headers, env: process.env })
+  let authorisedBy: 'operator_secret' | 'admin_session' | null =
+    caller.method === 'operator_secret' && caller.authorised ? 'operator_secret' : null
+
+  if (!authorisedBy && caller.method === 'admin_jwt') {
+    const admin = await verifyAdminSession(caller.token)
+    if (admin) authorisedBy = 'admin_session'
+  }
+
+  if (!authorisedBy) {
+    // 401 with no body content derived from data. `WWW-Authenticate` is
+    // accurate here: credentials were missing or not recognised.
+    return NextResponse.json(restrictedDiagnosticsBody(), {
+      status: 401,
+      headers: { 'WWW-Authenticate': 'Bearer realm="production-integrity"', 'Cache-Control': 'no-store' },
+    })
+  }
+
   try {
     const admin = getAdminClient()
     const since = new Date(Date.now() - WINDOW_DAYS * 86400_000).toISOString()
@@ -259,6 +322,9 @@ export async function GET() {
     return NextResponse.json({
       generatedAt: new Date().toISOString(),
       windowDays: WINDOW_DAYS,
+      // Which credential opened the payload, so a log line and a response can be
+      // matched up when two people are looking at the same endpoint.
+      authorisedBy,
       readOnly: true,
       connectedToTradeAuthority: false,
       overallStatus: checks.some((c) => c.status === 'FAILED') ? 'FAILED'
@@ -288,12 +354,18 @@ export async function GET() {
       },
     })
   } catch (error: any) {
-    console.error('[production-integrity]', error?.message)
+    // Reached only by an authorised caller. The raw driver text is logged but
+    // also returned as `detail`, deliberately separate from the stable `error`
+    // code — PostgREST messages carry table and column names, so they are for
+    // the operator's eyes, not for a shared screenshot.
+    console.error(`[production-integrity] inspection failed (authorisedBy=${authorisedBy})`, error?.message)
     return NextResponse.json({
       generatedAt: new Date().toISOString(),
+      authorisedBy,
       readOnly: true,
       overallStatus: 'FAILED',
-      error: error?.message || 'inspection failed',
+      error: 'inspection failed',
+      detail: error?.message || 'no detail',
     }, { status: 500 })
   }
 }
