@@ -287,3 +287,98 @@ the honest verdict remains **PARTIALLY IMPLEMENTED — OWNER ACTIONS REQUIRED**.
 - Did not convert unknown P&L into £0/$0 anywhere — the new paths return `null` and
   the UI renders an em dash.
 
+
+---
+
+## 12. Deployment record — 2026-11-16T21:14Z
+
+Pushed and deployed at the owner's explicit request. This section **supersedes §2's
+"not pushed"** and narrows §1: the *status endpoint* is now verified in production;
+everything else in §8 remains blocked.
+
+### 12.1 Git
+
+```
+git push origin main
+  6c89bfe..822b50b  main -> main      (5 commits: 00cd0ab SEC-1 … 822b50b docs)
+```
+
+### 12.2 Vercel — deployed automatically by the Git integration
+
+Two projects build from this repository, both were created by `vercel[bot]` for
+`822b50b` within seconds of the push, and **both report `success`**:
+
+| Project | Deployment URL | State |
+|---|---|---|
+| Production – `forex-ai` | `https://forex-ksq5z6ir9-sybexdesigns-projects.vercel.app` | success |
+| Production – `forex-work` | `https://forex-work-eybi6iz13-sybexdesigns-projects.vercel.app` | success |
+
+Production alias: **`https://forex-ai-delta.vercel.app`** (repo homepage).
+
+No CLI deploy was used: the stored Vercel CLI token in
+`~/Library/Application Support/com.vercel.cli/auth.json` is **expired**
+(`{"invalidToken": true}`, HTTP 403), and no `VERCEL_TOKEN` is present. The Git
+integration is the deploy path. **That token should be rotated** — it is also no longer a
+usable credential.
+
+### 12.3 Live probe of the new endpoint (the runbook's step 2)
+
+`GET https://forex-ai-delta.vercel.app/api/trading-session`, 21:15 UTC:
+
+```json
+{"session":{"version":"trading_session_v1","fingerprint":"ts1-bb2efc85",
+ "window":"07:00–16:00 UTC","startHour":7,"endHour":16,"wraps":false,
+ "utcTimestamp":"2026-11-16T21:15:09.120Z","utcHour":21,
+ "eligible":false,"reason":"outside_session",
+ "nextOpen":{"at":"2026-11-17T07:00:00.000Z","label":"07:00 UTC","utcDate":"2026-11-17","inMinutes":585},
+ "nextClose":null},
+ "source":"saved-strategy"}
+```
+
+`userId=c755a8f2…` → `window:"07:00–20:00 UTC"`, `reason:"outside_session"`.
+`userId` omitted → `source:"default-strategy"`, `07:00–20:00`.
+Unknown `userId` → `source:"default-strategy"` (no row ⇒ `DEFAULT_STRATEGY`, never 24h).
+
+This confirms in production: the new route is deployed, the **saved** row is the
+authority, per-user windows are honoured, unknown users fail to the default rather than
+to an open window, and next-open maths is correct.
+
+### 12.4 Saved windows read from production before deploying (safety pre-check)
+
+The gate went live only after confirming no legacy `0→23` row exists:
+
+| user_id | sessionStart | sessionEnd |
+|---|---|---|
+| `2fbdacfc…` | 7 | 16 |
+| `17035955…` | 7 | 16 |
+| `c755a8f2…` | 7 | 20 |
+
+Therefore the "legacy `0→23` blocks 23:00–23:59" behaviour change flagged in §1 does
+**not** affect current production data.
+
+### 12.5 What is now enforcing, and what is still not
+
+**Live now (Vercel):** `/api/orders` (pre-check + final gate), `/api/scalper/signal`
+(before AI), `/api/strategy` validation, `/api/trading-session`, and the UI status panel.
+
+**Live consequence to be aware of:** the VPS worker still runs the *old* code, but every
+`/api/scalper/signal` it requests now passes through the deployed gate. Its AI generation
+therefore stops outside 07:00–20:00 / 07:00–16:00 UTC **as of this deploy**, even before
+the worker code is updated. That is the intended enforcement, not a fault — but it is a
+real change in spend and cadence that starts now.
+
+**Still not live:** R-1/R-2/R-3 (patch unapplied), any 24/7 observability assertion on the
+worker (needs the worker redeploy), EA v9.5, and any net-P&L proof on a genuine close.
+
+### 12.6 Runbook status
+
+| Step | State |
+|---|---|
+| 1. Deploy | ✅ done (§12.2) |
+| 2. `/api/trading-session` probe | ✅ done (§12.3) |
+| 3. Out-of-hours order → 422 | ⬜ not attempted — would need an authenticated POST and is **not** safe to fake |
+| 4. In-hours order unchanged | ⬜ blocked until the window opens (07:00 UTC) |
+| 5. Worker log + `worker_logs` | ⬜ owner (VPS) |
+| 6. Genuine close after patch | ⬜ blocked (§8 items 1–4) |
+| 7. `test:phase42` regression | ✅ exit 0 on this commit |
+
