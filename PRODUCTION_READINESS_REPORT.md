@@ -386,7 +386,7 @@ worker (needs the worker redeploy), EA v9.5, and any net-P&L proof on a genuine 
 
 ---
 
-## 13. Broker Connection page now reflects EA v9.5 — 2026-11-17
+## 13. Broker Connection page now reflects EA v9.5 — 2026-11-16T21:30Z
 
 ### 13.1 The defect
 
@@ -445,7 +445,27 @@ per-entry stamp does — which is exactly why the page reads `openPositions` and
 | `public/SybexForexAI_EA_v9.5.mq5` exists | ✅ asserted by the test, so the link cannot 404 |
 | Page contains v9.3.1 anywhere | ✅ no (`grep` + test) |
 
-### 13.5 What this does NOT claim
+### 13.5 Live probe of the deployed bundle
+
+Deployed by the Git integration on push (`67be224`). The page is a lazy client chunk,
+so a plain HTML fetch proves nothing; the probe walks root HTML → root chunks →
+async chunk refs and greps every file for the new strings, plus the stale link that
+must have disappeared. Run at 21:29Z (before the new build was served) and 21:30Z
+(after):
+
+| Marker | 21:29Z | 21:30Z |
+|---|---|---|
+| root chunk fingerprint | `7eaa482b…` | `becbb20e…` (changed ⇒ new build served) |
+| `BROKER-DEAL ACCOUNTING` | 0 | **1** |
+| `closes gross-only` | 0 | **1** |
+| `EA build not reported` | 0 | **1** |
+| stale `SybexForexAI_EA_v9.3.1.mq5` link | 1 | **0** |
+
+The same probe run against the old deployment found the stale link and none of the new
+strings, so the check discriminates rather than matching everything.
+
+### 13.6 What this does NOT claim
+
 
 The page states which build the product **requires** and which build the terminal
 **last reported**. It does not prove v9.5 is compiled, attached or running — that remains
