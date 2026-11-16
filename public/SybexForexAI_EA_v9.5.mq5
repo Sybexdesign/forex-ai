@@ -1,0 +1,1715 @@
+//+------------------------------------------------------------------+
+//| SybexForexAI Balance Sync EA v9.5                                |
+//| Posts DIRECTLY to Supabase RPC -- bypasses Vercel entirely.      |
+//| v5 fix: ORDER_FILLING_RETURN (IOC caused all orders to reject).  |
+//| v6 fix: split fast order-poll (2s) from heavy data sync (10s)    |
+//|         so scalp orders are picked up in ~2s instead of ~30s.    |
+//| v7 add: modify_sl command (post-entry trade management layer)    |
+//|         close command now uses ticket when available (precise)   |
+//|         fixed: close/modify_sl no longer skipped by lots>0 guard |
+//| v7.1 fix: SymbolSuffix input for brokers using .s/.m/.r suffixes |
+//| v8 add: in-EA Profit Protection Layer (BE/partial/trail/decay)   |
+//| v8.1 fix: 6 profit protection improvements                       |
+//| v9 add: closedPositions reporting                                |
+//|   When MT5 closes a trade (TP/SL/profit-protection/manual),      |
+//|   the EA now detects the closure, reads P/L from deal history,   |
+//|   and reports it in the next sync payload as closedPositions.    |
+//|   The server uses this to mark DB trades WIN/LOSS and record      |
+//|   pl_usd — fixing daily-loss tracking for auto-traded sessions.  |
+//| v9.2 update: Profit Target formula matching app logic            |
+//|   Formula: profitCloseAmount = ProfitFixedUsd × (ProfitTargetPct / 100)
+//|   EA now receives both components from PULL and computes the      |
+//|   close threshold itself — identical to app-side calculation.    |
+//| v9.3.1 change: native MT5 position-ticket propagation            |
+//|   completedOrders now also reports the native POSITION_TICKET so  |
+//|   the server can persist the SAME identity the account snapshot   |
+//|   exposes (openPositions[].ticket). Order logic, lot sizing,      |
+//|   SL/TP, signals and magic-number behaviour are UNCHANGED.        |
+//| v9.5 add: restart recovery + close provenance + version in state  |
+//|   THREE defects, all about the EA being unable to answer a        |
+//|   question about its own behaviour:                               |
+//|                                                                  |
+//|   1. RESTART DROPS CLOSES (P-J / defect H-4). Closure detection   |
+//|      compared "positions open at the last snapshot" with          |
+//|      "positions open now". On restart that snapshot is empty, so  |
+//|      ANY position that closed while the terminal was off,         |
+//|      reconnecting, or over a weekend gap was never reported: the  |
+//|      row stayed OPEN in the database forever and the drawdown     |
+//|      that closed it was invisible to every risk limit.            |
+//|      RecoverOfflineCloses() now reads the account's deal history  |
+//|      from a PERSISTED watermark and reports those closes,         |
+//|      labelled as recovered, so nobody mistakes a reconstructed    |
+//|      close for a witnessed one.                                   |
+//|   2. NO PROVENANCE (P-I). A close seen live and a close rebuilt   |
+//|      from history looked identical in the payload. Each closed    |
+//|      entry now carries `provenance` = ea_observed|ea_recovered.   |
+//|   3. THE RUNNING BUILD WAS UNIDENTIFIABLE FROM STORED STATE       |
+//|      (A-7). `eaVersion` lived only at payload top level, and the  |
+//|      app's fixed-key configuration write-back drops it, so a flat |
+//|      account could not distinguish "v9.4 deployed and flat" from  |
+//|      "old build still running". Every position entry now carries |
+//|      eaVersion + executionPayloadVersion, so the STORED state     |
+//|      answers the question by itself.                              |
+//|                                                                  |
+//| Order logic, lot sizing, SL/TP, profit protection, signals, magic |
+//| number and every existing payload field are UNCHANGED.            |
+//+------------------------------------------------------------------+
+#property strict
+// Positive build identification. MetaTrader shows this under EA
+// Properties -> Version, and it is how an operator proves the attached
+// EX5 is the ticket-propagating build rather than a stale compile.
+#property version   "9.50"
+// Cosmetic version label only — no behaviour is attached to this string.
+#property description "SybexForexAI EA v9.5 -- deal-level accounting + restart close recovery (recovered closes labelled, never silently invented)"
+
+//--- Inputs -----------------------------------------------------------
+input string WebhookToken        = "c4fdfa3e21314a9fbf57fd7b3ffa30c4";
+input string SymbolSuffix        = "";   // broker symbol suffix, e.g. ".s" for Exness
+input int    OrderPollSeconds    = 2;    // how often to check for new pending orders
+input int    DataSyncSeconds     = 10;   // how often to push full market data
+input int    CandleBars          = 200;
+input int    CandleBarsHTF       = 100;
+input int    MagicNumber         = 20260001;
+input int    SlippagePoints      = 10;
+input ENUM_ORDER_TYPE_FILLING FillMode = ORDER_FILLING_RETURN;
+
+// v9.7 - HARD LOT CEILING
+// Execution-layer backstop: any pending order whose lots exceed MaxLots is
+// rejected in-EA and reported back as failed. Mirrors MAX_LOTS (10) in
+// lib/trade-levels.ts, which the position-size calculator, the orders route,
+// and the MT5 Direct adapter all enforce. Keep this input in sync with that
+// constant — it is the final gate before OrderSend.
+input double MaxLots             = 10.0;
+
+
+// v8.1 FIX - MIN HOLD TIME
+input int    MinHoldSeconds      = 60;   // no BE / trail / decay until trade is this old
+
+// v9.4 - DECAY EXIT MIN PEAK ($-cushion needed before decay activates)
+// Added after a +$14 → -$2.13 fill: decay triggered at the 50% level ($7) but
+// executed below zero due to ~2s MT5 queue lag. Setting the gate at $20 means
+// the 50% target ($10) survives typical XAU slippage of $1-3 per close.
+input double DecayMinPeakUsd     = 20.0;
+
+// v9.5 - TRAIL ACTIVATION MIN PROFIT (USD)
+// Added 2026-06-16 after a +$9.63/100s exit on a XAU BUY: ATR-trail tightened
+// SL into +5-7 pips of profit and a small pullback closed before the EA's
+// fixed-USD target ($37.50 trigger at $50 × 75%) could fire. Trail now waits
+// for the trade to clear this many unrealised USD before any SL move. Mirror
+// of TRAIL_MIN_PROFIT_USD in lib/trade-manager.ts — both layers must agree.
+// Set to 0 to disable the gate and restore pre-v9.5 behaviour.
+input double TrailMinUsd         = 15.0;
+
+// v9.6 - PEAK-BE THRESHOLD (USD)
+// Added 2026-06-16 to plug the gap between TrailMinUsd ($15) and the decay-exit
+// min peak ($20). Trades peaking at $8-$19 had no protection — peak +$14 and
+// +$9 fills on 2026-06-16 13:45 round-tripped to -$55 / -$60. If peak reaches
+// this value AND profit later returns to ≤ $0, close immediately so we lock
+// roughly break-even instead of riding the reversal to SL. Mirror of
+// PEAK_BE_THRESHOLD_USD in lib/trade-manager.ts. Set to 0 to disable.
+input double PeakBeThreshold     = 8.0;
+
+// v8.1 FIX - SPREAD + SESSION PROTECTION
+input int    MaxSpreadPips       = 30;   // skip SL actions if spread exceeds this
+input bool   UseRolloverFilter   = true; // skip actions during broker rollover 21:55-22:05
+
+// v9.2 PROFIT TARGET — formula: profitCloseAmount = ProfitFixedUsd × (ProfitTargetPct / 100)
+// e.g. ProfitFixedUsd=1.00, ProfitTargetPct=50 → nominal close at $0.50.
+// ProfitBufferPct adds a slippage cushion: actual trigger = closeAmount × (1 + buffer/100)
+// e.g. buffer=10 → trigger at $0.55, ensuring close fills above $0.50 after execution delay.
+// Both USD/pct values are also updated dynamically from app PULL response every 1s.
+// 0 = disabled (ProfitFixedUsd=0 turns off the entire profit target system).
+input double ProfitFixedUsd      = 0;    // base fixed USD target
+input int    ProfitTargetPct     = 75;   // percentage of fixed target to close at
+input int    ProfitBufferPct     = 10;   // slippage buffer: trigger at closeAmount × (1 + buffer%)
+
+string SYMBOLS[] = {"EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","XAGUSD","USDCAD","USDCHF","NZDUSD","GBPJPY","EURJPY"};
+
+//--- Constants --------------------------------------------------------
+string SYNC_URL = "https://lfurosnmkwvqtlifggaa.supabase.co/rest/v1/rpc/mt5_webhook_sync";
+string ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxmdXJvc25ta3d2cXRsaWZnZ2FhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjQ4MzEsImV4cCI6MjA5MzMwMDgzMX0.ZWxFA-D57GqObQM_jSQ2PvNbqfxPOY4YBd__XZiFeWA";
+
+//--- Globals ----------------------------------------------------------
+int    g_totalSymbols    = 0;
+string g_completedJson   = "[]";
+int    g_syncCounter     = 0;
+int    g_pollCounter     = 0;   // counts 1s ticks; PULL runs every g_pollEveryN ticks
+int    g_pollEveryN      = 2;   // = OrderPollSeconds (recalc in OnInit)
+double g_profitFixedUsd  = 0;   // updated from app PULL; base USD target
+int    g_profitTargetPct = 75;  // updated from app PULL; % of fixed target
+int    g_syncEveryN      = 10;  // = DataSyncSeconds (recalc in OnInit)
+
+//+------------------------------------------------------------------+
+//  v9: Closed Position Tracking                                      |
+//  Snapshot open positions before each timer tick. On next tick,     |
+//  compare to current list. Disappeared tickets are read from MT5    |
+//  deal history to get actual P/L and close price.                   |
+//+------------------------------------------------------------------+
+
+struct PrevPos {
+   ulong  ticket;
+   string symbol;    // raw broker symbol (may include suffix)
+   string direction; // "BUY" or "SELL"
+   double openPrice;
+   double lots;
+};
+
+PrevPos g_prevPos[];
+int     g_prevPosCount = 0;
+string  g_closedJson   = "[]";
+
+//--- Save current open positions for comparison on next tick -------
+void SnapshotOpenPositions()
+{
+   int n = PositionsTotal();
+   if(ArrayResize(g_prevPos, MathMax(n, 1)) < 0) return;
+   g_prevPosCount = 0;
+
+   for(int i = 0; i < n; i++)
+   {
+      ulong t = PositionGetTicket(i);
+      if(t == 0) continue;
+      g_prevPos[g_prevPosCount].ticket    = t;
+      g_prevPos[g_prevPosCount].symbol    = StripSuffix(PositionGetString(POSITION_SYMBOL));
+      g_prevPos[g_prevPosCount].direction =
+         (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      g_prevPos[g_prevPosCount].openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      g_prevPos[g_prevPosCount].lots      = PositionGetDouble(POSITION_VOLUME);
+      g_prevPosCount++;
+   }
+}
+
+//+------------------------------------------------------------------+
+//  v9.4 - BROKER DEAL-LEVEL ACCOUNTING                              |
+//+------------------------------------------------------------------+
+// A position does not necessarily close in one deal. A partial close emits
+// one DEAL_ENTRY_OUT per leg, and a stop-out emits DEAL_ENTRY_OUT_BY.
+// v9.3.1 read only the FIRST DEAL_ENTRY_OUT it found, `break`ed out of the
+// loop, and folded DEAL_PROFIT + DEAL_COMMISSION + DEAL_SWAP into a single
+// number named "profit". The server therefore received a lump it could not
+// decompose and could not verify, and correctly refused to call it a net
+// figure - accounting_complete stayed false on every production row.
+//
+// This aggregates EVERY deal for the position and transmits the components
+// separately so the server can derive and PROVE net P&L. Values are taken
+// SIGNED exactly as the broker reports them: Exness MT5 reports commission and
+// swap as negative charges and positive credits. Nothing here is estimated -
+// if the deal history is not available yet the function returns false and the
+// caller retries on the next sync instead of guessing.
+
+struct DealAgg
+{
+   double   gross;        // sum of DEAL_PROFIT
+   double   commission;   // sum of DEAL_COMMISSION (signed)
+   double   swap;         // sum of DEAL_SWAP       (signed)
+   double   fee;          // sum of DEAL_FEE        (signed)
+   double   volClosed;    // volume of exit legs
+   double   volEntry;     // volume of entry legs
+   double   lastClose;    // price of the LAST exit deal
+   datetime lastTime;     // time of the LAST exit deal
+   int      dealCount;    // every deal touching this position
+   int      exitDeals;    // exit legs seen
+   bool     partial;      // closed volume < entry volume
+   bool     ok;           // at least one deal and one exit leg
+   string   tickets;      // comma-joined deal tickets (audit trail)
+};
+
+#define ACCT_LOOKBACK_SEC 604800   // 7 days - bounded, survives an EA restart
+
+bool AggregatePositionDeals(ulong posTicket, DealAgg &agg)
+{
+   agg.gross = 0.0; agg.commission = 0.0; agg.swap = 0.0; agg.fee = 0.0;
+   agg.volClosed = 0.0; agg.volEntry = 0.0; agg.lastClose = 0.0;
+   agg.lastTime = 0; agg.dealCount = 0; agg.exitDeals = 0;
+   agg.partial = false; agg.ok = false; agg.tickets = "";
+
+   datetime from = TimeCurrent() - (datetime)ACCT_LOOKBACK_SEC;
+   if(!HistorySelect(from, TimeCurrent() + 120))
+      return false;
+
+   int total = HistoryDealsTotal();
+   for(int k = 0; k < total; k++)
+   {
+      ulong dt = HistoryDealGetTicket(k);
+      if(dt == 0) continue;
+      if((ulong)HistoryDealGetInteger(dt, DEAL_POSITION_ID) != posTicket) continue;
+
+      long   entry = HistoryDealGetInteger(dt, DEAL_ENTRY);
+      double vol   = HistoryDealGetDouble(dt, DEAL_VOLUME);
+
+      agg.gross      += HistoryDealGetDouble(dt, DEAL_PROFIT);
+      agg.commission += HistoryDealGetDouble(dt, DEAL_COMMISSION);
+      agg.swap       += HistoryDealGetDouble(dt, DEAL_SWAP);
+      agg.fee        += HistoryDealGetDouble(dt, DEAL_FEE);
+      agg.dealCount++;
+
+      if(agg.tickets != "") agg.tickets += ",";
+      agg.tickets += IntegerToString((long)dt);
+
+      if(entry == DEAL_ENTRY_IN)
+         agg.volEntry += vol;
+
+      // Every exit flavour counts: normal, broker-forced, and reversal.
+      if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY || entry == DEAL_ENTRY_INOUT)
+      {
+         agg.exitDeals++;
+         agg.volClosed += vol;
+         double p = HistoryDealGetDouble(dt, DEAL_PRICE);
+         if(p > 0.0) agg.lastClose = p;
+         datetime t = (datetime)HistoryDealGetInteger(dt, DEAL_TIME);
+         if(t >= agg.lastTime) agg.lastTime = t;
+      }
+   }
+
+   agg.ok = (agg.dealCount > 0 && agg.exitDeals > 0);
+   agg.partial = (agg.volEntry > 0.0 && agg.volClosed > 0.0
+                  && agg.volClosed < agg.volEntry - 0.00000001);
+   return agg.ok;
+}
+
+
+//+------------------------------------------------------------------+
+//  v9.5 - RESTART CLOSE RECOVERY (P-J / defect H-4)                 |
+//+------------------------------------------------------------------+
+// THE DEFECT
+// BuildClosedPositionsJSON() answers one question: "which of the tickets I
+// snapshotted last tick are gone now?" That is a correct answer to a narrower
+// question than the business needs. After a restart the snapshot is empty
+// (g_prevPosCount = 0), so:
+//   * a position closed while the terminal was off,
+//   * a position closed while MT5 was reconnecting,
+//   * a position closed over the weekend gap,
+// ...is never reported at all. The database row stays OPEN indefinitely, the
+// realised loss never reaches pl_usd, and therefore never reaches the daily-loss
+// limit that is supposed to stop the next trade. The defect hides losses exactly
+// when the terminal was least healthy.
+//
+// THE CORRECTION
+// On start-up, read the account's deal history from a PERSISTED watermark and
+// report every closed position that has not been delivered yet. Three rules keep
+// this honest:
+//
+//   1. A recovered close is LABELLED. `provenance` says ea_recovered, never
+//      ea_observed. A rebuild from history is not a witness statement, and the
+//      server (and any reviewer) must be able to tell them apart.
+//   2. The watermark advances ONLY after a successful push. A failed push keeps
+//      the queue in memory and retries next sync, so a network blip cannot lose
+//      a close - the same failure mode we are fixing.
+//   3. Nothing is invented. If the deal history is not available for a position
+//      (broker purged it, or it lies outside the bounded lookback), it is NOT
+//      reported with guessed numbers. It is logged and left alone.
+//
+// The watermark lives in a terminal GlobalVariable keyed by account login and
+// magic, so it survives restarts without a file and cannot leak between accounts.
+// Historical data is NOT modified. Order logic is untouched.
+//+------------------------------------------------------------------+
+#define RECOVERY_GVAR_PREFIX "SYBEX_LASTCLOSE_"
+#define RECOVERY_MAX_REPORT  50   // bounded: a week of history cannot flood the payload
+
+datetime g_recoveryFrom       = 0;   // earliest deal time NOT yet delivered
+datetime g_recoveryPendingTo  = 0;   // watermark to persist once delivered
+datetime g_lastDeliveredClose = 0;   // live closes also advance the watermark
+string   g_recoveredItems[];         // JSON objects awaiting delivery
+int      g_recoveredCount     = 0;
+bool     g_recoveryRan        = false;
+
+//--- Watermark identity: per account + per magic number ---------------
+string RecoveryGvarName()
+{
+   return RECOVERY_GVAR_PREFIX
+        + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_"
+        + IntegerToString((long)MagicNumber);
+}
+
+//--- Load the watermark, or seed it at the start of the bounded window --
+void LoadRecoveryWatermark()
+{
+   string name = RecoveryGvarName();
+   datetime floorTime = TimeCurrent() - (datetime)ACCT_LOOKBACK_SEC;
+
+   if(GlobalVariableCheck(name))
+   {
+      g_recoveryFrom = (datetime)(long)GlobalVariableGet(name);
+      // A watermark older than the bounded lookback cannot be honoured - the
+      // broker may no longer hold those deals. Clamp rather than ask for data
+      // that does not exist.
+      if(g_recoveryFrom < floorTime) g_recoveryFrom = floorTime;
+   }
+   else
+   {
+      g_recoveryFrom = floorTime;
+      GlobalVariableSet(name, (double)(long)g_recoveryFrom);
+   }
+   g_recoveryPendingTo = g_recoveryFrom;
+   Print("[recovery] watermark for ", name, " = ",
+         TimeToString(g_recoveryFrom, TIME_DATE|TIME_SECONDS),
+         " (lookback capped at ", ACCT_LOOKBACK_SEC, "s)");
+}
+
+//--- Persist the watermark. Called ONLY after a successful push. ------
+void CommitRecoveryWatermark()
+{
+   datetime target = g_recoveryPendingTo;
+   if(g_lastDeliveredClose > target) target = g_lastDeliveredClose;
+
+   if(target > g_recoveryFrom)
+   {
+      GlobalVariableSet(RecoveryGvarName(), (double)(long)target);
+      g_recoveryFrom = target;
+   }
+   // The queue is cleared only after delivery: a failed push keeps these closes
+   // for the next sync instead of dropping them.
+   ArrayResize(g_recoveredItems, 0);
+   g_recoveredCount    = 0;
+   g_recoveryPendingTo = g_recoveryFrom;
+}
+
+//--- Is this position still open? (a recovered close must be closed) ---
+bool PositionIsStillOpen(ulong posTicket)
+{
+   int n = PositionsTotal();
+   for(int i = 0; i < n; i++)
+      if(PositionGetTicket(i) == posTicket) return true;
+   return false;
+}
+
+
+//--- One recovered close as a payload object (labelled ea_recovered) --
+string BuildRecoveredCloseJSON(ulong posTicket, string sym, string dir,
+                               double openPrice, double lots, DealAgg &agg)
+{
+   int dp = (int)SymbolInfoInteger(sym + SymbolSuffix, SYMBOL_DIGITS);
+   if(dp == 0) dp = 5;
+   double netProfit = agg.gross + agg.commission + agg.swap + agg.fee;
+
+   return "{\"ticket\":\""      + IntegerToString((long)posTicket) + "\""
+        + ",\"symbol\":\""      + sym                               + "\""
+        + ",\"type\":\""        + dir                               + "\""
+        + ",\"openPrice\":"     + DoubleToString(openPrice,     dp)
+        + ",\"closePrice\":"    + DoubleToString(agg.lastClose, dp)
+        + ",\"lots\":"          + DoubleToString(lots,          2)
+        + ",\"profit\":"        + DoubleToString(agg.gross,     2)
+        + ",\"grossProfit\":"   + DoubleToString(agg.gross,     2)
+        + ",\"commission\":"    + DoubleToString(agg.commission, 2)
+        + ",\"swap\":"          + DoubleToString(agg.swap,      2)
+        + ",\"fee\":"           + DoubleToString(agg.fee,       2)
+        + ",\"netProfit\":"     + DoubleToString(netProfit,     2)
+        + ",\"dealCount\":"     + IntegerToString(agg.dealCount)
+        + ",\"dealTickets\":\"" + agg.tickets                     + "\""
+        + ",\"volumeClosed\":"  + DoubleToString(agg.volClosed, 2)
+        + ",\"partial\":"       + (agg.partial ? "true" : "false")
+        + ",\"closedAt\":\""    + TimeToString(agg.lastTime, TIME_DATE|TIME_SECONDS) + "\""
+        // v9.5: the fields that make this entry auditable. Provenance says the
+        // close was RECONSTRUCTED from deal history, not witnessed. MFE/MAE are
+        // zero with mfeMaeMeasured=false because no protection state existed
+        // while the terminal was down - zero here means "not measured", and the
+        // server must never read it as a measured excursion.
+        + ",\"mfe\":0.0,\"mae\":0.0"
+        + ",\"provenance\":\"ea_recovered\""
+        + ",\"mfeMaeMeasured\":false"
+        + ",\"executionPayloadVersion\":2"
+        + ",\"eaVersion\":\"9.50\""
+        + "}";
+}
+
+//--- Scan deal history from the watermark; queue undelivered closes ----
+void RecoverOfflineCloses()
+{
+   if(g_recoveryRan) return;      // once per EA start
+   g_recoveryRan = true;
+
+   datetime to = TimeCurrent() + 120;
+   if(!HistorySelect(g_recoveryFrom, to))
+   {
+      Print("[recovery] HistorySelect failed err=", GetLastError(),
+            " - retrying on the next tick rather than guess");
+      g_recoveryRan = false;      // allow a later attempt this session
+      return;
+   }
+
+   int total = HistoryDealsTotal();
+
+   // Collect the distinct positions that have at least one EXIT deal in the
+   // window, with the entry-side facts needed to describe them.
+   ulong    seenIds[];
+   string   seenSym[];
+   string   seenDir[];
+   double   seenOpen[];
+   double   seenLots[];
+   datetime seenLast[];
+   int      seenCount = 0;
+
+   for(int k = 0; k < total; k++)
+   {
+      ulong dt = HistoryDealGetTicket(k);
+      if(dt == 0) continue;
+
+      long  entry = HistoryDealGetInteger(dt, DEAL_ENTRY);
+      bool  isExit = (entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY
+                      || entry == DEAL_ENTRY_INOUT);
+      ulong posId = (ulong)HistoryDealGetInteger(dt, DEAL_POSITION_ID);
+      if(posId == 0) continue;
+
+      datetime dealTime = (datetime)HistoryDealGetInteger(dt, DEAL_TIME);
+
+      int idx = -1;
+      for(int s = 0; s < seenCount; s++)
+         if(seenIds[s] == posId) { idx = s; break; }
+
+      if(idx < 0)
+      {
+         if(!isExit) continue;    // only a position with an exit can be reported
+         idx = seenCount;
+         ArrayResize(seenIds,  idx + 1);
+         ArrayResize(seenSym,  idx + 1);
+         ArrayResize(seenDir,  idx + 1);
+         ArrayResize(seenOpen, idx + 1);
+         ArrayResize(seenLots, idx + 1);
+         ArrayResize(seenLast, idx + 1);
+         seenIds[idx]  = posId;
+         seenSym[idx]  = HistoryDealGetString(dt, DEAL_SYMBOL);
+         seenDir[idx]  = "";
+         seenOpen[idx] = 0.0;
+         seenLots[idx] = 0.0;
+         seenLast[idx] = dealTime;
+         seenCount++;
+      }
+
+      if(dealTime > seenLast[idx]) seenLast[idx] = dealTime;
+
+      if(entry == DEAL_ENTRY_IN)
+      {
+         seenOpen[idx] = HistoryDealGetDouble(dt, DEAL_PRICE);
+         seenLots[idx] = HistoryDealGetDouble(dt, DEAL_VOLUME);
+         long type = HistoryDealGetInteger(dt, DEAL_TYPE);
+         seenDir[idx]  = (type == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+         if(seenSym[idx] == "") seenSym[idx] = HistoryDealGetString(dt, DEAL_SYMBOL);
+      }
+   }
+
+   int queued = 0;
+   for(int s = 0; s < seenCount && queued < RECOVERY_MAX_REPORT; s++)
+   {
+      ulong posId = seenIds[s];
+
+      // Still open -> its close has not happened yet. The live path owns it.
+      if(PositionIsStillOpen(posId)) continue;
+
+      DealAgg agg;
+      if(!AggregatePositionDeals(posId, agg))
+      {
+         Print("[recovery] no deal history for position ", (long)posId,
+               " - NOT reported (no invented numbers)");
+         continue;
+      }
+
+      string dir = seenDir[s];
+      if(dir == "")
+      {
+         // No entry deal inside the window: derive the side from the deals that
+         // are present, so the direction comes from broker data, never assumed.
+         long t0 = 0;
+         for(int k = 0; k < total; k++)
+         {
+            ulong dt = HistoryDealGetTicket(k);
+            if(dt == 0) continue;
+            if((ulong)HistoryDealGetInteger(dt, DEAL_POSITION_ID) != posId) continue;
+            t0 = HistoryDealGetInteger(dt, DEAL_TYPE);
+            break;
+         }
+         dir = (t0 == DEAL_TYPE_SELL || t0 == DEAL_TYPE_SELL_LIMIT
+                || t0 == DEAL_TYPE_SELL_STOP) ? "SELL" : "BUY";
+      }
+
+      string sym = seenSym[s];
+      if(sym == "") sym = "UNKNOWN";
+
+      int at = g_recoveredCount;
+      ArrayResize(g_recoveredItems, at + 1);
+      g_recoveredItems[at] = BuildRecoveredCloseJSON(posId, sym, dir,
+                                                     seenOpen[s], seenLots[s], agg);
+      g_recoveredCount++;
+      queued++;
+
+      if(seenLast[s] > g_recoveryPendingTo) g_recoveryPendingTo = seenLast[s];
+
+      Print("[recovery] queued close pos=", (long)posId, " ", sym, " ", dir,
+            " net=", DoubleToString(agg.gross + agg.commission + agg.swap + agg.fee, 2),
+            " deals=", agg.dealCount,
+            " partial=", (agg.partial ? "yes" : "no"),
+            " closedAt=", TimeToString(agg.lastTime, TIME_DATE|TIME_SECONDS));
+   }
+
+   if(queued == 0)
+      Print("[recovery] no undelivered closes since ",
+            TimeToString(g_recoveryFrom, TIME_DATE|TIME_SECONDS));
+   else
+      Print("[recovery] ", queued, " close(s) recovered from deal history");
+}
+
+//--- The recovered entries as a JSON array ----------------------------
+string BuildRecoveredClosesJSON()
+{
+   if(g_recoveredCount == 0) return "[]";
+   string out = "[";
+   for(int i = 0; i < g_recoveredCount; i++)
+   {
+      if(i > 0) out += ",";
+      out += g_recoveredItems[i];
+   }
+   return out + "]";
+}
+
+//--- Merge live-detected closes with recovered ones -------------------
+string MergeClosedJSON(string liveJson)
+{
+   string rec = BuildRecoveredClosesJSON();
+   if(rec == "[]") return liveJson;
+   if(liveJson == "[]" || liveJson == "") return rec;
+   // liveJson already ends with ']'; drop the leading '[' of the recovered list.
+   return StringSubstr(liveJson, 0, StringLen(liveJson) - 1) + "," + StringSubstr(rec, 1);
+}
+
+
+//--- Detect closed positions since last snapshot; build JSON --------
+string BuildClosedPositionsJSON()
+{
+   // v9.5 (P-J): an empty snapshot is exactly the restart case that used to
+   // return "[]" and lose every close that happened while we were down. The
+   // recovered queue is still delivered here.
+   if(g_prevPosCount == 0) return MergeClosedJSON("[]");
+
+   // Build current open ticket set
+   int   curCount = PositionsTotal();
+   ulong curTickets[];
+   ArrayResize(curTickets, MathMax(curCount, 1));
+   for(int i = 0; i < curCount; i++)
+      curTickets[i] = PositionGetTicket(i);
+
+   // Deal history is re-selected inside AggregatePositionDeals() with a bounded
+   // lookback, so a slow sync or an EA restart cannot silently miss a close.
+   string out  = "[";
+   bool   first = true;
+
+   for(int i = 0; i < g_prevPosCount; i++)
+   {
+      // Still open?
+      bool stillOpen = false;
+      for(int j = 0; j < curCount; j++)
+         if(curTickets[j] == g_prevPos[i].ticket) { stillOpen = true; break; }
+      if(stillOpen) continue;
+
+      ulong closedTicket = g_prevPos[i].ticket;
+
+      // v9.4: aggregate EVERY deal for this position (entry + all exit legs).
+      // v9.3.1 scanned backwards and `break`ed on the first DEAL_ENTRY_OUT, so a
+      // partially-closed position was reported with ONE leg of its P&L and the
+      // remaining deals were silently dropped.
+      DealAgg agg;
+      if(!AggregatePositionDeals(closedTicket, agg))
+      {
+         Print("[acct] no deal history for position ", (long)closedTicket,
+               " - retrying next sync rather than reporting a guess");
+         continue;
+      }
+
+      string sym = g_prevPos[i].symbol;
+      int    dp  = (int)SymbolInfoInteger(sym + SymbolSuffix, SYMBOL_DIGITS);
+      if(dp == 0) dp = 5;
+
+      int piIdx = FindProtState(closedTicket);
+      double mfe = (piIdx >= 0) ? g_prot[piIdx].peakProfit   : 0.0;
+      double mae = (piIdx >= 0) ? g_prot[piIdx].troughProfit : 0.0;
+
+      double netProfit = agg.gross + agg.commission + agg.swap + agg.fee;
+
+      if(!first) out += ",";
+      out += "{\"ticket\":\""       + IntegerToString((long)closedTicket)      + "\""
+           + ",\"symbol\":\""       + sym                                       + "\""
+           + ",\"type\":\""         + g_prevPos[i].direction                   + "\""
+           + ",\"openPrice\":"      + DoubleToString(g_prevPos[i].openPrice, dp)
+           + ",\"closePrice\":"     + DoubleToString(agg.lastClose,          dp)
+           + ",\"lots\":"           + DoubleToString(g_prevPos[i].lots,      2)
+           + ",\"profit\":"         + DoubleToString(agg.gross,       2)
+           + ",\"grossProfit\":"    + DoubleToString(agg.gross,       2)
+           + ",\"commission\":"     + DoubleToString(agg.commission,  2)
+           + ",\"swap\":"           + DoubleToString(agg.swap,        2)
+           + ",\"fee\":"            + DoubleToString(agg.fee,         2)
+           + ",\"netProfit\":"      + DoubleToString(netProfit,       2)
+           + ",\"dealCount\":"      + IntegerToString(agg.dealCount)
+           + ",\"dealTickets\":\""  + agg.tickets                             + "\""
+           + ",\"volumeClosed\":"   + DoubleToString(agg.volClosed,   2)
+           + ",\"partial\":"        + (agg.partial ? "true" : "false")
+           + ",\"closedAt\":\""     + TimeToString(agg.lastTime, TIME_DATE|TIME_SECONDS) + "\""
+           + ",\"mfe\":"            + DoubleToString(mfe,             2)
+           + ",\"mae\":"            + DoubleToString(mae,             2)
+           // v9.5 (P-I / A-7): a live close is a WITNESSED close, and the entry
+           // now says so plus which build reported it. Without these two fields
+           // a v9.4 and a v9.5 payload are byte-identical on a flat account, and
+           // a recovered close is indistinguishable from an observed one.
+           + ",\"provenance\":\"ea_observed\""
+           + ",\"mfeMaeMeasured\":true"
+           + ",\"executionPayloadVersion\":2"
+           + ",\"eaVersion\":\"9.50\""
+           + "}";
+      first = false;
+      // Live closes advance the recovery watermark too, so the next restart does
+      // not re-report what this sync already delivered.
+      if(agg.lastTime > g_lastDeliveredClose) g_lastDeliveredClose = agg.lastTime;
+   }
+
+   return MergeClosedJSON(out + "]");
+}
+
+//+------------------------------------------------------------------+
+//  Profit Protection Layer — state per open position (unchanged v8.1)|
+//+------------------------------------------------------------------+
+
+struct ProtState {
+   ulong    ticket;
+   double   origEntry;
+   double   origSl;
+   double   peakProfit;     // max favorable excursion (USD)
+   double   troughProfit;   // v9.3: max adverse excursion (USD) — most negative profit seen
+   bool     beApplied;
+   bool     partialLocked;
+   datetime openedAt;
+};
+
+ProtState g_prot[];
+int       g_protCount    = 0;
+int       g_protCapacity = 0;
+
+int FindProtState(ulong ticket)
+{
+   for(int i = 0; i < g_protCount; i++)
+      if(g_prot[i].ticket == ticket) return i;
+   return -1;
+}
+
+int EnsureProtState(ulong ticket, double entry, double sl)
+{
+   int i = FindProtState(ticket);
+   if(i >= 0) return i;
+
+   if(g_protCount >= g_protCapacity)
+   {
+      int newCap = (g_protCapacity == 0) ? 20 : g_protCapacity * 2;
+      if(ArrayResize(g_prot, newCap) < 0)
+      {
+         Print("[pp] ERROR: ArrayResize failed, capacity=", g_protCapacity,
+               " — cannot track ticket=", ticket);
+         return -1;
+      }
+      g_protCapacity = newCap;
+      Print("[pp] g_prot expanded to capacity=", g_protCapacity);
+   }
+
+   i = g_protCount++;
+   g_prot[i].ticket        = ticket;
+   g_prot[i].origEntry     = entry;
+   g_prot[i].origSl        = sl;
+   g_prot[i].peakProfit    = 0.0;
+   g_prot[i].troughProfit  = 0.0;   // v9.3: tracks MAE; stays 0 if profit never goes adverse
+   g_prot[i].beApplied     = false;
+   g_prot[i].partialLocked = false;
+   g_prot[i].openedAt      = TimeCurrent();
+   return i;
+}
+
+void PurgeClosedStates()
+{
+   for(int i = g_protCount - 1; i >= 0; i--)
+   {
+      bool open = false;
+      for(int j = 0; j < PositionsTotal(); j++)
+         if(PositionGetTicket(j) == g_prot[i].ticket) { open = true; break; }
+      if(!open)
+      {
+         for(int k = i; k < g_protCount - 1; k++)
+            g_prot[k] = g_prot[k + 1];
+         g_protCount--;
+      }
+   }
+}
+
+string StripSuffix(string sym)
+{
+   int sufLen = StringLen(SymbolSuffix);
+   if(sufLen == 0) return sym;
+   int symLen = StringLen(sym);
+   if(symLen > sufLen && StringSubstr(sym, symLen - sufLen) == SymbolSuffix)
+      return StringSubstr(sym, 0, symLen - sufLen);
+   return sym;
+}
+
+double CalcATR_M5(string symbol)
+{
+   MqlRates rates[];
+   int copied = CopyRates(symbol, PERIOD_M5, 0, 15, rates);
+   if(copied < 2) return 0.0;
+   double sum = 0.0;
+   int    cnt = 0;
+   for(int i = 1; i < copied; i++)
+   {
+      double tr = MathMax(rates[i].high - rates[i].low,
+                  MathMax(MathAbs(rates[i].high - rates[i-1].close),
+                          MathAbs(rates[i].low  - rates[i-1].close)));
+      sum += tr;
+      cnt++;
+   }
+   return cnt > 0 ? sum / cnt : 0.0;
+}
+
+bool IsTrendSufficient(string symbol, bool isBuy)
+{
+   MqlRates r[];
+   int n = CopyRates(symbol, PERIOD_M5, 0, 15, r);
+   if(n < 10) return true;
+
+   double atrRecent = 0.0, atrOlder = 0.0;
+   for(int i = n - 3; i < n; i++)      atrRecent += r[i].high - r[i].low;
+   for(int i = n - 8; i < n - 3; i++) atrOlder  += r[i].high - r[i].low;
+   atrRecent /= 3.0;
+   atrOlder  /= 5.0;
+   if(atrOlder > 0.0 && atrRecent > atrOlder * 1.05) return true;
+
+   double avg5 = 0.0, avg10 = 0.0;
+   for(int i = n - 5;  i < n; i++) avg5  += r[i].close;
+   for(int i = n - 10; i < n; i++) avg10 += r[i].close;
+   avg5  /= 5.0;
+   avg10 /= 10.0;
+   bool aligned = isBuy ? (avg5 > avg10) : (avg5 < avg10);
+   if(aligned) return true;
+
+   return false;
+}
+
+double GetTrailMult(string sym)
+{
+   if(StringFind(sym, "XAU") >= 0) return 1.5;
+   if(StringFind(sym, "XAG") >= 0) return 1.2;
+   if(StringFind(sym, "JPY") >= 0) return 0.5;
+   return 0.5;
+}
+
+double CalcTrailSL(string sym, bool isBuy, double midPx)
+{
+   double atr  = CalcATR_M5(sym);
+   if(atr <= 0.0 || midPx <= 0.0) return 0.0;
+   double mult = GetTrailMult(sym);
+   return isBuy ? midPx - atr * mult : midPx + atr * mult;
+}
+
+double GetPipSize(string sym)
+{
+   if(StringFind(sym, "JPY") >= 0) return 0.01;
+   if(StringFind(sym, "XAU") >= 0) return 0.1;
+   if(StringFind(sym, "XAG") >= 0) return 0.001;
+   return 0.0001;
+}
+
+bool IsHighSpread(string sym)
+{
+   double spread  = SymbolInfoDouble(sym, SYMBOL_ASK) - SymbolInfoDouble(sym, SYMBOL_BID);
+   double pipSize = GetPipSize(sym);
+   return pipSize > 0.0 && (spread / pipSize) > MaxSpreadPips;
+}
+
+bool IsRolloverTime()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   if(dt.hour == 21 && dt.min >= 55) return true;
+   if(dt.hour == 22 && dt.min <= 5)  return true;
+   return false;
+}
+
+bool IsSafeToAct(string sym)
+{
+   if(UseRolloverFilter && IsRolloverTime()) return false;
+   if(IsHighSpread(sym))                     return false;
+   return true;
+}
+
+void RunProfitProtection()
+{
+   // v9.3: PurgeClosedStates() moved to AFTER BuildClosedPositionsJSON() in
+   // OnTimer so MFE/MAE can be read from g_prot[] when reporting closed positions.
+   // Purging before the report would lose the peak/trough data for tickets that
+   // closed during this tick.
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      string sym      = PositionGetString(POSITION_SYMBOL);
+      string rawSym   = StripSuffix(sym);
+      bool   isBuy    = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSl = PositionGetDouble(POSITION_SL);
+      double profit    = PositionGetDouble(POSITION_PROFIT);
+      int    dp        = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+
+      double midPx = isBuy ? SymbolInfoDouble(sym, SYMBOL_BID)
+                           : SymbolInfoDouble(sym, SYMBOL_ASK);
+      if(midPx <= 0.0) continue;
+
+      int si = EnsureProtState(ticket, openPrice, currentSl);
+      if(si < 0) continue;
+
+      int holdSecs = (int)(TimeCurrent() - g_prot[si].openedAt);
+      if(holdSecs < MinHoldSeconds) continue;
+
+      if(!IsSafeToAct(sym)) continue;
+
+      if(profit > g_prot[si].peakProfit)
+         g_prot[si].peakProfit = profit;
+
+      // v9.3 — track most adverse excursion. troughProfit init = 0.0, so the
+      // first negative profit sets it; if price never goes negative, trough
+      // stays 0 (= no adverse excursion). Diverges from the original snippet
+      // (which had `|| trough == 0.0`) — that latch overwrote trough with the
+      // first positive profit sample, mis-reporting MAE on pure-winner trades.
+      if(profit < g_prot[si].troughProfit)
+         g_prot[si].troughProfit = profit;
+
+      double origEntry = g_prot[si].origEntry;
+      double origSl    = g_prot[si].origSl;
+      double riskDist  = MathAbs(origEntry - origSl);
+      if(riskDist < 0.000001) continue;
+
+      double pnlDist = isBuy ? midPx - origEntry : origEntry - midPx;
+      double rMult   = pnlDist / riskDist;
+
+      double newSl   = 0.0;
+      bool   doClose = false;
+
+      if(!g_prot[si].beApplied && rMult >= 0.5)
+      {
+         bool improves = isBuy ? origEntry > currentSl : origEntry < currentSl;
+         if(improves && IsTrendSufficient(sym, isBuy))
+         {
+            newSl = origEntry;
+            g_prot[si].beApplied = true;
+            Print("[pp] ", rawSym, "#", ticket, " BE: R=", DoubleToString(rMult, 2),
+                  " → SL to entry ", DoubleToString(origEntry, dp));
+         }
+         else if(improves)
+            Print("[pp] ", rawSym, "#", ticket, " BE skipped: R=", DoubleToString(rMult, 2), " — choppy market");
+      }
+
+      if(!g_prot[si].partialLocked && rMult >= 1.5)
+      {
+         g_prot[si].partialLocked = true;
+         double lockSl   = isBuy ? origEntry + 0.5 * riskDist : origEntry - 0.5 * riskDist;
+         double baseline = (newSl > 0.0) ? newSl : currentSl;
+         bool   improves = isBuy ? lockSl > baseline : lockSl < baseline;
+         if(improves)
+         {
+            newSl = lockSl;
+            Print("[pp] ", rawSym, "#", ticket, " partial-lock: R=", DoubleToString(rMult, 2),
+                  " → SL=", DoubleToString(lockSl, dp));
+         }
+      }
+
+      // v9.5 — gate trail by TrailMinUsd so the fixed-USD profit target gets
+      // first dibs on shallow wins. Without the gate, ATR×1.5 on XAU tightens
+      // SL into +5-7 pips of profit and small pullbacks close the trade well
+      // before the ProfitFixedUsd × ProfitTargetPct trigger can fire.
+      if(profit > TrailMinUsd)
+      {
+         double trailSl = CalcTrailSL(sym, isBuy, midPx);
+         if(trailSl > 0.0)
+         {
+            bool inProfit = isBuy ? trailSl > origEntry : trailSl < origEntry;
+            double baseline = (newSl > 0.0) ? newSl : currentSl;
+            bool improves   = isBuy ? trailSl > baseline : trailSl < baseline;
+            if(inProfit && improves)
+            {
+               newSl = trailSl;
+               Print("[pp] ", rawSym, "#", ticket, " trail: px=", DoubleToString(midPx, dp),
+                     " profit=$", DoubleToString(profit, 2),
+                     " → SL=", DoubleToString(trailSl, dp));
+            }
+         }
+      }
+
+      if(newSl > 0.0)
+      {
+         int rc = 0;
+         if(!ModifySL(ticket, rawSym, NormalizeDouble(newSl, dp), rc))
+            Print("[pp] ModifySL FAILED ", rawSym, " ticket=", ticket, " retcode=", rc);
+      }
+
+      double peak = g_prot[si].peakProfit;
+
+      // v9.6 — Peak-BE close. Bridges the gap between TrailMinUsd ($15) and
+      // DecayMinPeakUsd ($20). A trade that reached PeakBeThreshold USD then
+      // returned to ≤ $0 has shown the AI direction was initially correct but
+      // the trend reversed — close at current price (≈ entry) to lock BE
+      // instead of riding the round-trip to SL. Evaluated before decay-exit
+      // because decay-exit gate ($20 peak) excludes this band entirely.
+      if(peak >= PeakBeThreshold && profit <= 0.0)
+      {
+         Print("[pp] ", rawSym, "#", ticket, " PEAK-BE-CLOSE: peak=$", DoubleToString(peak, 2),
+               " → profit=$", DoubleToString(profit, 2), " (<=0) — close at current to lock BE held=", holdSecs, "s");
+         doClose = true;
+      }
+
+      // v9.4 — decay only activates after peak ≥ DecayMinPeakUsd. Below the gate
+      // the trade is too thin to safely decay-exit (a +$14 → +$5 trigger filled
+      // at -$2 on 2026-06-08 due to ~2s queue lag). Threshold raised 0.40 → 0.50
+      // to match lib/trade-manager.ts DECAY_THRESHOLD — the two layers should
+      // agree on when a trade is "decaying enough" to close.
+      if(!doClose && peak >= DecayMinPeakUsd && profit < peak * 0.50)
+      {
+         Print("[pp] ", rawSym, "#", ticket, " DECAY-EXIT: profit=$", DoubleToString(profit, 2),
+               " < 50% of peak=$", DoubleToString(peak, 2), " (peak>=$", DoubleToString(DecayMinPeakUsd, 2), ") held=", holdSecs, "s");
+         doClose = true;
+      }
+
+      if(doClose)
+      {
+         int rc = 0;
+         if(!CloseByTicket(ticket, rawSym, rc))
+            Print("[pp] CloseByTicket FAILED ", rawSym, " ticket=", ticket, " retcode=", rc);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_totalSymbols = ArraySize(SYMBOLS);
+   // Timer fires every 1s. Profit target checks every tick.
+   // PULL runs every g_pollEveryN ticks (= OrderPollSeconds).
+   // Data sync runs every g_syncEveryN ticks (= DataSyncSeconds).
+   g_pollEveryN   = MathMax(1, OrderPollSeconds);
+   g_syncEveryN   = MathMax(1, DataSyncSeconds);
+   g_pollCounter  = 0;
+   g_protCount    = 0;
+   g_protCapacity = 0;
+   ArrayResize(g_prot, 20);
+   g_protCapacity = 20;
+
+   // v9: take initial position snapshot
+   g_prevPosCount = 0;
+   ArrayResize(g_prevPos, 20);
+   SnapshotOpenPositions();
+
+   // v9.5 (P-J): recover closes that happened while the terminal was down. This
+   // runs AFTER the snapshot so the live path is unchanged, and it reports only
+   // closes newer than the persisted watermark. Without this line every close
+   // during downtime stayed OPEN in the database forever.
+   LoadRecoveryWatermark();
+   RecoverOfflineCloses();
+
+   // v9.2: seed profit target from inputs (app PULL overrides dynamically)
+   g_profitFixedUsd  = ProfitFixedUsd;
+   g_profitTargetPct = ProfitTargetPct;
+
+   EventSetTimer(1);  // 1s tick — profit target checks every second, not every 2s
+   Print("SybexForexAI EA v9.5 started | FillMode=", EnumToString(FillMode),
+         " | OrderPoll=", OrderPollSeconds, "s | DataSync=", DataSyncSeconds, "s",
+         " | Suffix='", SymbolSuffix, "'",
+         " | MinHold=", MinHoldSeconds, "s",
+         " | MaxSpread=", MaxSpreadPips, "pip",
+         " | BE=0.5R | PartialLock=1.5R | Decay=50%peak (min $", DoubleToString(DecayMinPeakUsd, 2), ")",
+         " | TrailMinUsd=$", DoubleToString(TrailMinUsd, 2),
+         " | PeakBE=$", DoubleToString(PeakBeThreshold, 2),
+         " | MFE/MAE tracking enabled",
+         " | Token prefix: ", StringSubstr(WebhookToken, 0, 8));
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) { EventKillTimer(); }
+
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   // ── Profit Protection (every OrderPollSeconds, no server round-trip)
+   RunProfitProtection();
+
+   // ── v9.2 Profit Target: close any position whose floating P&L >= trigger threshold ──
+   // Formula: nominal   = profitFixedUsd × (profitTargetPct / 100)
+   //          trigger   = nominal × (1 + ProfitBufferPct / 100)   ← slippage cushion
+   // e.g. $1.00 × 50% = $0.50 nominal; +10% buffer → trigger at $0.55
+   // The buffer ensures the close fills comfortably above the target after execution delay.
+   double profitNominal = (g_profitFixedUsd > 0)
+      ? g_profitFixedUsd * g_profitTargetPct / 100.0
+      : 0.0;
+   double profitTrigger = profitNominal * (1.0 + ProfitBufferPct / 100.0);
+   if(profitTrigger > 0)
+   {
+      for(int i = PositionsTotal()-1; i >= 0; i--)
+      {
+         ulong tkt = PositionGetTicket(i);
+         if(tkt == 0) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         if(profit >= profitTrigger)
+         {
+            string rawSym = StripSuffix(PositionGetString(POSITION_SYMBOL));
+            int    rc     = 0;
+            Print("[profit-target] triggered ", rawSym, " #", tkt,
+                  " profit=$", DoubleToString(profit, 2),
+                  " >= trigger=$", DoubleToString(profitTrigger, 2),
+                  " (nominal=$", DoubleToString(profitNominal, 2),
+                  " +", ProfitBufferPct, "% buffer)");
+            if(CloseByTicket(tkt, rawSym, rc))
+               Print("[profit-target] CLOSED ", rawSym, " #", tkt);
+            else
+               Print("[profit-target] FAILED ", rawSym, " #", tkt, " retcode=", rc);
+         }
+      }
+   }
+
+   // ── v9: detect positions that closed since last snapshot ────────
+   // Must run before SnapshotOpenPositions to capture the disappearance
+   //
+   // v9.5 (P-J): if start-up recovery could not read the deal history (the broker
+   // was not ready yet), retry here. `g_recoveryRan` stays false until a
+   // successful scan, so this costs one array walk per tick in the rare failure
+   // case and nothing at all otherwise.
+   if(!g_recoveryRan) RecoverOfflineCloses();
+   g_closedJson = BuildClosedPositionsJSON();
+
+   // v9.3: purge closed-position ProtStates AFTER the JSON is built, so MFE/MAE
+   // for tickets that just closed are available to BuildClosedPositionsJSON.
+   // Previously PurgeClosedStates ran at the start of RunProfitProtection,
+   // which discarded the peak/trough data before it could be reported.
+   PurgeClosedStates();
+
+   // ── Order poll: every OrderPollSeconds (not every 1s tick) ──────
+   // Profit target check above runs every tick; PULL is gated here.
+   g_pollCounter++;
+   if(g_pollCounter >= g_pollEveryN)
+   {
+      g_pollCounter = 0;
+      string resp = FetchPendingOrders();
+      if(StringLen(resp) > 10)
+      {
+         int cnt = 0, sp = 0;
+         while(StringFind(resp, "\"id\":", sp) >= 0) { sp = StringFind(resp,"\"id\":",sp)+1; cnt++; }
+         if(cnt > 0)
+         {
+            Print("SybexForexAI v9.2: ", cnt, " pending command(s) -- executing...");
+            g_completedJson = ExecuteOrders(resp);
+            Print("SybexForexAI v9.2: completedOrders=", g_completedJson);
+         }
+      }
+   }
+
+   // ── Slow path: full data push every DataSyncSeconds ─────────────
+   bool ordersJustFilled = (g_completedJson != "[]");
+   bool hadClosures      = (g_closedJson    != "[]");
+
+   g_syncCounter++;
+   if(g_syncCounter >= g_syncEveryN || ordersJustFilled || hadClosures)
+   {
+      if(hadClosures)
+         Print("SybexForexAI v9.2: reporting closed positions: ", g_closedJson);
+
+      g_syncCounter   = 0;
+      SendDataToApp();
+      g_completedJson = "[]";
+
+      // v9: take fresh snapshot AFTER sending so next tick's diff is accurate
+      SnapshotOpenPositions();
+   }
+}
+
+//+------------------------------------------------------------------+
+string BuildHeaders()
+{
+   return "Content-Type: application/json\r\n"
+        + "apikey: " + ANON_KEY + "\r\n"
+        + "Authorization: Bearer " + ANON_KEY + "\r\n";
+}
+
+//+------------------------------------------------------------------+
+string FetchPendingOrders()
+{
+   char post[], result[];
+   string respHdr = "";
+   string body = "{\"p_token\":\"" + WebhookToken + "\",\"p_payload\":null}";
+   StringToCharArray(body, post, 0, StringLen(body));
+   ArrayResize(post, StringLen(body));
+
+   ResetLastError();
+   int rc = WebRequest("POST", SYNC_URL, BuildHeaders(), 4000, post, result, respHdr);
+   if(rc == -1)
+   {
+      Print("SybexForexAI v9.0: pull FAILED err=", GetLastError(),
+            " -- add URL to Tools>Options>Expert Advisors>Allowed URLs");
+      return "";
+   }
+   if(rc != 200)
+   {
+      Print("SybexForexAI v9.0: pull HTTP ", rc);
+      return "";
+   }
+   string resp = CharArrayToString(result);
+
+   // v9.2: read profit target components from PULL so EA uses the same formula as the app:
+   //   profitCloseAmount = profitFixedUsd × (profitTargetPct / 100)
+   // Only act when the keys are present — JsonNum returns 0 for absent keys, which must not
+   // be confused with "app explicitly set fixed USD to 0" (= target disabled).
+   bool hasFixedKey = (StringFind(resp, "\"profitFixedUsd\":") >= 0);
+   bool hasPctKey   = (StringFind(resp, "\"profitTargetPct\":") >= 0);
+   if(hasFixedKey)
+   {
+      double newFixed = JsonNum(resp, "profitFixedUsd");
+      if(newFixed != g_profitFixedUsd)
+      {
+         g_profitFixedUsd = newFixed;
+         Print("[profit-target] fixedUsd updated from app: $", DoubleToString(newFixed, 2));
+      }
+   }
+   if(hasPctKey)
+   {
+      int newPct = (int)JsonNum(resp, "profitTargetPct");
+      if(newPct > 0 && newPct != g_profitTargetPct)
+      {
+         g_profitTargetPct = newPct;
+         Print("[profit-target] targetPct updated from app: ", newPct, "%");
+      }
+   }
+   // Log effective close threshold whenever either component changes
+   if(hasFixedKey || hasPctKey)
+   {
+      double eff = (g_profitFixedUsd > 0) ? g_profitFixedUsd * g_profitTargetPct / 100.0 : 0.0;
+      if(eff > 0)
+         Print("[profit-target] close threshold: $", DoubleToString(eff, 2),
+               " ($", DoubleToString(g_profitFixedUsd, 2), " x ", g_profitTargetPct, "%)");
+      else
+         Print("[profit-target] disabled (fixedUsd=0)");
+   }
+
+   return resp;
+}
+
+//+------------------------------------------------------------------+
+void SendDataToApp()
+{
+   string body = "{"
+      + "\"p_token\":\"" + WebhookToken + "\","
+      + "\"p_payload\":{"
+      // v9.4 — versioned payload contract. The server keys its accounting
+      // behaviour on this: >= 2 means the closedPositions entries carry
+      // commission/swap/fee separately from gross, so net P&L can be PROVEN.
+      // A v9.3.1 EA omits the field and the server keeps treating its numbers
+      // as gross-only rather than inventing costs.
+      + "\"executionPayloadVersion\":2"
+      + ",\"eaVersion\":\"9.50\""
+      + ",\"balance\":"           + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2)
+      + ",\"equity\":"           + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2)
+      + ",\"currency\":\""       + AccountInfoString(ACCOUNT_CURRENCY) + "\""
+      + ",\"login\":\""          + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\""
+      + ",\"server\":\""         + AccountInfoString(ACCOUNT_SERVER) + "\""
+      + ",\"prices\":"           + BuildPricesJSON()
+      + ",\"candles\":"          + BuildCandlesJSON()
+      + ",\"openPositions\":"    + BuildOpenPositionsJSON()
+      + ",\"completedOrders\":"  + g_completedJson
+      // v9.5 (P-J): live closes AND recovered closes travel in the same array.
+      // Each entry says which it is via `provenance`.
+      + ",\"closedPositions\":"  + MergeClosedJSON(g_closedJson)
+      + "}}";
+
+   char post[], result[];
+   string respHdr = "";
+   StringToCharArray(body, post, 0, StringLen(body));
+   ArrayResize(post, StringLen(body));
+
+   ResetLastError();
+   int rc = WebRequest("POST", SYNC_URL, BuildHeaders(), 15000, post, result, respHdr);
+   if(rc == -1)
+      Print("SybexForexAI v9.0: push FAILED err=", GetLastError());
+   else if(rc == 200)
+   {
+      Print("SybexForexAI v9.5: push OK | Bal=",
+            DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2),
+            " Pos=", PositionsTotal(),
+            " Closed=", (g_closedJson != "[]" ? g_closedJson : "none"),
+            " RecoveredPending=", g_recoveredCount);
+      // v9.5 (P-J): the watermark moves only after the server has accepted the
+      // payload. A failed push leaves the queue intact for the next sync, so a
+      // network blip cannot silently drop a close.
+      CommitRecoveryWatermark();
+   }
+   else
+      Print("SybexForexAI v9.0: push HTTP ", rc, " -- ", StringSubstr(CharArrayToString(result),0,200));
+}
+
+//+------------------------------------------------------------------+
+string JsonStr(string j, string key)
+{
+   string s = "\"" + key + "\":";
+   int p = StringFind(j, s);
+   if(p < 0) return "";
+   p += StringLen(s);
+   while(StringGetCharacter(j,p) == 32) p++;
+   if(StringGetCharacter(j,p) != '"') return "";
+   p++;
+   int e = StringFind(j, "\"", p);
+   return e < 0 ? "" : StringSubstr(j, p, e-p);
+}
+
+double JsonNum(string j, string key)
+{
+   string s = "\"" + key + "\":";
+   int p = StringFind(j, s);
+   if(p < 0) return 0;
+   p += StringLen(s);
+   while(StringGetCharacter(j,p) == 32) p++;
+   return StringToDouble(StringSubstr(j, p, 30));
+}
+
+//+------------------------------------------------------------------+
+string BuildPricesJSON()
+{
+   string out = "{";
+   bool first = true;
+   for(int i = 0; i < g_totalSymbols; i++)
+   {
+      string fullSym = SYMBOLS[i] + SymbolSuffix;
+      double bid = SymbolInfoDouble(fullSym, SYMBOL_BID);
+      double ask = SymbolInfoDouble(fullSym, SYMBOL_ASK);
+      if(bid <= 0 || ask <= 0)
+      {
+         Print("SybexForexAI v9.3: SKIP ", SYMBOLS[i],
+               " (suffix='", SymbolSuffix,
+               "') -- bid=", bid, " ask=", ask);
+         continue;
+      }
+      int dp = (int)SymbolInfoInteger(fullSym, SYMBOL_DIGITS);
+      if(!first) out += ",";
+      out += "\"" + SYMBOLS[i] + "\":{\"bid\":" + DoubleToString(bid,dp)
+           + ",\"ask\":" + DoubleToString(ask,dp) + "}";
+      first = false;
+   }
+   return out + "}";
+}
+
+//+------------------------------------------------------------------+
+string BuildCandleArray(string symbol, ENUM_TIMEFRAMES period, int bars)
+{
+   MqlRates rates[];
+   int copied = CopyRates(symbol, period, 0, bars, rates);
+   if(copied <= 0) return "[]";
+   int dp = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string out = "[";
+   for(int i = 0; i < copied; i++)
+   {
+      if(i > 0) out += ",";
+      out += "{\"t\":" + IntegerToString((long)rates[i].time)
+           + ",\"o\":" + DoubleToString(rates[i].open,  dp)
+           + ",\"h\":" + DoubleToString(rates[i].high,  dp)
+           + ",\"l\":" + DoubleToString(rates[i].low,   dp)
+           + ",\"c\":" + DoubleToString(rates[i].close, dp)
+           + ",\"v\":" + IntegerToString((long)rates[i].tick_volume) + "}";
+   }
+   return out + "]";
+}
+
+string BuildCandlesForTF(ENUM_TIMEFRAMES period, int bars)
+{
+   string out = "{";
+   bool first = true;
+   for(int i = 0; i < g_totalSymbols; i++)
+   {
+      string fullSym = SYMBOLS[i] + SymbolSuffix;
+      string arr = BuildCandleArray(fullSym, period, bars);
+      if(arr == "[]") continue;
+      if(!first) out += ",";
+      out += "\"" + SYMBOLS[i] + "\":" + arr;  // key is always the clean name
+      first = false;
+   }
+   return out + "}";
+}
+
+string BuildCandlesJSON()
+{
+   return "{"
+      + "\"M5\":"   + BuildCandlesForTF(PERIOD_M5,  CandleBars)
+      + ",\"M15\":" + BuildCandlesForTF(PERIOD_M15, CandleBarsHTF)
+      + ",\"H1\":"  + BuildCandlesForTF(PERIOD_H1,  CandleBarsHTF)
+      + ",\"H4\":"  + BuildCandlesForTF(PERIOD_H4,  50)
+      + "}";
+}
+
+string BuildOpenPositionsJSON()
+{
+   string out = "[";
+   bool first = true;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!first) out += ",";
+      out += "{"
+           + "\"ticket\":"     + IntegerToString((long)ticket)
+           + ",\"symbol\":\""  + StripSuffix(PositionGetString(POSITION_SYMBOL)) + "\""
+           + ",\"type\":\""    + (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL") + "\""
+           + ",\"lots\":"      + DoubleToString(PositionGetDouble(POSITION_VOLUME),2)
+           + ",\"openPrice\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN),5)
+           + ",\"sl\":"        + DoubleToString(PositionGetDouble(POSITION_SL),5)
+           + ",\"tp\":"        + DoubleToString(PositionGetDouble(POSITION_TP),5)
+           + ",\"profit\":"    + DoubleToString(PositionGetDouble(POSITION_PROFIT),2)
+           // v9.5 (A-7): the app stores openPositions under FIXED keys and drops
+           // unknown payload fields, so a top-level `eaVersion` never survives in
+           // stored state. These two fields ride INSIDE each entry, which does
+           // survive - so "which build is running" is answerable from the stored
+           // snapshot even when the account is flat.
+           + ",\"eaVersion\":\"9.50\""
+           + ",\"executionPayloadVersion\":2"
+           + "}";
+      first = false;
+   }
+   return out + "]";
+}
+
+//+------------------------------------------------------------------+
+bool PlaceOrder(string symbol, string direction, double lots,
+                double slPrice, double tpPrice,
+                double &filledPrice, int &retcode, ulong &posTicket)
+{
+   string fullSym = symbol + SymbolSuffix;
+   ENUM_ORDER_TYPE_FILLING modes[3];
+   modes[0] = FillMode;
+   modes[1] = ORDER_FILLING_FOK;
+   modes[2] = ORDER_FILLING_IOC;
+
+   for(int f = 0; f < 3; f++)
+   {
+      MqlTradeRequest req;
+      MqlTradeResult  res;
+      ZeroMemory(req);
+      ZeroMemory(res);
+
+      req.action       = TRADE_ACTION_DEAL;
+      req.symbol       = fullSym;
+      req.volume       = lots;
+      req.type         = (direction == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      req.price        = (direction == "BUY")
+                         ? SymbolInfoDouble(fullSym, SYMBOL_ASK)
+                         : SymbolInfoDouble(fullSym, SYMBOL_BID);
+      req.sl           = slPrice;
+      req.tp           = tpPrice;
+      req.deviation    = SlippagePoints;
+      req.magic        = MagicNumber;
+      req.type_filling = modes[f];
+
+      bool ok  = OrderSend(req, res);
+      retcode  = (int)res.retcode;
+
+      if(ok && res.retcode == 10009)
+      {
+         filledPrice = res.price;
+
+         // ── v9.3.1 — resolve the NATIVE POSITION ticket ──────────────────
+         // The app must persist the SAME identity that BuildOpenPositionsJSON()
+         // reports, i.e. POSITION_TICKET from PositionGetTicket(i). That is NOT
+         // interchangeable with res.order: per MT5 semantics a position's ticket
+         // is the ticket of the order that OPENED it, so on a netting account an
+         // order that ADDS to an existing position leaves the position holding
+         // its ORIGINAL ticket while res.order is a new, different ticket. Using
+         // res.order blindly would persist an identifier in the wrong identity
+         // space and attribution would silently never match.
+         //
+         // 1) PositionSelectByTicket(res.order) — exact for hedging and for any
+         //    order that opened a new position; reads the real POSITION_TICKET.
+         // 2) Otherwise the order added to an existing position (netting): find
+         //    the symbol's position for our magic and read its ticket. This is
+         //    EA-side resolution of which position our own order affected — not
+         //    an attribution heuristic.
+         // 3) If neither resolves, leave posTicket 0 and report nothing: the app
+         //    fails closed (attribution stays unavailable) rather than recording
+         //    a fabricated identifier.
+         posTicket = 0;
+         if(PositionSelectByTicket(res.order))
+            posTicket = (ulong)PositionGetInteger(POSITION_TICKET);
+
+         if(posTicket == 0)
+         {
+            for(int i = PositionsTotal() - 1; i >= 0; i--)
+            {
+               ulong t = PositionGetTicket(i);
+               if(t == 0) continue;
+               if(PositionGetString(POSITION_SYMBOL) != fullSym) continue;
+               if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+               if(PositionGetInteger(POSITION_TYPE)
+                  != ((direction == "BUY") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL)) continue;
+               posTicket = t;
+               break;
+            }
+            if(posTicket != 0)
+               Print("SybexForexAI v9.3.1: position ticket resolved via symbol scan=", posTicket);
+         }
+
+         if(posTicket == 0)
+            Print("SybexForexAI v9.3.1: WARNING fill OK but native position ticket UNRESOLVED for ",
+                  fullSym, " order=", res.order, " — attribution will remain unavailable");
+
+         if(f > 0) Print("SybexForexAI v9.0: used fallback fill mode ", EnumToString(modes[f]));
+         return true;
+      }
+
+      // 10013=INVALID (often fill-mode mismatch), 10015=no_money, 10030=unsupported_filling
+      if(res.retcode != 10015 && res.retcode != 10030 && res.retcode != 10013)
+      {
+         Print("SybexForexAI v9.0: order FAILED ", fullSym, " ", direction,
+               " retcode=", res.retcode, " fill=", EnumToString(modes[f]));
+         return false;
+      }
+      Print("SybexForexAI v9.0: fill mode ", EnumToString(modes[f]),
+            " rejected -- trying next mode...");
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool CloseByTicket(ulong ticket, string symbol, int &retcode)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+
+   string             fullSym = symbol + SymbolSuffix;
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double             volume  = PositionGetDouble(POSITION_VOLUME);
+
+   ENUM_ORDER_TYPE_FILLING modes[3];
+   modes[0] = FillMode;
+   modes[1] = ORDER_FILLING_FOK;
+   modes[2] = ORDER_FILLING_IOC;
+
+   for(int f = 0; f < 3; f++)
+   {
+      MqlTradeRequest req;
+      MqlTradeResult  res;
+      ZeroMemory(req);
+      ZeroMemory(res);
+
+      req.action       = TRADE_ACTION_DEAL;
+      req.symbol       = fullSym;
+      req.volume       = volume;
+      req.type         = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      req.price        = (posType == POSITION_TYPE_BUY)
+                         ? SymbolInfoDouble(fullSym, SYMBOL_BID)
+                         : SymbolInfoDouble(fullSym, SYMBOL_ASK);
+      req.deviation    = SlippagePoints;
+      req.magic        = MagicNumber;
+      req.position     = ticket;
+      req.type_filling = modes[f];
+
+      bool ok = OrderSend(req, res);
+      retcode = (int)res.retcode;
+
+      if(ok && res.retcode == 10009)
+      {
+         if(f > 0) Print("[close] used fallback fill mode ", EnumToString(modes[f]));
+         return true;
+      }
+
+      // 10013=INVALID (fill-mode mismatch), 10030=unsupported_filling — retry next mode
+      if(res.retcode != 10013 && res.retcode != 10030)
+      {
+         Print("[close] FAILED retcode=", res.retcode, " fill=", EnumToString(modes[f]));
+         return false;
+      }
+      Print("[close] fill mode ", EnumToString(modes[f]), " rejected (", res.retcode, ") -- trying next...");
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool ModifySL(ulong ticket, string symbol, double newSl, int &retcode)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action   = TRADE_ACTION_SLTP;
+   req.symbol   = symbol + SymbolSuffix;
+   req.sl       = newSl;
+   req.tp       = PositionGetDouble(POSITION_TP);
+   req.position = ticket;
+
+   bool ok = OrderSend(req, res);
+   retcode = (int)res.retcode;
+   return ok && res.retcode == 10009;
+}
+
+//+------------------------------------------------------------------+
+string ExecuteOrders(string response)
+{
+   string completed = "[";
+   bool   first     = true;
+
+   int pos = StringFind(response, "\"pendingOrders\"");
+   if(pos < 0) return "[]";
+
+   int arrStart = StringFind(response, "[", pos);
+   int arrEnd   = StringFind(response, "]", arrStart);
+   if(arrStart < 0 || arrEnd < 0) return "[]";
+
+   string arr       = StringSubstr(response, arrStart, arrEnd - arrStart + 1);
+   int    searchPos = 0;
+
+   while(true)
+   {
+      int objStart = StringFind(arr, "{", searchPos);
+      if(objStart < 0) break;
+      int objEnd = StringFind(arr, "}", objStart);
+      if(objEnd < 0) break;
+
+      string obj     = StringSubstr(arr, objStart, objEnd - objStart + 1);
+      string orderId = JsonStr(obj, "id");
+      string symbol  = JsonStr(obj, "symbol");
+
+      bool isClose    = (StringFind(obj, "\"type\":\"close\"")     >= 0);
+      bool isModifySl = (StringFind(obj, "\"type\":\"modify_sl\"") >= 0);
+      double lots     = JsonNum(obj, "lots");
+
+      if(StringLen(orderId) == 0 || StringLen(symbol) == 0)
+      {
+         searchPos = objEnd + 1;
+         continue;
+      }
+
+      if(!first) completed += ",";
+
+      // ── modify_sl ───────────────────────────────────────────────────
+      if(isModifySl)
+      {
+         ulong  ticket = (ulong)JsonNum(obj, "ticket");
+         double newSl  = JsonNum(obj, "newSl");
+         int    rc     = 0;
+         bool   ok     = false;
+
+         if(ticket > 0 && newSl > 0)
+            ok = ModifySL(ticket, symbol, newSl, rc);
+
+         if(ok)
+         {
+            completed += "{\"id\":\"" + orderId + "\",\"success\":true,\"type\":\"modify_sl\""
+                       + ",\"ticket\":" + IntegerToString((long)ticket)
+                       + ",\"newSl\":"  + DoubleToString(newSl, 5) + "}";
+            Print("SybexForexAI v9.0: SL modified ", symbol, " ticket=", ticket, " newSl=", newSl);
+         }
+         else
+         {
+            completed += "{\"id\":\"" + orderId + "\",\"success\":false,\"type\":\"modify_sl\""
+                       + ",\"error\":\"retcode " + IntegerToString(rc) + "\"}";
+            Print("SybexForexAI v9.0: modify_sl FAILED ", symbol, " ticket=", ticket, " retcode=", rc);
+         }
+      }
+
+      // ── close ───────────────────────────────────────────────────────
+      else if(isClose)
+      {
+         ulong cmdTicket = (ulong)JsonNum(obj, "ticket");
+         int   rc        = 0;
+         bool  ok        = false;
+
+         if(cmdTicket > 0)
+         {
+            ok = CloseByTicket(cmdTicket, symbol, rc);
+            if(!ok)
+               Print("SybexForexAI v9.0: ticket close failed ticket=", cmdTicket,
+                     " retcode=", rc, " -- falling back to symbol close");
+         }
+
+         if(!ok)
+         {
+            string fullSym = symbol + SymbolSuffix;
+            for(int i = PositionsTotal()-1; i >= 0; i--)
+            {
+               ulong t = PositionGetTicket(i);
+               if(t == 0) continue;
+               if(PositionGetString(POSITION_SYMBOL) != fullSym) continue;
+               int   rc2 = 0;
+               if(!CloseByTicket(t, symbol, rc2))
+                  Print("SybexForexAI v9.0: symbol close failed ticket=", t, " retcode=", rc2);
+               else
+                  ok = true;
+            }
+         }
+
+         completed += "{\"id\":\"" + orderId + "\",\"success\":" + (ok ? "true" : "false")
+                    + ",\"type\":\"close\"}";
+         Print("SybexForexAI v9.0: close ", (ok ? "OK" : "FAILED"), " ", symbol);
+      }
+
+      // ── new order ───────────────────────────────────────────────────
+      else if(lots > 0)
+      {
+         // v9.7 — hard lot ceiling. Final gate before OrderSend. Mirrors
+         // MAX_LOTS in lib/trade-levels.ts (also enforced by the orders route
+         // and the MT5 Direct adapter). If a pending order somehow exceeds it,
+         // reject in-EA and report back as failed so the server can surface it.
+         if(lots > MaxLots)
+         {
+            completed += "{\"id\":\"" + orderId + "\",\"success\":false"
+                       + ",\"error\":\"lots " + DoubleToString(lots, 2)
+                       + " exceed MaxLots ceiling " + DoubleToString(MaxLots, 2) + "\"}";
+            Print("SybexForexAI v9.7: BLOCKED ", symbol,
+                  " lots=", lots, " > MaxLots=", MaxLots);
+            first     = false;
+            searchPos = objEnd + 1;
+            continue;
+         }
+
+         string direction = JsonStr(obj, "direction");
+
+         double slPrice   = JsonNum(obj, "slPrice");
+         double tpPrice   = JsonNum(obj, "tpPrice");
+         double filledPrice = 0;
+         int    retcode     = 0;
+         ulong  posTicket   = 0;
+         bool   ok = PlaceOrder(symbol, direction, lots, slPrice, tpPrice, filledPrice, retcode, posTicket);
+
+
+         if(ok)
+         {
+            // v9.3.1 — both identities are reported. `id` stays the APPLICATION
+            // correlation id (the server matches it against trades.oanda_trade_id,
+            // which is never overwritten). `ticket` is the NATIVE MT5 position
+            // ticket — the same identity space as openPositions[].ticket — which
+            // the server persists into trades.broker_ticket on confirmed fill.
+            // Emitted as a bare number to match BuildOpenPositionsJSON()'s
+            // "ticket":<n> style; OMITTED entirely when unresolved so the server
+            // fails closed instead of storing something wrong.
+            completed += "{\"id\":\"" + orderId + "\",\"success\":true"
+                       + ",\"filledPrice\":" + DoubleToString(filledPrice,5);
+            if(posTicket != 0)
+               completed += ",\"ticket\":" + IntegerToString((long)posTicket);
+            completed += "}";
+            Print("SybexForexAI v9.0: FILLED ", symbol, " ", direction,
+                  " lots=", lots, " @ ", filledPrice,
+                  (posTicket != 0 ? " position=" + IntegerToString((long)posTicket) : " position=UNRESOLVED"));
+         }
+         else
+         {
+            completed += "{\"id\":\"" + orderId + "\",\"success\":false"
+                       + ",\"error\":\"retcode " + IntegerToString(retcode) + "\"}";
+            Print("SybexForexAI v9.0: REJECTED ", symbol, " retcode=", retcode);
+         }
+      }
+      else
+      {
+         completed += "{\"id\":\"" + orderId + "\",\"success\":false"
+                    + ",\"error\":\"unknown command type\"}";
+         Print("SybexForexAI v9.0: unknown command in ", StringSubstr(obj,0,80));
+      }
+
+      first     = false;
+      searchPos = objEnd + 1;
+   }
+   return completed + "]";
+}

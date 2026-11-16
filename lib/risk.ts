@@ -14,7 +14,8 @@ export interface RiskGuardOptions {
   strategy: StrategySettings
   openTrades: OpenTrade[]
   accountBalance: number
-  todayRealizedPL: number
+  /** Realised P&L for today, or `null` when it is not known. */
+  todayRealizedPL: number | null
   newsInWindow: boolean
   newsEvent?: string
 }
@@ -33,19 +34,35 @@ export function runRiskGuards(options: RiskGuardOptions): RiskCheck[] {
   }
 
   // 2. Daily loss limit — skip entirely if balance not yet synced (0)
+  //
+  // Phase 4.2.1 (defect H-2): an UNKNOWN daily P&L used to pass this guard by
+  // accident. `null <= -maxLossUSD` is `false` (null coerces to 0), so a day
+  // whose realised losses were never recorded looked like a zero-loss day and
+  // trading continued. Unknown is now a BLOCK, not a pass. The percentage
+  // thresholds below are untouched.
   if (strategy.hardDailyStop && accountBalance > 0) {
     const maxLossUSD = accountBalance * (strategy.maxLoss / 100)
-    if (maxLossUSD > 0 && todayRealizedPL <= -maxLossUSD) {
+    // Narrow once, explicitly: `null`/`NaN`/`undefined` all mean "unknown".
+    const dailyPL = typeof todayRealizedPL === 'number' && Number.isFinite(todayRealizedPL)
+      ? todayRealizedPL
+      : null
+    if (dailyPL === null) {
       checks.push({
         allowed: false,
         severity: 'BLOCK',
-        reason: `Daily loss limit hit: -$${Math.abs(todayRealizedPL).toFixed(2)} exceeds ${strategy.maxLoss}% of balance ($${maxLossUSD.toFixed(2)}). Trading is locked for today.`,
+        reason: 'Daily realised P&L is not known yet, so the daily loss limit cannot be evaluated. Trading is blocked until closed-trade accounting completes.',
       })
-    } else if (todayRealizedPL <= -maxLossUSD * 0.75) {
+    } else if (maxLossUSD > 0 && dailyPL <= -maxLossUSD) {
+      checks.push({
+        allowed: false,
+        severity: 'BLOCK',
+        reason: `Daily loss limit hit: -$${Math.abs(dailyPL).toFixed(2)} exceeds ${strategy.maxLoss}% of balance ($${maxLossUSD.toFixed(2)}). Trading is locked for today.`,
+      })
+    } else if (dailyPL <= -maxLossUSD * 0.75) {
       checks.push({
         allowed: true,
         severity: 'WARN',
-        reason: `Approaching daily loss limit: $${Math.abs(todayRealizedPL).toFixed(2)} of $${maxLossUSD.toFixed(2)} used (${Math.round(Math.abs(todayRealizedPL) / maxLossUSD * 100)}%). Trade with reduced size.`,
+        reason: `Approaching daily loss limit: $${Math.abs(dailyPL).toFixed(2)} of $${maxLossUSD.toFixed(2)} used (${Math.round(Math.abs(dailyPL) / maxLossUSD * 100)}%). Trade with reduced size.`,
       })
     }
   }

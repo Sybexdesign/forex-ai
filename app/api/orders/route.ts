@@ -14,6 +14,7 @@ import { planOrder } from '@/lib/order-planner.mjs'
 import { EXECUTION_CONTRACT_VERSION } from '@/lib/execution-truth.mjs'
 import { evaluateExecutionGuards } from '@/lib/execution-guards.mjs'
 import { classifySubmission, deriveRequestId, evaluateOrderAuthority } from '@/lib/order-authority.mjs'
+import { closedExecutions, sumKnownPL } from '@/lib/analytics-scope.mjs'
 
 import { alertOrderPlaced, alertOrderBlocked, alertOrderFailed, alertProfitTargetDisabled } from '@/lib/telegram'
 
@@ -38,6 +39,30 @@ function dbToSettings(d: any): PropFirmSettings {
 // Dedup map for the profit-target-disabled Telegram warning: userId → last
 // alert ms. One Telegram per user per hour even if many orders fire.
 const ptDisabledWarned = new Map<string, number>()
+
+// ─── Risk-evaluation population scope (Phase 4.2.1, P-A / defect H-2) ────────
+// Every column read here exists in `trades` (verified against migrations
+// 20260914_execution_truth, 20261004_reconcile_close_accounting and
+// 20261112_phase41_order_authority_and_accounting). Selecting a phantom column
+// makes PostgREST answer 400, the surrounding `catch` swallows it, and the guard
+// silently evaluates 0 — so this list is deliberately explicit and minimal.
+const RISK_COLUMNS = 'pl_usd, closed_at, broker_ticket, result, trade_result, trade_status, accounting_complete, net_realised_pnl, accounting_missing'
+
+/**
+ * Reduce a fetched row set to the rows a risk limit may be evaluated on.
+ *
+ * Rules, all three of which the old `Σ (t.pl_usd || 0)` broke:
+ *   - only genuine broker executions count (simulation rows never move a
+ *     live-account limit);
+ *   - an OPEN or CANCELLED row is not a realised result;
+ *   - a closed execution with no P&L yet is UNKNOWN, not 0. It is returned as a
+ *     count so the caller can fail closed instead of passing a phantom zero.
+ */
+function scopeRiskRows(rows: any[]) {
+  const executed = closedExecutions(rows)
+  return { ...sumKnownPL(executed), executed }
+}
+
 
 export async function POST(req: NextRequest) {
   try {
@@ -143,7 +168,9 @@ export async function POST(req: NextRequest) {
     let openTrades: any[] = []
     let balance = 0          // 0 = not yet synced; guards skip on 0 to avoid false blocks
     let equity  = 0
-    let todayPL = 0
+    let todayPL: number | null = 0
+    let todayUnknownPLRows = 0
+    let allTimeUnknownPLRows = 0
     let allTimePL = 0
     let tradingDays = 0
     let maxDailyPLEver = 0
@@ -263,31 +290,63 @@ export async function POST(req: NextRequest) {
         const today = new Date().toISOString().split('T')[0]
 
         const [todayRes, allTimeRes, daysRes] = await Promise.all([
-          // Today's P&L
-          admin.from('trades').select('pl_usd').eq('user_id', userId)
-            .gte('closed_at', today + 'T00:00:00').not('pl_usd', 'is', null),
-          // All-time P&L (also need closed_at for consistency rule)
-          admin.from('trades').select('pl_usd, closed_at').eq('user_id', userId).not('pl_usd', 'is', null),
-          // Distinct trading days
-          admin.from('trades').select('closed_at').eq('user_id', userId).not('closed_at', 'is', null),
+          // Today's rows — NO `pl_usd IS NOT NULL` filter. Filtering unknown
+          // rows out of the array is exactly how "unknown" used to become
+          // "0.00" and keep the daily-loss guard open.
+          admin.from('trades').select(RISK_COLUMNS).eq('user_id', userId)
+            .gte('closed_at', today + 'T00:00:00'),
+          // All-time rows, same treatment. NOTE: PostgREST caps a select at 1000
+          // rows by default; that cap pre-dates this change and is recorded as a
+          // residual limitation rather than silently papered over.
+          admin.from('trades').select(RISK_COLUMNS).eq('user_id', userId),
+          // Distinct trading days — scoped to broker executions, because a
+          // model row is not a day the account traded a prop-firm challenge.
+          admin.from('trades').select('closed_at, broker_ticket').eq('user_id', userId)
+            .not('closed_at', 'is', null),
         ])
 
-        todayPL = (todayRes.data || []).reduce((s: number, t: any) => s + (t.pl_usd || 0), 0)
-        allTimePL = (allTimeRes.data || []).reduce((s: number, t: any) => s + (t.pl_usd || 0), 0)
+        const todayScope   = scopeRiskRows(todayRes.data || [])
+        const allTimeScope = scopeRiskRows(allTimeRes.data || [])
 
-        const days = new Set((daysRes.data || []).map((t: any) => t.closed_at?.split('T')[0]))
+        todayPL               = todayScope.pl
+        todayUnknownPLRows    = todayScope.unknown
+        allTimePL             = allTimeScope.pl ?? 0
+        allTimeUnknownPLRows  = allTimeScope.unknown
+
+        const days = new Set(
+          (daysRes.data || [])
+            .filter((t: any) => String(t.broker_ticket ?? '').trim().length > 0)
+            .map((t: any) => t.closed_at?.split('T')[0]),
+        )
         tradingDays = days.size
 
-        // Max single-day profit for consistency rule
+        // Max single-day profit for consistency rule — known values only, and
+        // only broker executions (a simulation win cannot mask a real drawdown).
         const dayTotals: Record<string, number> = {}
-        for (const t of allTimeRes.data || []) {
-          if (t.pl_usd > 0 && t.closed_at) {
-            const d = t.closed_at.split('T')[0]
-            dayTotals[d] = (dayTotals[d] || 0) + t.pl_usd
-          }
+        for (const t of allTimeScope.executed) {
+          if (typeof t.closed_at !== 'string') continue
+          const pl = typeof t.pl_usd === 'number' ? t.pl_usd : Number(t.pl_usd)
+          if (!Number.isFinite(pl) || pl <= 0) continue
+          const d = t.closed_at.split('T')[0]
+          dayTotals[d] = (dayTotals[d] || 0) + pl
         }
         maxDailyPLEver = Math.max(0, ...Object.values(dayTotals))
       } catch { /* ignore */ }
+    }
+
+    // ─── Unknown daily P&L guard (Phase 4.2.1, P-A) ───────────────────────
+    // A closed broker execution today whose P&L has not landed yet makes the
+    // day UNKNOWN. Unknown is not "no loss": `null <= -limit` is false, so the
+    // hard daily stop below would pass. Fail closed, with a reason the operator
+    // can act on (run reconciliation / check the EA is reporting closes).
+    if (todayUnknownPLRows > 0) {
+      const reason = `Daily P&L is not yet known for ${todayUnknownPLRows} closed broker execution(s) today — the daily loss limit cannot be evaluated, so entries are blocked until accounting completes. Run outcome reconciliation, or check the MT5 EA is reporting closes.`
+      console.warn(`[orders] UNKNOWN DAILY P&L — ${todayUnknownPLRows} scoped row(s) today, blocking ${pair} ${direction}`)
+      await alertOrderBlocked({ pair, direction, reason })
+      return NextResponse.json({
+        success: false, blocked: true, reasons: [reason],
+        code: 'DAILY_PL_UNKNOWN', unknownPLRows: todayUnknownPLRows,
+      }, { status: 422 })
     }
 
     // ─── Prop firm guards (if enabled) ────────────────────────────────────
@@ -344,6 +403,10 @@ export async function POST(req: NextRequest) {
     }
 
     // ─── Hard risk guards ─────────────────────────────────────────────────
+    // `todayPL` is still `number | null` here. An unknown day was already
+    // rejected by the guard above, so it cannot reach this comparison; if the
+    // DB read itself failed, `todayPL` is 0 and behaviour is unchanged from
+    // before this phase (documented residual in PHASE42_1_OWNER_ACTIONS.md).
     const riskChecks = runRiskGuards({
       strategy, openTrades, accountBalance: balance,
       todayRealizedPL: todayPL,
@@ -681,6 +744,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ...orderResult, success: true, lots, broker: broker.name,
       riskWarnings: riskChecks.filter(c => c.severity === 'WARN').map(c => c.reason),
+      // Population disclosure (Phase 4.2.1, P-A): the daily figure the guards
+      // actually evaluated, plus how many closed executions were left out of it
+      // for want of P&L. A silent omission is what made the old numbers look
+      // complete; here it is visible.
+      riskScope: {
+        todayRealizedPL: todayPL,
+        allTimeRealizedPL: allTimePL,
+        allTimeUnknownPLRows,
+        tradingDays,
+      },
     })
   } catch (error: any) {
     console.error('[orders]', error)

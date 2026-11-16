@@ -160,7 +160,7 @@ async function scanPair(
   timeframe: string,
   authToken: string | undefined,
   strategy: StrategySettings,
-  context: { newsInWindow: boolean; openPositions: number; todayPL: number; accountBalance: number },
+  context: { newsInWindow: boolean; openPositions: number; todayPL: number | null; accountBalance: number },
   cfg: ReturnType<typeof tfConfig>,
 ): Promise<ScanResult> {
   const block = (reason: string): ScanResult => ({ signal: null, blockedBy: reason })
@@ -420,7 +420,7 @@ export async function POST(req: NextRequest) {
       newsInWindow = false, openPositions = 0, todayPL = 0, accountBalance = 10000,
     } = body as {
       pairs: string[]; timeframe: string; strategy: StrategySettings
-      newsInWindow: boolean; openPositions: number; todayPL: number; accountBalance: number
+      newsInWindow: boolean; openPositions: number; todayPL: number | null; accountBalance: number
     }
 
     // Enforce metals-only — filter out any non-metals pairs

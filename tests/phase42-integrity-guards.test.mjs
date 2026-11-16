@@ -30,16 +30,25 @@ const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8')
 }
 
 // ── B — the refresh endpoint must not trust a forgeable header ────────────
+// Phase 4.2.1 (C-2): the authorisation logic was extracted to
+// `lib/cron-auth.mjs` so the *behaviour* can be executed by a test rather than
+// pattern-matched in a comment. These assertions pin the wiring; group C-2 of
+// `tests/phase421-remediation.test.mjs` exercises the function itself.
 {
-  const src = read('app/api/outcome-reconciliation/refresh/route.ts')
-  assert.ok(!src.includes("'header_only_INSECURE'"), 'B: the insecure auth mode is gone')
-  assert.ok(!/ok:\s*!!req\.headers\.get\('x-vercel-cron'\)/.test(src),
+  const route = read('app/api/outcome-reconciliation/refresh/route.ts')
+  const auth = read('lib/cron-auth.mjs')
+
+  assert.ok(!route.includes("'header_only_INSECURE'"), 'B: the insecure auth mode is gone')
+  assert.ok(!/ok:\s*!!req\.headers\.get\('x-vercel-cron'\)/.test(route),
     'B: x-vercel-cron is never sufficient to authorise')
-  assert.match(src, /cron_secret_not_configured/, 'B: unconfigured production is denied explicitly')
-  assert.match(src, /function timingSafeEqual/, 'B: comparison is timing-safe')
-  assert.match(src, /authorization/i, 'B: secret accepted via Authorization header')
-  assert.match(src, /x-cron-secret/, 'B: secret accepted via dedicated header')
-  assert.match(src, /status = auth\.authMode === 'cron_secret_not_configured' \? 503 : 401/,
+  assert.ok(!/headers\??\.get\(\s*['"`]x-vercel-cron['"`]\s*\)/.test(auth),
+    'B: the authorisation module never reads the forgeable cron header')
+  assert.match(route, /authoriseCronRequest\(/, 'B: the route delegates to the shared authorisation')
+  assert.match(auth, /cron_secret_not_configured/, 'B: unconfigured production is denied explicitly')
+  assert.match(auth, /export function timingSafeEqual/, 'B: comparison is timing-safe')
+  assert.match(auth, /authorization/i, 'B: secret accepted via Authorization header')
+  assert.match(auth, /x-cron-secret/, 'B: secret accepted via dedicated header')
+  assert.match(auth, /authMode === 'cron_secret_not_configured' \? 503 : 401/,
     'B: misconfiguration returns 503, bad caller returns 401')
   console.log('PASS B: refresh auth requires the exact secret and never trusts a header')
 }

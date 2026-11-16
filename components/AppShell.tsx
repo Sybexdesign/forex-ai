@@ -23,6 +23,7 @@ import AuthPage from './AuthPage'
 import { usePriceFeed, useAccount, useNews, useStrategy, useTrades, useSignals } from '@/hooks/useForex'
 import { useScanner } from '@/hooks/useScanner'
 import { useAuth } from '@/hooks/useAuth'
+import { closedExecutions, sumKnownPL } from '@/lib/analytics-scope.mjs'
 import type { StrategySettings } from '@/lib/supabase'
 import { DEFAULT_STRATEGY } from '@/lib/supabase'
 import { currencySymbol, currencySigned } from '@/lib/currency'
@@ -151,12 +152,48 @@ export default function AppShell() {
     return () => window.removeEventListener('keydown', onKey)
   }, [NAV])
 
-  // Today's P/L
+  // ─── Today's realised P&L — SCOPED and UNKNOWN-AWARE (Phase 4.2.1, P-B) ──
+  //
+  // Three defects used to meet in one line:  Σ (t.pl_usd || 0)
+  //   1. `|| 0` turned "unknown" into "no loss", so a day whose closes had not
+  //      been accounted yet looked like a zero-loss day — and the daily-loss
+  //      checklist item downstream could never fail on it.
+  //   2. ticket-less simulation rows were summed into a LIVE risk gate.
+  //      Production holds a −963.50 model row; against a 12.36 GBP account
+  //      (2 % daily limit ≈ 0.25 GBP) that single row locked real trading for
+  //      the rest of the day on model fiction.
+  //   3. CANCELLED rows counted as 0.00 instead of being excluded.
+  //
+  // Now only closed broker executions contribute, and if any of them is still
+  // unknown the day is UNKNOWN (`null`) rather than zero. `lib/indicators.ts`
+  // refuses to pass the checklist on an unknown day (P-C). The two are atomic:
+  // `null > -100` is `true`, so shipping P-B alone would ENABLE trading on
+  // unknown data.
   const today = new Date().toDateString()
-  const todayTrades = trades.filter(t => t.closed_at && new Date(t.closed_at).toDateString() === today)
-  const todayPL = todayTrades.reduce((s: number, t: any) => s + (t.pl_usd || 0), 0)
-  const wins = trades.filter((t: any) => t.result === 'WIN').length
-  const winRate = trades.length ? Math.round((wins / trades.length) * 100) : 0
+  const todayTrades = trades.filter((t: any) => t.closed_at && new Date(t.closed_at).toDateString() === today)
+  const todayScope = sumKnownPL(closedExecutions(todayTrades))
+  const todayPL: number | null = todayScope.pl
+  // Unknown must never be rendered as a green +0.00.
+  const todayPLText  = todayPL === null ? '—' : currencySigned(todayPL, account?.currency)
+  const todayPLColor = todayPL === null ? '#607080' : todayPL >= 0 ? '#00ff87' : '#ff3056'
+  const todayPLTitle = todayPL === null
+    ? `${todayScope.unknown} closed execution(s) today have no realised P&L yet — the day is unknown, not zero`
+    : `${todayScope.known} closed broker execution(s) today`
+  // Win rate — DECISIVE BROKER EXECUTIONS only (Phase 4.2.1, P-B / M-4).
+  //
+  // The old ratio was `wins / trades.length`: the denominator counted OPEN rows,
+  // CANCELLED rows and ticket-less simulation rows, so it was not a win rate at
+  // all — it was a ratio of wins to "everything the window happened to contain".
+  // A break-even row also counted as a loss. Both are fixed here: the denominator
+  // is closed broker executions whose realised P&L is known and non-zero, and the
+  // numerator is those of them in profit.
+  const decisiveExecutions = closedExecutions(trades)
+    .map((t: any) => (typeof t.pl_usd === 'number' ? t.pl_usd : Number(t.pl_usd)))
+    .filter((v: number) => Number.isFinite(v) && v !== 0)
+  const wins = decisiveExecutions.filter((v: number) => v > 0).length
+  const winRate = decisiveExecutions.length
+    ? Math.round((wins / decisiveExecutions.length) * 100)
+    : 0
 
   // Single scanner instance — always metals only, regardless of what's saved in strategy.watchlist
   const rawWatchlist = strategy.watchlist?.length ? strategy.watchlist : FALLBACK_PAIRS
@@ -278,8 +315,8 @@ export default function AppShell() {
           )}
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
             <span style={{ color: 'var(--text-muted)' }}>Today P/L</span>
-            <span className="mono" style={{ color: todayPL >= 0 ? '#00ff87' : '#ff3056' }}>
-              {currencySigned(todayPL, account?.currency)}
+            <span className="mono" title={todayPLTitle} style={{ color: todayPLColor }}>
+              {todayPLText}
             </span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -543,8 +580,8 @@ export default function AppShell() {
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
             <span style={{ color: 'var(--text-muted)' }}>Today P/L</span>
-            <span className="mono" style={{ color: todayPL >= 0 ? '#00ff87' : '#ff3056' }}>
-              {currencySigned(todayPL, account?.currency)}
+            <span className="mono" title={todayPLTitle} style={{ color: todayPLColor }}>
+              {todayPLText}
             </span>
           </div>
 

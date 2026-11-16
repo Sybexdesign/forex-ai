@@ -12,6 +12,7 @@ import { getAdminClient } from '@/lib/supabase'
 import { linkRecords } from '@/lib/outcome-linkage.mjs'
 import { classifyRecord, diagnose } from '@/lib/outcome-reconciliation.mjs'
 import { diffRefresh } from '@/lib/execution-truth.mjs'
+import { authoriseCronRequest, cronRejectionMessage, cronRejectionStatus } from '@/lib/cron-auth.mjs'
 
 export const dynamic = 'force-dynamic'
 
@@ -42,46 +43,39 @@ let lastRefreshError: { at: string, message: string } | null = null
  * Modes are returned so /api/production-integrity can report the real state
  * instead of a boolean that hides why a request was rejected.
  */
-function timingSafeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a, 'utf8')
-  const bb = Buffer.from(b, 'utf8')
-  if (ab.length !== bb.length) return false
-  let diff = 0
-  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i]
-  return diff === 0
-}
-
-function authorise(req: NextRequest): { ok: boolean, authMode: string, configured: boolean } {
-  const configured = process.env.CRON_SECRET
-  const presented = req.headers.get('authorization')?.replace(/^Bearer\s+/i, '').trim()
-    || req.headers.get('x-cron-secret')?.trim()
-    || req.nextUrl.searchParams.get('secret')?.trim()
-    || ''
-
-  if (configured) {
-    const ok = presented.length > 0 && timingSafeEqual(presented, configured)
-    return { ok, authMode: 'cron_secret', configured: true }
-  }
-
-  // No secret configured. Never open in production — an unauthenticated endpoint
-  // that rewrites derived analytical rows is an open invitation.
-  if (process.env.NODE_ENV !== 'production') return { ok: true, authMode: 'development_open', configured: false }
-  return { ok: false, authMode: 'cron_secret_not_configured', configured: false }
-}
+/*
+ * Authorisation (Phase 4.2E, extracted to lib/cron-auth.mjs in Phase 4.2.1 so the
+ * behaviour can be exercised by tests instead of merely described):
+ *
+ *   1. The secret was read ONLY from the query string (`?secret=`). A query
+ *      string is written to access logs, proxy logs, browser history and every
+ *      Referer header, so a valid secret leaked itself. Headers are the supported
+ *      transport and the query string is kept only as a fallback for a manually
+ *      typed call.
+ *   2. When CRON_SECRET was absent in production the check fell back to trusting
+ *      the `x-vercel-cron` request header — which any caller can forge, so the
+ *      "authentication" was decorative. That fallback is GONE. Unconfigured in
+ *      production now denies, and says so.
+ *   3. Comparison was a plain `===`. It is now timing-safe.
+ *
+ * Modes are returned so /api/production-integrity can report the real state
+ * instead of a boolean that hides why a request was rejected.
+ */
 
 export async function GET(req: NextRequest) {
-  const auth = authorise(req)
+  const auth = authoriseCronRequest({
+    headers: req.headers,
+    searchParams: req.nextUrl.searchParams,
+    env: process.env,
+  })
   if (!auth.ok) {
     // 503 (not 401) when the secret is simply absent: this is a deployment
     // misconfiguration that an operator must fix, not a bad caller.
-    const status = auth.authMode === 'cron_secret_not_configured' ? 503 : 401
     return NextResponse.json({
       refreshed: false,
-      error: auth.authMode === 'cron_secret_not_configured'
-        ? 'CRON_SECRET is not configured; refusing to refresh unauthenticated'
-        : 'Unauthorized',
+      error: cronRejectionMessage(auth.authMode),
       authMode: auth.authMode,
-    }, { status })
+    }, { status: cronRejectionStatus(auth.authMode) })
   }
   try {
     const windowDays = Math.max(1, Math.min(90, parseInt(req.nextUrl.searchParams.get('windowDays') || '2', 10) || 2))

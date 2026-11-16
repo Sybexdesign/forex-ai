@@ -17,6 +17,7 @@ import { buildEvidence } from '@/lib/execution-evidence.mjs'
 import { ukOffsetMinutes } from '@/lib/uk-time.mjs'
 import { buildScopedAnalytics } from '@/lib/analytics-metrics.mjs'
 import { POPULATION } from '@/lib/analytics-scope.mjs'
+import { reconStatus, reconWarnHours } from '@/lib/integrity-thresholds.mjs'
 
 const WINDOW_DAYS = 120
 const EVIDENCE_LIMIT = 3000
@@ -96,8 +97,21 @@ export async function GET() {
     } catch { hasPhase41 = false }
 
     // ── 4. Reconciliation freshness ───────────────────────────────────────
-    let recon: { rows: number | null, executionLinked: number | null, lastUpdatedAt: string | null, ageHours: number | null, status: Status } = {
-      rows: null, executionLinked: null, lastUpdatedAt: null, ageHours: null, status: 'FAILED',
+    //
+    // Phase 4.2.1 (M-6 / A-6). The threshold was hard-coded at 48 h FAILED /
+    // 6 h WARNING against a 10-minute design cadence, so a 4.4 h stale
+    // reconciliation reported HEALTHY — the health surface could not see the
+    // staleness it exists to detect.
+    //
+    // The strict value is deliberately NOT hard-coded: M-6 has a hard dependency
+    // on C-2 (the scheduler's CRON_SECRET), and turning the monitor red before
+    // the scheduler can be fixed produces noise, not safety. So the threshold is
+    // environment-gated with **today's value as the default** — nothing changes
+    // until the owner opts in by setting RECON_STALE_WARN_HOURS (strict value
+    // 0.5, i.e. 30 min, documented in PHASE42_1_OWNER_ACTIONS.md).
+    const warnH = reconWarnHours(process.env)
+    let recon: { rows: number | null, executionLinked: number | null, lastUpdatedAt: string | null, ageHours: number | null, warnHours: number, status: Status } = {
+      rows: null, executionLinked: null, lastUpdatedAt: null, ageHours: null, warnHours: warnH, status: 'FAILED',
     }
     try {
       const r = await admin.from('outcome_reconciliation')
@@ -113,7 +127,8 @@ export async function GET() {
         executionLinked: linkedRes.count ?? null,
         lastUpdatedAt: last,
         ageHours: ageH === null ? null : +ageH.toFixed(1),
-        status: ageH === null ? 'FAILED' : ageH > 48 ? 'FAILED' : ageH > 6 ? 'WARNING' : 'HEALTHY',
+        warnHours: warnH,
+        status: reconStatus(ageH, warnH),
       }
     } catch { /* left as FAILED */ }
 

@@ -5,6 +5,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { Panel } from '../ui'
 import { authFetch } from '@/lib/api'
 import { calcPropFirmStatus, FIRM_PRESETS, DEFAULT_PROP_FIRM, type PropFirmSettings } from '@/lib/propfirm'
+import { closedExecutions, sumKnownPL } from '@/lib/analytics-scope.mjs'
 
 const FIRMS = [
   { key: 'ftmo',       label: 'FTMO',         color: '#00c060' },
@@ -49,20 +50,37 @@ export default function PropFirmPage({ trades, onToast }: PropFirmPageProps) {
   }
 
   // Calculate live status from trades
+  //
+  // Phase 4.2.1 (P-E): same two corrections as P-B, on the prop-firm page.
+  // `Σ (t.pl_usd || 0)` over the whole array counted 1,092 ticket-less
+  // simulation rows (and every still-OPEN row) as prop-firm performance, and
+  // coerced unknown P&L to zero. `lib/propfirm.ts` now fails closed on an
+  // unknown day, so this page must hand it an honest `null` rather than a
+  // fabricated 0 — otherwise the page would show a clean 0 % utilisation while
+  // the evaluator silently blocked trading.
   const today = new Date().toDateString()
-  const todayPL = trades.filter(t => t.closed_at && new Date(t.closed_at).toDateString() === today)
-    .reduce((s: number, t: any) => s + (t.pl_usd || 0), 0)
-  const allTimePL = trades.reduce((s: number, t: any) => s + (t.pl_usd || 0), 0)
-  const tradingDays = new Set(
-    trades.filter(t => t.closed_at).map(t => new Date(t.closed_at).toDateString())
-  ).size
-  const dailyPLs = trades
-    .filter(t => t.closed_at && (t.pl_usd || 0) > 0)
-    .reduce((acc: Record<string, number>, t) => {
-      const d = new Date(t.closed_at).toDateString()
-      acc[d] = (acc[d] || 0) + t.pl_usd
-      return acc
-    }, {})
+  const todayExecutions = closedExecutions(
+    trades.filter(t => t.closed_at && new Date(t.closed_at).toDateString() === today),
+  )
+  const todayPL: number | null = sumKnownPL(todayExecutions).pl
+  const allTimeExecutions = closedExecutions(trades)
+  const allTimeScope = sumKnownPL(allTimeExecutions)
+  const allTimePL = allTimeScope.pl ?? 0
+  const closedDates = allTimeExecutions
+    .map(t => t.closed_at)
+    .filter((v): v is string => typeof v === 'string' && v.length > 0)
+  const tradingDays = new Set(closedDates.map(v => new Date(v).toDateString())).size
+  // Consistency rule denominator: the largest *known* profit day. Unknown rows
+  // are skipped rather than counted as a zero-profit day, and the row must be a
+  // broker execution (a simulation win cannot mask a real drawdown).
+  const dailyPLs: Record<string, number> = {}
+  for (const t of allTimeExecutions) {
+    if (typeof t.closed_at !== 'string') continue
+    const pl = typeof t.pl_usd === 'number' ? t.pl_usd : Number(t.pl_usd)
+    if (!Number.isFinite(pl) || pl <= 0) continue
+    const d = new Date(t.closed_at).toDateString()
+    dailyPLs[d] = (dailyPLs[d] || 0) + pl
+  }
   const maxDailyProfit = Math.max(0, ...Object.values(dailyPLs))
 
   const status = calcPropFirmStatus(settings, todayPL, allTimePL, tradingDays, maxDailyProfit)
@@ -244,6 +262,11 @@ export default function PropFirmPage({ trades, onToast }: PropFirmPageProps) {
                 pct={status.dailyLossPct}
                 maxPct={settings.maxDailyLossPct}
                 danger={status.dailyLossLimitHit}
+                // Phase 4.2.1 (P-E): when today's realised P&L is unknown the
+                // limit is NOT 0 % used — it is unevaluated. Showing a calm
+                // empty bar beside a blocking evaluator is the display half of
+                // the same defect, so the bar says so explicitly.
+                unevaluated={!status.dailyPLEvaluated}
                 prefix="-$"
                 color="#ff3056"
               />
@@ -325,22 +348,24 @@ export default function PropFirmPage({ trades, onToast }: PropFirmPageProps) {
   )
 }
 
-function MetricBar({ label, value, limit, pct, maxPct, danger, success, prefix, color }: any) {
-  const fill = Math.min(100, (pct / maxPct) * 100)
-  const barColor = danger ? '#ff3056' : success ? '#00ff87' : color
+function MetricBar({ label, value, limit, pct, maxPct, danger, success, unevaluated, prefix, color }: any) {
+  // `unevaluated` is not a zero. It means the number does not exist yet, and
+  // rendering 0.00 % here would claim a rule was checked when it was not.
+  const fill = unevaluated ? 0 : Math.min(100, (pct / maxPct) * 100)
+  const barColor = unevaluated ? '#607080' : danger ? '#ff3056' : success ? '#00ff87' : color
   return (
     <div style={{ background: 'rgba(0,0,0,0.2)', borderRadius: 4, padding: '12px 14px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
         <span style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 1 }}>{label.toUpperCase()}</span>
         <span className="mono" style={{ fontSize: 12, color: barColor, fontWeight: 700 }}>
-          {prefix}{value.toFixed(2)} / {prefix}{limit.toFixed(2)}
+          {unevaluated ? 'UNKNOWN' : `${prefix}${value.toFixed(2)} / ${prefix}${limit.toFixed(2)}`}
         </span>
       </div>
       <div style={{ height: 4, background: 'rgba(255,255,255,0.06)', borderRadius: 2, overflow: 'hidden' }}>
         <div style={{ height: '100%', width: `${fill}%`, background: barColor, borderRadius: 2, transition: 'width 0.4s' }} />
       </div>
       <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 4 }}>
-        {pct.toFixed(1)}% of {maxPct}% limit
+        {unevaluated ? 'not evaluated — today’s realised P&L is still unknown' : `${pct.toFixed(1)}% of ${maxPct}% limit`}
       </div>
     </div>
   )

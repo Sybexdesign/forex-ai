@@ -148,7 +148,8 @@ export function evaluateChecklist(
     minStrength: number
     openPositions: number
     maxPositions: number
-    todayPL: number
+    /** Realised broker P&L for the trading day, or `null` when it is unknown. */
+    todayPL: number | null
     balance: number
     maxLossPct: number
   }
@@ -178,7 +179,21 @@ export function evaluateChecklist(
   const trendStrong   = indicators.adx >= 20
   const openPositionsOk = options.openPositions < options.maxPositions
   const maxLossUSD    = options.balance * (options.maxLossPct / 100)
-  const dailyLossOk   = options.todayPL > -maxLossUSD
+  // ── P-C: FAIL CLOSED WHEN THE DAY'S P&L IS UNKNOWN ───────────────────────
+  //
+  // `todayPL` used to be a plain `number`, fed by `Σ (pl_usd || 0)`. A missing
+  // P&L therefore became 0, and `0 > -maxLossUSD` is always true — the daily
+  // loss guard could not fail on a day whose losses were simply not recorded.
+  //
+  // With an honest `null` the comparison would be WORSE, not better:
+  //     null > -100  ===  true      (null coerces to 0)
+  //     undefined > -100 === false  (accidental, not designed)
+  // So the guard must refuse explicitly: an unknown day is not a passing day.
+  //
+  // GATE-1: this check is atomic with P-B. Shipping the null-aware client
+  // without this line would ENABLE trading on unknown data.
+  const todayPLKnown = typeof options.todayPL === 'number' && Number.isFinite(options.todayPL)
+  const dailyLossOk   = todayPLKnown && (options.todayPL as number) > -maxLossUSD
 
   const results = [emaCross, rsiConfirmed, macdConfirmed, priceAtLevel, noNews, trendStrong, openPositionsOk, dailyLossOk]
   const passCount = results.filter(Boolean).length

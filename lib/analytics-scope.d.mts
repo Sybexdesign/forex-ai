@@ -40,12 +40,23 @@ export interface TradeLike {
   [key: string]: unknown
 }
 
+export type BrokerTicketKind = 'MT5_POSITION' | 'OTHER_BROKER_REF' | 'NONE'
+
+export declare const BROKER_TICKET_KIND: {
+  MT5_POSITION: 'MT5_POSITION'
+  OTHER_BROKER_REF: 'OTHER_BROKER_REF'
+  NONE: 'NONE'
+}
+
 export interface TradeVerdict {
   population: PopulationKey
   reason: string
   netPnl: number | null
   grossPnl: number | null
   isGenuineExecution: boolean
+  /** Phase 4.2.1 (M-1): what KIND of broker reference the row carries. An
+   *  "MT5-confirmed" claim may only rest on `MT5_POSITION`. */
+  brokerEvidence: BrokerTicketKind
   contributesToNet: boolean
   contributesToGross: boolean
   version: string
@@ -54,15 +65,41 @@ export interface TradeVerdict {
 export type PopulationCounts = Record<PopulationKey, number>
 
 export declare function isGenuineExecution(trade?: TradeLike): boolean
+export declare function isUuidRef(value?: unknown): boolean
+export declare function brokerTicketKind(trade?: TradeLike, internalId?: string | null): BrokerTicketKind
+export declare function isMt5TicketBacked(trade?: TradeLike): boolean
+
+export interface KnownPLSum {
+  /** `null` when ANY considered row has no finite `pl_usd` — a partially known
+   *  total is not a total. */
+  pl: number | null
+  known: number
+  unknown: number
+  rows: number
+}
+
+export declare function sumKnownPL(trades?: TradeLike[]): KnownPLSum
 export declare function classifyTrade(trade?: TradeLike): TradeVerdict
 
 export declare function partitionTrades(trades?: TradeLike[]): {
   classified: Array<{ trade: TradeLike; verdict: TradeVerdict }>
   buckets: Record<PopulationKey, TradeLike[]>
   counts: PopulationCounts
+  ticketKinds: Record<BrokerTicketKind, number>
   totalRows: number
   genuineExecutions: number
+  mt5TicketExecutions: number
+  otherBrokerExecutions: number
   version: string
 }
+
+/**
+ * The populations that represent a closed broker execution. Exported so tests
+ * and callers can assert the definition instead of restating it.
+ */
+export declare const EXECUTION_POPULATIONS: PopulationKey[]
+
+/** Rows a risk limit or a performance figure may be computed over. */
+export declare function closedExecutions(trades?: TradeLike[]): TradeLike[]
 
 export declare function describeScope(counts?: Partial<PopulationCounts>): string

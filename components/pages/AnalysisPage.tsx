@@ -23,7 +23,8 @@ interface AnalysisProps {
   news: any
   account: any
   openPositions: number
-  todayPL: number
+  /** Realised P&L for today, or `null` when it is not known yet. */
+  todayPL: number | null
   onToast: (msg: string, color?: string) => void
   userId?: string
   onRefreshAccount?: () => void
@@ -113,8 +114,13 @@ export default function AnalysisPage({
       pass: openPositions < strategy.maxPositions
     },
     {
-      label: 'Daily loss limit not reached',
-      pass: todayPL > -(balance * strategy.maxLoss / 100)
+      // Phase 4.2.1 (P-C): this mirrors `evaluateChecklist` in lib/indicators.ts,
+      // so it must mirror the unknown handling too. An unknown day is not a
+      // passing day — `null > -limit` is `true` in JS, which would show a green
+      // tick on a day whose losses were never recorded.
+      label: todayPL === null ? 'Daily loss limit — UNKNOWN (today\'s realised P&L has not been accounted yet)' : 'Daily loss limit not reached',
+      pass: typeof todayPL === 'number' && Number.isFinite(todayPL)
+        && todayPL > -(balance * strategy.maxLoss / 100)
     },
   ] : []
 

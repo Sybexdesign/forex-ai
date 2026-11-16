@@ -330,8 +330,22 @@ export default function DashboardPage({ prices, account, news, trades, onToast, 
                             </span>
                           </td>
                           <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t.lots?.toFixed(2) ?? '—'}</td>
-                          <td className="mono" style={{ color: (t.pl_usd ?? 0) >= 0 ? '#00ff87' : '#ff6060', fontWeight: 700 }}>
-                            {currencySigned(t.pl_usd ?? 0, account?.currency)}
+                          <td className="mono" style={{
+                            // Phase 4.2.1 (P-F): `t.pl_usd ?? 0` rendered a
+                            // missing result as a green +$0.00 — a loss-shaped
+                            // hole in the record shown as a break-even. Unknown
+                            // is now an em dash in a neutral colour, and the
+                            // result column tells the reader why.
+                            color: t.pl_usd === null || t.pl_usd === undefined
+                              ? '#607080'
+                              : t.pl_usd >= 0 ? '#00ff87' : '#ff6060',
+                            fontWeight: 700,
+                          }}
+                            title={t.pl_usd === null || t.pl_usd === undefined ? 'No realised P&L recorded for this row yet' : undefined}
+                          >
+                            {t.pl_usd === null || t.pl_usd === undefined
+                              ? '—'
+                              : currencySigned(t.pl_usd, account?.currency)}
                           </td>
 
                           <td>

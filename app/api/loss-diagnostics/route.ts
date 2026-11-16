@@ -89,8 +89,17 @@ export async function POST(req: NextRequest) {
     if (outcome !== 'LOSS') {
       return NextResponse.json({ message: `Row resolved as ${outcome} — automatic diagnosis only applies to losses.`, outcome }, { status: 200 })
     }
-    const rMultiple = source === 'closed_trade' && slPips && slPips > 0
-      ? (row.pl_usd ?? 0) / (slPips * getPipValuePerLot(row.pair) * (row.lots ?? 0.01))
+    // Phase 4.2.1 (P-G): `(row.pl_usd ?? 0)` turned a missing result into
+    // exactly 0R, so an unaccounted loss was diagnosed as a "perfect stop" — a
+    // fabricated behavioural insight. R is now `null` when there is no money to
+    // divide, and `diagnoseLoss` reports it as unknown rather than 0R.
+    const R_DENOMINATOR = slPips && slPips > 0
+      ? slPips * getPipValuePerLot(row.pair) * (row.lots ?? 0.01)
+      : 0
+    const rMultiple = source === 'closed_trade'
+      && typeof row.pl_usd === 'number' && Number.isFinite(row.pl_usd)
+      && R_DENOMINATOR > 0
+      ? row.pl_usd / R_DENOMINATOR
       : null
 
     const snap = row.indicator_snapshot || {}

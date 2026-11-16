@@ -16,7 +16,12 @@ interface UserRow {
   confirmed: boolean
   trades: number
   wins: number
+  /** Known realised P&L subtotal. Rows with no recorded result are excluded. */
   totalPL: number
+  knownPL: number
+  /** Count of this user's rows whose realised P&L is still unknown. */
+  unknownPL: number
+  knownTrades: number
   winRate: number
 }
 
@@ -149,19 +154,26 @@ export default function AdminPage({ onToast, account }: AdminPageProps) {
   )
 
   const totalTrades = users.reduce((s, u) => s + u.trades, 0)
-  const totalPL = users.reduce((s, u) => s + u.totalPL, 0)
+  const totalPL = users.reduce((s, u) => s + (u.knownPL ?? 0), 0)
+  // Phase 4.2.1 (P-H): the headline figure is a KNOWN subtotal, so it carries
+  // the count of rows it could not include. A total that quietly drops
+  // unaccounted trades reads as complete when it is not.
+  const unknownPLRows = users.reduce((s, u) => s + (u.unknownPL ?? 0), 0)
   const activeUsers = users.filter(u => u.trades > 0).length
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
       {/* Stats row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 12 }}>
         {[
           { label: 'TOTAL USERS', value: users.length, color: '#60c0ff' },
           { label: 'ACTIVE TRADERS', value: activeUsers, color: '#00ff87' },
           { label: 'TOTAL TRADES', value: totalTrades, color: '#ffb800' },
           { label: 'TOTAL P/L', value: `${totalPL >= 0 ? '+' : ''}${currencySymbol(account?.currency)}${totalPL.toFixed(2)}`, color: totalPL >= 0 ? '#00ff87' : '#ff3056' },
+          // Phase 4.2.1 (P-H): the count of rows behind the figure above, so the
+          // total is never read as complete when part of it is unaccounted.
+          { label: 'UNKNOWN P/L ROWS', value: unknownPLRows, color: unknownPLRows > 0 ? '#ffb800' : 'var(--text-muted)' },
 
         ].map(s => (
           <div key={s.label} style={{ background: 'rgba(0,0,0,0.3)', border: '1px solid var(--border)', borderRadius: 4, padding: '14px 16px' }}>
@@ -340,7 +352,14 @@ export default function AdminPage({ onToast, account }: AdminPageProps) {
                         <span style={{ color: u.totalPL >= 0 ? '#00ff87' : '#ff3056' }}>
                           {u.totalPL >= 0 ? '+' : ''}{currencySymbol(account?.currency)}{u.totalPL.toFixed(2)}
                         </span>
-
+                        {/* Phase 4.2.1 (P-H): the per-row figure is a known
+                            subtotal too — say how many rows it excludes. */}
+                        {u.unknownPL > 0 && (
+                          <span
+                            title={`${u.unknownPL} row(s) with no recorded realised P&L are excluded from this figure`}
+                            style={{ marginLeft: 6, fontSize: 10, color: '#ffb800' }}
+                          >+{u.unknownPL}?</span>
+                        )}
                       </td>
                       <td style={{ padding: '10px 12px' }}>
                         <span style={{

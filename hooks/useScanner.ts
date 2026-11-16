@@ -43,7 +43,7 @@ function getScanInterval(tf: string): number {
 
 export function useScanner(
   strategy: StrategySettings,
-  context: { newsInWindow: boolean; openPositions: number; todayPL: number; accountBalance: number },
+  context: { newsInWindow: boolean; openPositions: number; todayPL: number | null; accountBalance: number },
   pairs: string[],
   timeframe = '1H',
 ) {

@@ -32,33 +32,65 @@ export async function GET(req: NextRequest) {
     .select('id, email, full_name, created_at')
 
   // Aggregate stats per user
+  //
+  // Phase 4.2.1 (P-H): an admin total is a number somebody will act on, so it
+  // may not silently absorb unknowns. `t.pl_usd || 0` both hid how many rows
+  // were unaccounted and let them inflate the *count* of trades used for the
+  // per-user win rate. Each user now carries `unknownPL` (rows with no number)
+  // and `knownPL` (the sum of the rest), and the endpoint reports the totals so
+  // a reader can see the denominator instead of trusting a single figure.
   const userStats: Record<string, any> = {}
   for (const t of trades || []) {
-    if (!userStats[t.user_id]) userStats[t.user_id] = { trades: 0, wins: 0, totalPL: 0 }
-    userStats[t.user_id].trades++
-    if (t.result === 'WIN') userStats[t.user_id].wins++
-    userStats[t.user_id].totalPL += t.pl_usd || 0
+    if (!userStats[t.user_id]) userStats[t.user_id] = { trades: 0, wins: 0, totalPL: 0, knownPL: 0, unknownPL: 0 }
+    const s = userStats[t.user_id]
+    s.trades++
+    if (t.result === 'WIN') s.wins++
+    if (typeof t.pl_usd === 'number' && Number.isFinite(t.pl_usd)) {
+      s.knownPL += t.pl_usd
+      s.totalPL += t.pl_usd
+    } else {
+      s.unknownPL++
+    }
   }
 
   const profileMap: Record<string, any> = {}
   for (const p of profiles || []) profileMap[p.id] = p
 
-  const result = (users || []).map(u => ({
-    id: u.id,
-    email: u.email,
-    fullName: profileMap[u.id]?.full_name || '',
-    createdAt: u.created_at,
-    lastSignIn: u.last_sign_in_at,
-    confirmed: !!u.email_confirmed_at,
-    trades: userStats[u.id]?.trades || 0,
-    wins: userStats[u.id]?.wins || 0,
-    totalPL: +(userStats[u.id]?.totalPL || 0).toFixed(2),
-    winRate: userStats[u.id]?.trades
-      ? Math.round((userStats[u.id].wins / userStats[u.id].trades) * 100)
-      : 0,
-  }))
+  const result = (users || []).map(u => {
+    const s = userStats[u.id] || { trades: 0, wins: 0, totalPL: 0, knownPL: 0, unknownPL: 0 }
+    const knownTrades = s.trades - s.unknownPL
+    return {
+      id: u.id,
+      email: u.email,
+      fullName: profileMap[u.id]?.full_name || '',
+      createdAt: u.created_at,
+      lastSignIn: u.last_sign_in_at,
+      confirmed: !!u.email_confirmed_at,
+      trades: s.trades,
+      wins: s.wins,
+      // `totalPL` is kept for existing callers but is now explicitly the KNOWN
+      // subtotal — the companion `unknownPL` counter says how much is missing.
+      totalPL: +s.knownPL.toFixed(2),
+      knownPL: +s.knownPL.toFixed(2),
+      unknownPL: s.unknownPL,
+      knownTrades,
+      // win rate is over rows whose outcome is recorded, so an unaccounted row
+      // cannot flatter the percentage
+      winRate: knownTrades > 0 ? Math.round((s.wins / knownTrades) * 100) : 0,
+    }
+  })
 
-  return NextResponse.json({ users: result })
+  const totals = result.reduce(
+    (acc, u) => ({
+      users: acc.users + 1,
+      trades: acc.trades + u.trades,
+      knownPL: +(acc.knownPL + u.knownPL).toFixed(2),
+      unknownPL: acc.unknownPL + u.unknownPL,
+    }),
+    { users: 0, trades: 0, knownPL: 0, unknownPL: 0 },
+  )
+
+  return NextResponse.json({ users: result, totals })
 }
 
 export async function DELETE(req: NextRequest) {

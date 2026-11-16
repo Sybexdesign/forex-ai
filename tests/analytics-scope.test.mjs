@@ -124,14 +124,33 @@ const grossRow = (o = {}) => ({
 }
 
 // ── H — an accounting error is quarantined, not averaged ───────────────────
+// Phase 4.2.1 (M-3): this group used to assert the population via
+// `accounting_status: 'ERROR'` — a column that does not exist in `trades`
+// (selecting it returns HTTP 400), so the assertion was proving dead code. The
+// contract is now `accounting_missing`, the column Phase 4.1's derivation trigger
+// actually writes.
 {
   const v = classifyTrade({
     broker_ticket: '77', pl_usd: 10, accounting_complete: false,
-    accounting_status: 'ERROR', result: 'WIN',
+    accounting_missing: ['error'], result: 'WIN',
   })
   assert.equal(v.population, POPULATION.ACCOUNTING_ERROR, 'H: broker-flagged error is its own population')
   assert.equal(v.contributesToNet, false, 'H: never contributes to net')
   assert.equal(v.contributesToGross, false, 'H: and not to gross either')
+
+  const invalid = classifyTrade({
+    broker_ticket: '78', pl_usd: 10, accounting_complete: false,
+    accounting_missing: ['invalid_broker_value'], result: 'WIN',
+  })
+  assert.equal(invalid.population, POPULATION.ACCOUNTING_ERROR, 'H: invalid broker value is an accounting error')
+
+  // The phantom column must have NO effect. If it did, the classifier would be
+  // reading a field that cannot exist in the row.
+  const phantom = classifyTrade({
+    broker_ticket: '79', pl_usd: 10, accounting_complete: false,
+    accounting_status: 'ERROR', result: 'WIN',
+  })
+  assert.equal(phantom.population, POPULATION.GROSS_ONLY, 'H: accounting_status is not read — costs are merely unconfirmed')
   console.log('PASS H: accounting errors are quarantined out of every P&L figure')
 }
 
